@@ -1,0 +1,4 @@
+# Direnv
+.direnv/
+.crush
+zig-out
