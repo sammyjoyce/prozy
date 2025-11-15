@@ -5,7 +5,25 @@
 
 set -e
 
+# Latest nightly version (update as needed)
+NIGHTLY_VERSION="0.16.0-dev.1316+181b25ce4"
+
 echo "🚀 Setting up Prozy development environment..."
+
+# Helper function to download and extract Zig
+download_and_extract_zig() {
+    local url="$1"
+    local dest="$2"
+    
+    if command -v curl >/dev/null 2>&1; then
+        curl -fL "$url" | tar -xJ -C "$dest" --strip-components=1 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO- "$url" | tar -xJ -C "$dest" --strip-components=1 2>/dev/null
+    else
+        echo "❌ Neither curl nor wget available"
+        return 1
+    fi
+}
 
 # Check Zig installation and version
 echo "📋 Checking Zig installation..."
@@ -18,12 +36,75 @@ if command -v zig >/dev/null 2>&1; then
         echo "✅ Zig version supports async I/O APIs"
     else
         echo "⚠️  Warning: Zig version may not support new async I/O APIs"
+        echo "📦 Installing latest Zig master for async I/O support..."
+        
+        # Proceed with installation even if older version found
+        INSTALL_ZIG=true
     fi
 else
-    echo "❌ Zig not found - installing or using fallback..."
-    # Fallback: try to download Zig if not available
-    if [[ "$CLAUDE_CODE_REMOTE" == "true" ]]; then
-        echo "📦 In remote environment, Zig should be pre-installed"
+    echo "❌ Zig not found - installing Zig master..."
+    INSTALL_ZIG=true
+fi
+
+# Install Zig if needed
+if [[ "$INSTALL_ZIG" == "true" ]]; then
+    # Determine platform and architecture
+    ARCH=$(uname -m)
+    OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+    
+    case $ARCH in
+        x86_64) ZIG_ARCH="x86_64" ;;
+        aarch64|arm64) ZIG_ARCH="aarch64" ;;
+        *) echo "❌ Unsupported architecture: $ARCH"; exit 1 ;;
+    esac
+    
+    case $OS in
+        linux) ZIG_OS="linux" ;;
+        darwin) ZIG_OS="macos" ;;
+        *) echo "❌ Unsupported OS: $OS"; exit 1 ;;
+    esac
+    
+    # Download Zig master
+    ZIG_TAR="zig-${ZIG_OS}-${ZIG_ARCH}.tar.xz"
+    ZIG_URL="https://ziglang.org/builds/${ZIG_TAR}"
+    ZIG_DIR="$HOME/.zig"
+    ZIG_BIN="$ZIG_DIR/zig"
+    
+    # Create directory
+    mkdir -p "$ZIG_DIR"
+    
+    echo "📦 Downloading Zig master from: $ZIG_URL"
+    
+    # Try master first, then fallback to specific nightly if it fails
+    if ! download_and_extract_zig "$ZIG_URL" "$ZIG_DIR"; then
+        echo "⚠️  Master download failed, trying specific nightly..."
+        ZIG_TAR="zig-${ZIG_OS}-${ZIG_ARCH}-${NIGHTLY_VERSION}.tar.xz"
+        ZIG_URL="https://ziglang.org/download/${ZIG_TAR}"
+        
+        if ! download_and_extract_zig "$ZIG_URL" "$ZIG_DIR"; then
+            echo "❌ Both master and nightly downloads failed"
+            exit 1
+        fi
+    fi
+    
+    # Make executable
+    chmod +x "$ZIG_BIN"
+    
+    # Add to PATH for this session
+    export PATH="$ZIG_DIR:$PATH"
+    
+    # Persist PATH for subsequent commands
+    if [[ -n "$CLAUDE_ENV_FILE" ]]; then
+        echo "export PATH=\"$ZIG_DIR:\$PATH\"" >> "$CLAUDE_ENV_FILE"
+    fi
+    
+    # Verify installation
+    if [[ -x "$ZIG_BIN" ]]; then
+        ZIG_VERSION=$("$ZIG_BIN" version)
+        echo "✅ Zig installed successfully: $ZIG_VERSION"
+    else
+        echo "❌ Zig installation failed"
+        exit 1
     fi
 fi
 
