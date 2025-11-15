@@ -76,7 +76,10 @@ pub const Proxy = struct {
         log.info("waiting to accept connections (limit: {})", .{configured_limit});
 
         var connection_group: std.Io.Group = .init;
-        defer connection_group.wait(io);
+        defer {
+            connection_group.wait(io) catch |err|
+                log.err("connection group wait failed: {s}", .{@errorName(err)});
+        }
 
         var accepted: usize = 0;
         while (accepted < configured_limit) {
@@ -94,7 +97,11 @@ pub const Proxy = struct {
                 self.backend_host,
                 self.backend_port,
                 options.connect_timeout,
-            });
+            }) catch |err| {
+                log.err("failed to spawn client task: {s}", .{@errorName(err)});
+                client_stream.close(io);
+                continue;
+            };
         }
     }
 
@@ -108,7 +115,7 @@ pub const Proxy = struct {
 
         std.debug.print("\nCore Implementation Patterns:\n", .{});
         std.debug.print("1. Server listener: accept incoming connections\n", .{});
-        std.debug.print("2. Thread per client via io.concurrent()\n", .{});
+        std.debug.print("2. Dedicated concurrent task per client via io.concurrent()\n", .{});
         std.debug.print("3. Backend connection: resolve + connect\n", .{});
         std.debug.print("4. Bidirectional copy with io.select()\n", .{});
 
