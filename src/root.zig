@@ -88,7 +88,7 @@ pub const Proxy = struct {
             accepted += 1;
             log.info("accepted connection #{}", .{accepted});
 
-            connection_group.async(io, handleClient, .{
+            _ = connection_group.async(io, handleClient, .{
                 client_stream,
                 io,
                 self.backend_host,
