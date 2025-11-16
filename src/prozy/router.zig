@@ -204,11 +204,11 @@ test "Router reverse proxy basic routing" {
     const allocator = std.testing.allocator;
 
     // Create a test backend
-    var backend = @import("backend.zig").Backend.init("127.0.0.1", 3003, 1);
+    const backend = @import("backend.zig").Backend.init("127.0.0.1", 3003, 1);
 
     // Create a cluster with the backend
     var backends = [_]@import("backend.zig").Backend{backend};
-    var cluster = Cluster.init("test-cluster", &backends, .round_robin, 10);
+    const cluster = Cluster.init("test-cluster", &backends, .round_robin, 10);
 
     // Create a route
     const route = Route{
@@ -233,7 +233,7 @@ test "Router reverse proxy basic routing" {
         .version = "HTTP/1.1",
     };
     const headers = "Host: api.example.com\r\n\r\n";
-    const client_ip = IpKey{ .v4 = 0x7F000001 }; // 127.0.0.1
+    const client_ip = IpKey{ .ipv4 = 0x7F000001 }; // 127.0.0.1
 
     // Route the request
     const decision = try router.routeRequest(&req, headers, client_ip);
@@ -249,9 +249,9 @@ test "Router reverse proxy basic routing" {
 test "Router no matching route" {
     const allocator = std.testing.allocator;
 
-    var backend = @import("backend.zig").Backend.init("127.0.0.1", 3003, 1);
+    const backend = @import("backend.zig").Backend.init("127.0.0.1", 3003, 1);
     var backends = [_]@import("backend.zig").Backend{backend};
-    var cluster = Cluster.init("test-cluster", &backends, .round_robin, 10);
+    const cluster = Cluster.init("test-cluster", &backends, .round_robin, 10);
 
     const route = Route{
         .name = "api-route",
@@ -273,7 +273,7 @@ test "Router no matching route" {
         .version = "HTTP/1.1",
     };
     const headers = "Host: other.example.com\r\n\r\n";
-    const client_ip = IpKey{ .v4 = 0x7F000001 };
+    const client_ip = IpKey{ .ipv4 = 0x7F000001 };
 
     // Should fail to route
     const result = router.routeRequest(&req, headers, client_ip);
@@ -283,9 +283,9 @@ test "Router no matching route" {
 test "Router forward proxy URI parsing" {
     const allocator = std.testing.allocator;
 
-    var backend = @import("backend.zig").Backend.init("127.0.0.1", 8080, 1);
+    const backend = @import("backend.zig").Backend.init("127.0.0.1", 8080, 1);
     var backends = [_]@import("backend.zig").Backend{backend};
-    var cluster = Cluster.init("forward-cluster", &backends, .round_robin, 10);
+    const cluster = Cluster.init("forward-cluster", &backends, .round_robin, 10);
 
     // Wildcard route for forward proxy
     const route = Route{
@@ -308,7 +308,7 @@ test "Router forward proxy URI parsing" {
         .version = "HTTP/1.1",
     };
     const headers = "\r\n";
-    const client_ip = IpKey{ .v4 = 0x7F000001 };
+    const client_ip = IpKey{ .ipv4 = 0x7F000001 };
 
     // Route the request
     const decision = try router.routeRequest(&req, headers, client_ip);

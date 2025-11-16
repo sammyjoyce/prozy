@@ -372,7 +372,6 @@ pub const Proxy = struct {
                 if (self.rate_limiter) |*limiter| limiter else null,
                 if (self.load_balancer) |*lb| lb else null,
                 if (self.http_cache) |*cache| cache else null,
-                self.allocator,
                 self.router, // Phase 3: Pass router for advanced routing
             });
         }
@@ -510,7 +509,6 @@ pub const Proxy = struct {
         rate_limiter: ?*RateLimiter,
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
-        allocator: std.mem.Allocator,
         router: ?*Router, // Phase 3: Optional router for advanced routing
     ) void {
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
@@ -719,7 +717,10 @@ pub const Proxy = struct {
             // Apply router's timeout policy
             const timeout_ms = decision.timeouts.connect_timeout_ms;
             actual_connect_timeout = if (timeout_ms > 0)
-                Timeout{ .ms = timeout_ms }
+                Timeout{ .duration = .{
+                    .raw = Duration.fromMilliseconds(@intCast(timeout_ms)),
+                    .clock = .awake,
+                } }
             else
                 .none;
 
