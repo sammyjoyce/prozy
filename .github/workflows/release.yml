@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          # Extract changelog for this version
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          CHANGELOG=$(sed -n "/## \[$VERSION\]/,/## \[/p" CHANGELOG.md | sed '$d')
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Prozy ${{ steps.get_version.outputs.VERSION }}
+          body: ${{ steps.changelog.outputs.CHANGELOG }}
+          draft: false
+          prerelease: false
+
+  build-and-upload:
+    name: Build and Upload - ${{ matrix.name }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            name: linux-x86_64
+            binary: prozy
+          - os: ubuntu-latest
+            target: aarch64-linux
+            name: linux-arm64
+            binary: prozy
+          - os: macos-latest
+            target: x86_64-macos
+            name: macos-x86_64
+            binary: prozy
+          - os: macos-latest
+            target: aarch64-macos
+            name: macos-arm64
+            binary: prozy
+          - os: windows-latest
+            target: x86_64-windows
+            name: windows-x86_64
+            binary: prozy.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Build for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Package binary
+        run: |
+          mkdir -p release
+          cp zig-out/bin/${{ matrix.binary }} release/
+          cp LICENSE release/
+          cp README.md release/
+          cp CHANGELOG.md release/
+          tar czf prozy-${{ matrix.name }}.tar.gz -C release .
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./prozy-${{ matrix.name }}.tar.gz
+          asset_name: prozy-${{ matrix.name }}.tar.gz
+          asset_content_type: application/gzip
+
+  publish-checksums:
+    name: Publish Checksums
+    needs: build-and-upload
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Generate checksums
+        run: |
+          sha256sum prozy-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload checksums
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./SHA256SUMS
+          asset_name: SHA256SUMS
+          asset_content_type: text/plain
