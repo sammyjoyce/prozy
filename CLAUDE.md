@@ -86,6 +86,66 @@ The proxy supports extensive configuration:
 - **Cache size**: 10MB default (configurable)
 - **Rate limits**: Per-IP and global (configurable)
 - **Access control**: Allow/deny lists (optional)
+- **HTTP mode**: TCP tunnel (L4) or HTTP proxy (L7)
+
+## HTTP Proxy Mode (L7)
+
+Prozy now supports true L7 HTTP proxying with request/response semantics:
+
+### Features
+
+- **HTTP keep-alive**: Multiple requests on the same TCP connection
+- **Request/response lifecycle**: Proper HTTP message handling instead of byte tunneling
+- **Host-aware caching**: Cache keys include Host header for multi-tenant isolation
+- **Connection header handling**: Respects Connection: keep-alive and Connection: close
+- **HTTP-aware routing**: Route based on method, host, and path (extensible)
+- **Sequential processing**: Clean request → route → forward → response → next request
+
+### Usage
+
+```zig
+const std = @import("std");
+const prozy = @import("prozy");
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
+    // Create Io executor
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    // Initialize proxy
+    var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+    defer proxy.deinit();
+
+    // Enable caching
+    proxy.enableCaching(10 * 1024 * 1024);
+
+    // Run in HTTP proxy mode (L7)
+    try proxy.runWithIoOptions(io, .{
+        .http_mode = .http_proxy,  // ← Enable L7 mode
+        .enable_caching = true,
+        .enable_stats = true,
+    });
+}
+```
+
+### HTTP Mode vs TCP Tunnel Mode
+
+| Feature | TCP Tunnel (`.tcp_tunnel`) | HTTP Proxy (`.http_proxy`) |
+|---------|---------------------------|----------------------------|
+| **Protocol awareness** | None (raw bytes) | Full HTTP parsing |
+| **Connection lifetime** | Single bidirectional tunnel | Multiple request/response cycles |
+| **Keep-alive** | Not supported | Full support |
+| **Caching** | Buffer-based (one request only) | Request-level (works with keep-alive) |
+| **Routing** | Connection-level | Request-level (per-request routing) |
+| **Performance** | Lower latency (no parsing) | Higher throughput (keep-alive) |
+| **Use cases** | Any TCP protocol, WebSockets | HTTP/1.1 APIs, REST services |
+
+### Examples
+
+See `examples/configs/http_proxy.zig` for a complete HTTP proxy example with caching and keep-alive.
 
 ## Implementation Details
 

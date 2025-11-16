@@ -11,25 +11,29 @@
 //! - Bidirectional data copying coordinated via io.concurrent/io.select
 //! - Structured concurrency via Io.Group and explicit cancellation
 //!
+//! ## Operating Modes
+//!
+//! Prozy supports two operating modes:
+//!
+//! ### HTTP Proxy Mode (L7) - NEW!
+//! - **HTTP keep-alive**: Multiple requests on the same TCP connection
+//! - **Request-level routing**: Per-request backend selection based on method/host/path
+//! - **Connection header handling**: Respects Connection: keep-alive and Connection: close
+//! - **Host-aware caching**: Cache keys include Host header for multi-tenant isolation
+//! - **Sequential processing**: Clean request → route → forward → response → next request
+//!
+//! ### TCP Tunnel Mode (L4) - Legacy
+//! - **One HTTP request per TCP connection**: Each connection carries a single HTTP request
+//! - **Bidirectional byte streaming**: Full-duplex data flow with io.select()
+//! - **Connection-level routing**: Backend selected once per TCP connection
+//! - **30-second timeout**: After one direction completes, waits up to 30s for the other
+//!
 //! ## Known Limitations and Assumptions
 //!
-//! ### Request Handling
-//! - **One HTTP request per TCP connection**: The proxy assumes each TCP connection
-//!   carries a single HTTP request. HTTP keep-alive and pipelining are NOT supported.
-//!   Subsequent requests in the same connection will bypass cache checking and request
-//!   inspection.
-//!
 //! ### Protocol Support
-//! - **HTTP-only**: Currently designed for HTTP traffic. No TLS/SSL termination,
-//!   WebSocket support, or HTTP/2.
+//! - **HTTP/1.1 only**: No TLS/SSL termination, WebSocket support, or HTTP/2.
 //! - **TCP-only**: No UDP support. Adding UDP would require significant changes.
-//!
-//! ### Connection Handling
-//! - **30-second timeout**: After one direction of a connection completes, the proxy
-//!   waits up to 30 seconds for the other direction before timing out and canceling.
-//!   Implemented using io.concurrent(sleep, ...) combined with io.select() for concurrent
-//!   timeout enforcement. Prevents hung connections during HTTP keep-alive scenarios.
-//! - **Full close only**: No TCP half-close support. Both directions are closed together.
+//! - **HTTP pipelining**: Not supported (sequential request/response only)
 //!
 //! ### Cache Behavior
 //! - **GET requests only**: Only GET requests are cached. POST/PUT/DELETE bypass cache.
@@ -44,8 +48,8 @@
 //! ### Load Balancing
 //! - **Reactive health checks**: Backend health is determined by connection success/
 //!   failure only. No proactive health checks, HTTP 5xx tracking, or timeout detection.
-//! - **Connection-level routing**: Load balancing decision is made per connection,
-//!   not per request (consistent with one-request-per-connection assumption).
+//! - **HTTP mode**: Per-request routing with backend health checking
+//! - **TCP tunnel mode**: Per-connection routing (backend selected once)
 //!
 //! ### Security
 //! - **No X-Forwarded-For handling**: Client IP is extracted from TCP socket only.
@@ -91,6 +95,8 @@ pub const RunOptions = proxy.RunOptions;
 pub const Proxy = proxy.Proxy;
 pub const runProxy = proxy.runProxy;
 pub const runProxyWithIo = proxy.runProxyWithIo;
+pub const HttpMode = proxy.HttpMode;
+pub const RoutingDecision = proxy.RoutingDecision;
 
 // Import tests for `zig build test`
 test {

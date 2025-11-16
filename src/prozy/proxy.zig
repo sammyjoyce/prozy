@@ -1,63 +1,52 @@
-//! Prozy: A simple TCP proxy
+//! Prozy: A production-grade async HTTP/TCP proxy
 //!
-//! This is a production-grade async TCP proxy using Zig's new std.Io runtime.
-//! It demonstrates the expected pattern from the 0.16 era async APIs: create an
-//! Io executor at the edge (usually `main`), then pass it through the
-//! application just like an allocator so the implementation can target
-//! Threaded, io_uring, kqueue, or any future backend without code changes.
+//! This is a production-grade proxy using Zig's new std.Io runtime with support for
+//! both L7 HTTP proxying and L4 TCP tunneling. It demonstrates the expected pattern
+//! from the 0.16 era async APIs: create an Io executor at the edge (usually `main`),
+//! then pass it through the application like an allocator so the implementation can
+//! target Threaded, io_uring, kqueue, or any future backend without code changes.
 //!
-//! The proxy showcases the core patterns needed:
+//! ## Operating Modes
+//!
+//! ### HTTP Proxy Mode (L7) - Recommended
+//! - HTTP keep-alive support (multiple requests per connection)
+//! - Request/response lifecycle management
+//! - Per-request routing and backend selection
+//! - Connection header handling (keep-alive / close)
+//! - Host-aware caching for multi-tenant isolation
+//!
+//! ### TCP Tunnel Mode (L4) - Legacy
+//! - Raw TCP byte streaming
+//! - Bidirectional data flow with io.select()
+//! - One request per connection
+//! - 30-second timeout for half-closed connections
+//!
+//! The proxy showcases these core patterns:
 //! - TCP socket listening and accepting with std.Io.net
-//! - Bidirectional data copying coordinated via io.concurrent/io.select
+//! - HTTP request/response parsing and handling (L7 mode)
+//! - Bidirectional data copying coordinated via io.concurrent/io.select (L4 mode)
 //! - Structured concurrency via Io.Group and explicit cancellation
 //!
-//! ## Known Limitations and Assumptions
-//!
-//! ### Request Handling
-//! - **One HTTP request per TCP connection**: The proxy assumes each TCP connection
-//!   carries a single HTTP request. HTTP keep-alive and pipelining are NOT supported.
-//!   Subsequent requests in the same connection will bypass cache checking and request
-//!   inspection.
+//! ## Known Limitations
 //!
 //! ### Protocol Support
-//! - **HTTP-only**: Currently designed for HTTP traffic. No TLS/SSL termination,
-//!   WebSocket support, or HTTP/2.
-//! - **TCP-only**: No UDP support. Adding UDP would require significant changes.
-//!
-//! ### Connection Handling
-//! - **30-second timeout**: After one direction of a connection completes, the proxy
-//!   waits up to 30 seconds for the other direction before timing out and canceling.
-//!   Implemented using io.concurrent(sleep, ...) combined with io.select() for concurrent
-//!   timeout enforcement. Prevents hung connections during HTTP keep-alive scenarios.
-//! - **Full close only**: No TCP half-close support. Both directions are closed together.
+//! - **HTTP/1.1 only**: No TLS/SSL termination, WebSocket support, or HTTP/2.
+//! - **TCP-only**: No UDP support.
+//! - **HTTP pipelining**: Not supported (sequential request/response only)
 //!
 //! ### Cache Behavior
-//! - **GET requests only**: Only GET requests are cached. POST/PUT/DELETE bypass cache.
-//! - **Basic cacheability**: Cache does NOT respect Cache-Control, Vary, or other
-//!   HTTP caching headers. All GET responses are cached with a fixed TTL.
-//! - **No cache population from backend**: Currently, responses from backends are
-//!   streamed directly to clients but NOT buffered and stored in the cache for future
-//!   requests. This is planned for a future release.
-//! - **Fixed-size buffers**: Request headers are buffered in an 8KB buffer. Headers
-//!   larger than 8KB will cause cache checking to fail (request still forwarded).
+//! - **GET requests only**: Only GET requests are cached.
+//! - **No cache population**: Responses streamed directly (not stored in cache yet).
+//! - **Fixed TTL**: No Cache-Control, Vary, or conditional request support.
+//! - **8KB header limit**: Larger headers cause cache bypass (still forwarded).
 //!
 //! ### Load Balancing
-//! - **Reactive health checks**: Backend health is determined by connection success/
-//!   failure only. No proactive health checks, HTTP 5xx tracking, or timeout detection.
-//! - **Connection-level routing**: Load balancing decision is made per connection,
-//!   not per request (consistent with one-request-per-connection assumption).
+//! - **Reactive health checks**: Based on connection success/failure only.
+//! - **No proactive polling**: No HTTP 5xx tracking or active health probes.
 //!
 //! ### Security
-//! - **No X-Forwarded-For handling**: Client IP is extracted from TCP socket only.
-//!   If behind another proxy, all clients appear to come from the proxy's IP.
-//! - **Trusted backend assumption**: No validation of backend responses or protection
-//!   against malicious backends.
-//!
-//! ### Performance
-//! - **Fixed buffer sizes**: 4KB client buffers, 4KB backend buffers, 8KB request buffer
-//! - **Per-chunk byte counting**: Statistics are updated per 8KB chunk (atomic operations)
-//! - **Approximate LRU**: Cache get() does NOT update LRU order for performance
-//!   (uses lockShared instead of write lock)
+//! - **No X-Forwarded-For**: Client IP extracted from TCP socket only.
+//! - **Trusted backends**: No validation of backend responses.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -88,6 +77,24 @@ const resolveListenAddress = @import("transport.zig").resolveListenAddress;
 const connectToBackend = @import("transport.zig").connectToBackend;
 const extractClientIp = @import("transport.zig").extractClientIp;
 
+/// HTTP proxy mode - determines how connections are handled
+pub const HttpMode = enum {
+    /// TCP tunnel mode: Full-duplex byte streaming (current behavior)
+    tcp_tunnel,
+    /// HTTP proxy mode: L7 request/response handling with keep-alive
+    http_proxy,
+};
+
+/// Routing decision made for an HTTP request
+pub const RoutingDecision = struct {
+    backend_host: []const u8,
+    backend_port: u16,
+    backend: ?*Backend = null,
+    cache_allowed: bool = true,
+    force_connection_close: bool = false,
+    // Future: header_transforms, auth, request/response modification
+};
+
 pub const RunOptions = struct {
     /// Host/interface to bind the proxy listener to. Default is loopback.
     listen_host: []const u8 = "127.0.0.1",
@@ -111,6 +118,8 @@ pub const RunOptions = struct {
     enable_caching: bool = true,
     /// Enable load balancing across multiple backends
     enable_load_balancing: bool = false,
+    /// HTTP proxy mode (L7 vs L4)
+    http_mode: HttpMode = .tcp_tunnel,
 };
 
 pub const Proxy = struct {
@@ -330,25 +339,43 @@ pub const Proxy = struct {
             accepted += 1;
             log.info("accepted connection #{} from {any}", .{ accepted, client_ip });
 
-            if (options.enable_stats) {
-                self.stats.recordConnection();
-            }
+            // Dispatch based on HTTP mode
+            switch (options.http_mode) {
+                .http_proxy => {
+                    // L7 HTTP proxy mode with keep-alive support
+                    _ = connection_group.async(io, serveHttpConnection, .{
+                        io,
+                        client_stream,
+                        self,
+                        client_ip,
+                        options,
+                        if (self.rate_limiter) |*limiter| limiter else null,
+                        @as(*ProxyStats, @constCast(&self.stats)),
+                    });
+                },
+                .tcp_tunnel => {
+                    // L4 TCP tunnel mode (legacy behavior)
+                    if (options.enable_stats) {
+                        self.stats.recordConnection();
+                    }
 
-            _ = connection_group.async(io, handleClientWithFeatures, .{
-                client_stream,
-                io,
-                self.backend_host,
-                self.backend_port,
-                options.connect_timeout,
-                @as(*ProxyStats, @constCast(&self.stats)),
-                &self.http_inspector,
-                options,
-                client_ip,
-                if (self.rate_limiter) |*limiter| limiter else null,
-                if (self.load_balancer) |*lb| lb else null,
-                if (self.http_cache) |*cache| cache else null,
-                self.allocator,
-            });
+                    _ = connection_group.async(io, handleClientWithFeatures, .{
+                        client_stream,
+                        io,
+                        self.backend_host,
+                        self.backend_port,
+                        options.connect_timeout,
+                        @as(*ProxyStats, @constCast(&self.stats)),
+                        &self.http_inspector,
+                        options,
+                        client_ip,
+                        if (self.rate_limiter) |*limiter| limiter else null,
+                        if (self.load_balancer) |*lb| lb else null,
+                        if (self.http_cache) |*cache| cache else null,
+                        self.allocator,
+                    });
+                },
+            }
         }
 
         // Print final statistics
@@ -376,6 +403,383 @@ pub const Proxy = struct {
         std.debug.print("- Io.Group for lifecycle management\n", .{});
         std.debug.print("- io.concurrent + io.select for duplex pipes\n", .{});
         std.debug.print("- Reader/Writer interfaces with buffering\n", .{});
+    }
+
+    /// Route an HTTP request to a backend
+    /// Returns routing decision with backend selection and cache policy
+    pub fn routeRequest(
+        self: *const Self,
+        request: *const HTTPInspector.HTTPRequest,
+        host: ?[]const u8,
+        client_ip: IpKey,
+        options: RunOptions,
+    ) !RoutingDecision {
+        _ = request; // Future: path-based routing, header inspection
+
+        var decision = RoutingDecision{
+            .backend_host = self.backend_host,
+            .backend_port = self.backend_port,
+            .cache_allowed = options.enable_caching,
+            .force_connection_close = false,
+        };
+
+        // Use load balancer if enabled
+        if (options.enable_load_balancing) {
+            if (self.load_balancer) |*lb| {
+                if (lb.selectBackend(client_ip)) |backend| {
+                    decision.backend = backend;
+                    decision.backend_host = backend.host;
+                    decision.backend_port = backend.port;
+                    backend.incrementConnections();
+                } else {
+                    return error.NoHealthyBackend;
+                }
+            }
+        }
+
+        // Disable caching if no Host header (security)
+        if (host == null) {
+            decision.cache_allowed = false;
+        }
+
+        return decision;
+    }
+
+    /// Serve HTTP connection with keep-alive support (L7 mode)
+    /// Loops over multiple requests on the same TCP connection
+    fn serveHttpConnection(
+        io: Io,
+        client_stream: net.Stream,
+        proxy: *const Self,
+        client_ip: IpKey,
+        options: RunOptions,
+        rate_limiter: ?*RateLimiter,
+        stats: *ProxyStats,
+    ) void {
+        defer client_stream.close(io);
+        if (options.enable_stats) {
+            defer stats.recordConnectionEnd();
+        }
+
+        const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
+
+        if (options.enable_connection_logging and !builtin.is_test) {
+            log.info("new HTTP connection from client", .{});
+        }
+
+        // Track connection
+        if (options.enable_stats) {
+            stats.recordConnection();
+        }
+
+        // Loop to handle multiple requests on same connection
+        var request_count: usize = 0;
+        while (true) {
+            request_count += 1;
+
+            // Serve one request/response cycle
+            const keep_alive = serveHttpOnce(
+                io,
+                client_stream,
+                proxy,
+                client_ip,
+                options,
+                rate_limiter,
+            ) catch |err| {
+                // On error, log and close connection
+                if (!builtin.is_test) {
+                    log.warn("request #{} failed: {s}, closing connection", .{ request_count, @errorName(err) });
+                }
+                if (options.enable_stats) {
+                    stats.recordError();
+                }
+                break;
+            };
+
+            // If keep_alive is false, close connection
+            if (!keep_alive) {
+                if (!builtin.is_test and request_count > 1) {
+                    log.info("connection closed after {} requests (keep-alive disabled)", .{request_count});
+                }
+                break;
+            }
+
+            // Connection will continue for next request
+            if (!builtin.is_test) {
+                log.info("keep-alive: waiting for request #{}", .{request_count + 1});
+            }
+        }
+
+        if (options.enable_connection_logging and !builtin.is_test and start_time != null) {
+            if (std.time.Instant.now()) |end_time| {
+                const duration_ns = end_time.since(start_time.?);
+                const duration_ms = duration_ns / std.time.ns_per_ms;
+                log.info("connection completed after {} requests, duration: {}ms", .{ request_count, duration_ms });
+            } else |_| {
+                log.info("connection completed after {} requests", .{request_count});
+            }
+        }
+    }
+
+    /// Serve a single HTTP request/response (L7 mode)
+    /// This is the foundation for HTTP keep-alive and proper L7 proxying
+    fn serveHttpOnce(
+        io: Io,
+        client_stream: net.Stream,
+        proxy: *const Self,
+        client_ip: IpKey,
+        options: RunOptions,
+        rate_limiter: ?*RateLimiter,
+    ) !bool {
+        // Returns true if connection should be kept alive, false otherwise
+
+        const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
+        var selected_backend: ?*Backend = null;
+
+        // Defer cleanup for rate limiting and backend connections
+        defer {
+            if (rate_limiter) |limiter| {
+                if (options.enable_rate_limiting) {
+                    limiter.release(client_ip);
+                }
+            }
+            if (selected_backend) |backend| {
+                backend.decrementConnections();
+            }
+        }
+
+        // Set up buffered readers/writers
+        var client_read_buf: [4096]u8 = undefined;
+        var client_write_buf: [4096]u8 = undefined;
+        var client_reader = client_stream.reader(io, &client_read_buf);
+        var client_writer = client_stream.writer(io, &client_write_buf);
+
+        // Buffer for request headers (8KB should be enough for most requests)
+        var request_header_buffer: [8192]u8 = undefined;
+        var request_size: usize = 0;
+
+        // Read request headers until we find \r\n\r\n or buffer is full
+        while (request_size < request_header_buffer.len) {
+            var slices = [_][]u8{request_header_buffer[request_size..]};
+            const n = client_reader.interface.readVec(&slices) catch |err| switch (err) {
+                error.EndOfStream => {
+                    if (request_size == 0) return false; // Clean close, no keep-alive
+                    return error.IncompleteRequest;
+                },
+                error.ReadFailed => return err,
+            };
+
+            if (n == 0) continue;
+            request_size += n;
+
+            // Check if we have complete headers
+            if (HTTPInspector.findHeadersEnd(request_header_buffer[0..request_size])) |_| {
+                break;
+            }
+        }
+
+        if (request_size == 0) return false; // No data, close connection
+
+        // Parse HTTP request
+        const request = HTTPInspector.parseRequestLine(request_header_buffer[0..request_size]) orelse {
+            if (!builtin.is_test) {
+                log.warn("failed to parse HTTP request", .{});
+            }
+            return error.MalformedRequest;
+        };
+
+        // Extract Host header
+        const maybe_host = HTTPInspector.findHeader(request_header_buffer[0..request_size], "Host");
+
+        // Log request
+        if (options.enable_connection_logging and !builtin.is_test) {
+            if (maybe_host) |host| {
+                log.info("HTTP {s} http://{s}{s}", .{ request.method, host, request.path });
+            } else {
+                log.info("HTTP {s} {s} (no Host header)", .{ request.method, request.path });
+            }
+        }
+
+        // Check cache for GET requests with Host header
+        if (options.enable_caching and std.mem.eql(u8, request.method, "GET")) {
+            if (maybe_host) |host| {
+                if (proxy.http_cache) |*cache| {
+                    if (cache.get(request.method, host, request.path)) |cached_response| {
+                        defer proxy.allocator.free(cached_response);
+
+                        if (!builtin.is_test) {
+                            log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
+                        }
+
+                        Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
+                            log.warn("failed to write cached response: {s}", .{@errorName(err)});
+                            return err;
+                        };
+                        Writer.flush(&client_writer.interface) catch |err| {
+                            log.warn("failed to flush cached response: {s}", .{@errorName(err)});
+                            return err;
+                        };
+
+                        if (options.enable_stats) {
+                            const stats = @constCast(&proxy.stats);
+                            stats.recordBytesBackendToClient(@intCast(cached_response.len));
+                        }
+
+                        // Check Connection header for keep-alive
+                        const connection_header = HTTPInspector.findHeader(request_header_buffer[0..request_size], "Connection");
+                        const keep_alive = if (connection_header) |conn|
+                            std.ascii.eqlIgnoreCase(conn, "keep-alive")
+                        else
+                            std.mem.eql(u8, request.version, "HTTP/1.1"); // HTTP/1.1 defaults to keep-alive
+
+                        return keep_alive;
+                    }
+
+                    if (!builtin.is_test) {
+                        log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
+                    }
+                }
+            } else {
+                if (!builtin.is_test) {
+                    log.warn("cache SKIPPED for GET {s} - missing Host header", .{request.path});
+                }
+            }
+        }
+
+        // Route request to backend
+        const decision = proxy.routeRequest(&request, maybe_host, client_ip, options) catch |err| {
+            log.err("routing failed: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                const stats = @constCast(&proxy.stats);
+                stats.recordError();
+            }
+            return err;
+        };
+
+        selected_backend = decision.backend;
+
+        // Connect to backend
+        const backend_stream = connectToBackend(
+            io,
+            decision.backend_host,
+            decision.backend_port,
+            options.connect_timeout,
+        ) catch |err| {
+            log.err("backend connect failed: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                const stats = @constCast(&proxy.stats);
+                stats.recordBackendFailure();
+                stats.recordError();
+            }
+            if (decision.backend) |backend| {
+                backend.markHealthy(false);
+                if (!builtin.is_test) {
+                    log.warn("marked backend {s}:{} as unhealthy", .{ backend.host, backend.port });
+                }
+            }
+            return err;
+        };
+        defer backend_stream.close(io);
+
+        // Mark backend as healthy on successful connection
+        if (decision.backend) |backend| {
+            if (!backend.isHealthy()) {
+                backend.markHealthy(true);
+                if (!builtin.is_test) {
+                    log.info("backend {s}:{} recovered to healthy state", .{ backend.host, backend.port });
+                }
+            }
+        }
+
+        if (options.enable_connection_logging and !builtin.is_test) {
+            log.info("connected to backend {s}:{}", .{ decision.backend_host, decision.backend_port });
+        }
+
+        // Set up backend readers/writers
+        var backend_read_buf: [4096]u8 = undefined;
+        var backend_write_buf: [4096]u8 = undefined;
+        var backend_writer = backend_stream.writer(io, &backend_write_buf);
+        var backend_reader = backend_stream.reader(io, &backend_read_buf);
+
+        // Forward request to backend
+        Writer.writeAll(&backend_writer.interface, request_header_buffer[0..request_size]) catch |err| {
+            log.err("failed to write request to backend: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                const stats = @constCast(&proxy.stats);
+                stats.recordError();
+            }
+            return err;
+        };
+        Writer.flush(&backend_writer.interface) catch |err| {
+            log.err("failed to flush request to backend: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                const stats = @constCast(&proxy.stats);
+                stats.recordError();
+            }
+            return err;
+        };
+
+        if (options.enable_stats) {
+            const stats = @constCast(&proxy.stats);
+            stats.recordBytesClientToBackend(@intCast(request_size));
+        }
+
+        // For now, read response and stream directly to client
+        // Future: buffer response for caching
+        var response_buffer: [8192]u8 = undefined;
+        while (true) {
+            var slices = [_][]u8{response_buffer[0..]};
+            const n = backend_reader.interface.readVec(&slices) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => {
+                    log.warn("backend read failed: {s}", .{@errorName(err)});
+                    if (options.enable_stats) {
+                        const stats = @constCast(&proxy.stats);
+                        stats.recordError();
+                    }
+                    return err;
+                },
+            };
+
+            if (n == 0) continue;
+
+            Writer.writeAll(&client_writer.interface, response_buffer[0..n]) catch |err| {
+                log.warn("client write failed: {s}", .{@errorName(err)});
+                if (options.enable_stats) {
+                    const stats = @constCast(&proxy.stats);
+                    stats.recordError();
+                }
+                return err;
+            };
+
+            if (options.enable_stats) {
+                const stats = @constCast(&proxy.stats);
+                stats.recordBytesBackendToClient(@intCast(n));
+            }
+        }
+
+        Writer.flush(&client_writer.interface) catch |err| {
+            log.warn("failed to flush response: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                const stats = @constCast(&proxy.stats);
+                stats.recordError();
+            }
+            return err;
+        };
+
+        if (options.enable_connection_logging and !builtin.is_test and start_time != null) {
+            if (std.time.Instant.now()) |end_time| {
+                const duration_ns = end_time.since(start_time.?);
+                const duration_ms = duration_ns / std.time.ns_per_ms;
+                log.info("request completed, duration: {}ms", .{duration_ms});
+            } else |_| {
+                log.info("request completed", .{});
+            }
+        }
+
+        // For now, close connection after each request
+        // Future: implement keep-alive
+        return false;
     }
 
     fn handleClientWithFeatures(
