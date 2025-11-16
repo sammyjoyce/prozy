@@ -249,6 +249,12 @@ pub const HTTPCache = struct {
         access_count: u32,
     };
 
+    /// Get current Unix timestamp in seconds
+    fn getTimestamp() i64 {
+        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
+        return ts.sec;
+    }
+
     allocator: std.mem.Allocator,
     cache: std.AutoHashMap(u64, CacheEntry),
     max_size: usize,
@@ -285,7 +291,7 @@ pub const HTTPCache = struct {
 
         if (self.cache.getPtr(key)) |entry| {
             // Check if expired
-            const now = std.time.timestamp();
+            const now = getTimestamp();
             if (now - entry.created_at > entry.ttl) {
                 self.evict(key);
                 _ = self.misses.fetchAdd(1, .monotonic);
@@ -325,24 +331,36 @@ pub const HTTPCache = struct {
         @memcpy(response_copy, response);
 
         const method_copy = try self.allocator.alloc(u8, method.len);
-        errdefer self.allocator.free(method_copy);
+        errdefer {
+            self.allocator.free(response_copy);
+            self.allocator.free(method_copy);
+        }
         @memcpy(method_copy, method);
 
         const path_copy = try self.allocator.alloc(u8, path.len);
-        errdefer self.allocator.free(path_copy);
+        errdefer {
+            self.allocator.free(response_copy);
+            self.allocator.free(method_copy);
+            self.allocator.free(path_copy);
+        }
         @memcpy(path_copy, path);
 
         const entry = CacheEntry{
             .response = response_copy,
             .method = method_copy,
             .path = path_copy,
-            .created_at = std.time.timestamp(),
+            .created_at = getTimestamp(),
             .ttl = ttl,
             .size = response.len,
             .access_count = 0,
         };
 
-        try self.cache.put(key, entry);
+        self.cache.put(key, entry) catch |err| {
+            self.allocator.free(response_copy);
+            self.allocator.free(method_copy);
+            self.allocator.free(path_copy);
+            return err;
+        };
         _ = self.current_size.fetchAdd(response.len, .monotonic);
     }
 
@@ -453,6 +471,7 @@ pub const LoadBalancer = struct {
     current_index: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     strategy: Strategy,
     mutex: std.Thread.Mutex = .{},
+    rng: std.Random.DefaultPrng,
 
     pub const Strategy = enum {
         round_robin,
@@ -463,9 +482,14 @@ pub const LoadBalancer = struct {
     };
 
     pub fn init(backends: []Backend, strategy: Strategy) LoadBalancer {
+        const seed = blk: {
+            const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch break :blk 0;
+            break :blk @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+        };
         return .{
             .backends = backends,
             .strategy = strategy,
+            .rng = std.Random.DefaultPrng.init(seed),
         };
     }
 
@@ -507,7 +531,8 @@ pub const LoadBalancer = struct {
         if (total_weight == 0) return null;
 
         const index = self.current_index.fetchAdd(1, .monotonic);
-        var target = @as(u32, @intCast(index % total_weight));
+        const total_weight_usize = @as(usize, @intCast(total_weight));
+        var target = @as(u32, @intCast(index % total_weight_usize));
 
         for (self.backends) |*backend| {
             if (!backend.isHealthy()) continue;
@@ -540,8 +565,10 @@ pub const LoadBalancer = struct {
     }
 
     fn randomBackend(self: *LoadBalancer) ?*Backend {
-        var rng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-        const random = rng.random();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const random = self.rng.random();
 
         var healthy_backends: usize = 0;
         for (self.backends) |backend| {
@@ -932,6 +959,9 @@ pub const Proxy = struct {
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
     ) void {
+        // TODO: Integrate HTTP caching - requires buffering and parsing HTTP requests/responses
+        _ = http_cache;
+
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
         var selected_backend: ?*Backend = null;
 
