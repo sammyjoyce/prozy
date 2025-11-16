@@ -322,15 +322,8 @@ pub const HTTPCache = struct {
             .next = null,
         };
 
-        // Add to cache map
-        self.cache.put(key, node) catch |err| {
-            self.allocator.free(response_copy);
-            self.allocator.free(method_copy);
-            self.allocator.free(host_copy);
-            self.allocator.free(path_copy);
-            self.allocator.destroy(node);
-            return err;
-        };
+        // Add to cache map (errdefer above handles cleanup on failure)
+        try self.cache.put(key, node);
 
         // Add to front of LRU list
         self.addToFront(node);
