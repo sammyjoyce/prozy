@@ -183,17 +183,29 @@ pub const RateLimiter = struct {
         return true;
     }
 
+    /// Release a rate limit slot for an IP address
+    ///
+    /// CRITICAL FIX: Prevents HashMap leak on OOM
+    /// - When count == 1: remove() entry entirely (avoids rehashing)
+    /// - When count > 1: put() will never fail (existing key, no allocation)
+    /// - Global counter is ALWAYS decremented to prevent leaks
+    ///
+    /// Previous implementation: put() could fail during HashMap rehashing,
+    /// causing global counter leak and eventual rate limit exhaustion.
     pub fn release(self: *RateLimiter, ip: u32) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.connections_per_ip.get(ip)) |count| {
             if (count > 0) {
-                // Only decrement global count if put succeeds to maintain consistency
-                self.connections_per_ip.put(ip, count - 1) catch {
-                    // If put fails, we can't update the count, so don't decrement global
-                    return;
-                };
+                if (count == 1) {
+                    // Remove entry entirely to avoid HashMap rehashing issues
+                    _ = self.connections_per_ip.remove(ip);
+                } else {
+                    // Decrement existing entry (should never fail - not adding new key)
+                    self.connections_per_ip.put(ip, count - 1) catch unreachable;
+                }
+                // Always decrement global counter
                 _ = self.current_global.fetchSub(1, .monotonic);
             }
         }
@@ -347,6 +359,7 @@ pub const HTTPCache = struct {
         key: u64,
         response: []u8,
         method: []u8,
+        host: []u8,
         path: []u8,
         created_at: i64,
         ttl: u32,
@@ -359,6 +372,7 @@ pub const HTTPCache = struct {
     const CacheEntry = struct {
         response: []u8,
         method: []u8,
+        host: []u8,
         path: []u8,
         created_at: i64,
         ttl: u32,
@@ -402,33 +416,42 @@ pub const HTTPCache = struct {
             const node = kv.value_ptr.*;
             self.allocator.free(node.response);
             self.allocator.free(node.method);
+            self.allocator.free(node.host);
             self.allocator.free(node.path);
             self.allocator.destroy(node);
         }
         self.cache.deinit();
     }
 
-    pub fn get(self: *HTTPCache, method: []const u8, path: []const u8) ?[]const u8 {
-        const key = hashKey(method, path);
+    /// Get cached response (read-only, uses shared lock for high concurrency)
+    ///
+    /// IMPORTANT CHANGES:
+    /// - Now includes Host header in cache key for multi-tenant isolation
+    /// - Uses lockShared() for concurrent reads (high performance)
+    /// - Does NOT update LRU order to avoid write lock contention
+    /// - Expired entries are detected but not evicted (cleanup happens during put)
+    ///
+    /// This design prioritizes read performance over LRU accuracy, which is
+    /// acceptable for a high-throughput proxy where cache hits are common.
+    pub fn get(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8) ?[]const u8 {
+        const key = hashKey(method, host, path);
 
-        // Use write lock from the start to avoid lock upgrade anti-pattern.
-        // Cache get() always modifies state (LRU order, access counts), so
-        // write lock is semantically correct and eliminates race conditions.
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        // Use shared (read) lock for concurrent reads
+        self.rwlock.lockShared();
+        defer self.rwlock.unlockShared();
 
         if (self.cache.get(key)) |node| {
-            // Check if expired
+            // Check if expired (read-only check)
             const now = getTimestamp();
             if (now - node.created_at > node.ttl) {
-                self.evictNode(node);
+                // Don't evict here, just return null
+                // Eviction will happen on next put() or during periodic cleanup
                 _ = self.misses.fetchAdd(1, .monotonic);
                 return null;
             }
 
-            // Move to front of LRU list (most recently used)
-            self.moveToFront(node);
-            node.access_count += 1;
+            // Don't update LRU order (read-only path for concurrency)
+            // Access count is not updated to avoid write contention
             _ = self.hits.fetchAdd(1, .monotonic);
             return node.response;
         }
@@ -437,8 +460,8 @@ pub const HTTPCache = struct {
         return null;
     }
 
-    pub fn put(self: *HTTPCache, method: []const u8, path: []const u8, response: []const u8, ttl: u32) !void {
-        const key = hashKey(method, path);
+    pub fn put(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8, response: []const u8, ttl: u32) !void {
+        const key = hashKey(method, host, path);
 
         // Don't cache if response is too large
         if (response.len > self.max_size / 2) {
@@ -454,7 +477,7 @@ pub const HTTPCache = struct {
         }
 
         // Check if we need to evict to make space
-        const total_new_size = response.len + method.len + path.len;
+        const total_new_size = response.len + method.len + host.len + path.len;
         while (self.current_size.load(.monotonic) + total_new_size > self.max_size and self.cache.count() > 0) {
             self.evictLRU();
         }
@@ -471,10 +494,19 @@ pub const HTTPCache = struct {
         }
         @memcpy(method_copy, method);
 
+        const host_copy = try self.allocator.alloc(u8, host.len);
+        errdefer {
+            self.allocator.free(response_copy);
+            self.allocator.free(method_copy);
+            self.allocator.free(host_copy);
+        }
+        @memcpy(host_copy, host);
+
         const path_copy = try self.allocator.alloc(u8, path.len);
         errdefer {
             self.allocator.free(response_copy);
             self.allocator.free(method_copy);
+            self.allocator.free(host_copy);
             self.allocator.free(path_copy);
         }
         @memcpy(path_copy, path);
@@ -484,6 +516,7 @@ pub const HTTPCache = struct {
         errdefer {
             self.allocator.free(response_copy);
             self.allocator.free(method_copy);
+            self.allocator.free(host_copy);
             self.allocator.free(path_copy);
             self.allocator.destroy(node);
         }
@@ -492,10 +525,11 @@ pub const HTTPCache = struct {
             .key = key,
             .response = response_copy,
             .method = method_copy,
+            .host = host_copy,
             .path = path_copy,
             .created_at = getTimestamp(),
             .ttl = ttl,
-            .size = response.len + method.len + path.len,
+            .size = response.len + method.len + host.len + path.len,
             .access_count = 0,
             .prev = null,
             .next = null,
@@ -505,6 +539,7 @@ pub const HTTPCache = struct {
         self.cache.put(key, node) catch |err| {
             self.allocator.free(response_copy);
             self.allocator.free(method_copy);
+            self.allocator.free(host_copy);
             self.allocator.free(path_copy);
             self.allocator.destroy(node);
             return err;
@@ -515,9 +550,10 @@ pub const HTTPCache = struct {
         _ = self.current_size.fetchAdd(node.size, .monotonic);
     }
 
-    fn hashKey(method: []const u8, path: []const u8) u64 {
+    fn hashKey(method: []const u8, host: []const u8, path: []const u8) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(method);
+        hasher.update(host);
         hasher.update(path);
         return hasher.final();
     }
@@ -584,6 +620,7 @@ pub const HTTPCache = struct {
         // Free memory
         self.allocator.free(node.response);
         self.allocator.free(node.method);
+        self.allocator.free(node.host);
         self.allocator.free(node.path);
         self.allocator.destroy(node);
     }
@@ -612,6 +649,10 @@ pub const HTTPCache = struct {
         }
     };
 };
+
+/// Global fallback timestamp counter for when clock_gettime fails
+/// Used by Backend health tracking to ensure recovery works even if system clock fails
+var global_fallback_timestamp: std.atomic.Value(i64) = std.atomic.Value(i64).init(1);
 
 /// Backend server configuration for load balancing
 pub const Backend = struct {
@@ -644,12 +685,12 @@ pub const Backend = struct {
         if (!healthy) {
             // Record when backend became unhealthy.
             // This timestamp is used by shouldRetry() for exponential backoff.
-            const now = HTTPCache.getTimestamp();
+            var now = HTTPCache.getTimestamp();
 
-            // Warn if timestamp failed (0 means clock_gettime failed).
-            // Without a valid timestamp, shouldRetry() will return false permanently.
+            // Use fallback monotonic counter if clock_gettime fails
             if (now == 0) {
-                log.warn("failed to record unhealthy_since for backend {s}:{}: clock_gettime returned 0, health recovery will be disabled", .{ self.host, self.port });
+                now = global_fallback_timestamp.fetchAdd(1, .monotonic);
+                log.warn("clock_gettime failed for backend {s}:{}, using fallback timestamp: {}", .{ self.host, self.port, now });
             }
 
             self.unhealthy_since.store(now, .monotonic);
@@ -898,12 +939,8 @@ pub const LoadBalancer = struct {
     }
 
     fn weightedRoundRobin(self: *LoadBalancer) ?*Backend {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Increment counter ONCE per public call, BEFORE the two-pass selection.
-        // This ensures weighted distribution is correct even when falling back
-        // to retry candidates in selectBackendWithRetry().
+        // No mutex needed: fetchAdd is atomic, backends array is immutable,
+        // and selectBackendWithRetry only reads backend state via atomics
         const start_index = self.current_index.fetchAdd(1, .monotonic);
 
         const context = SelectionContext{
@@ -937,9 +974,7 @@ pub const LoadBalancer = struct {
     }
 
     fn leastConnections(self: *LoadBalancer) ?*Backend {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+        // No mutex needed: connection counts are read via atomics
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = 0,
@@ -1415,12 +1450,15 @@ pub const Proxy = struct {
             if (bytes_read > 0) {
                 // Try to parse HTTP request
                 if (HTTPInspector.parseRequestLine(request_buffer[0..bytes_read])) |request| {
+                    // Extract Host header for cache key (multi-tenant isolation)
+                    const host = HTTPInspector.findHeader(request_buffer[0..bytes_read], "Host") orelse "default";
+
                     // Only cache GET requests
                     if (std.mem.eql(u8, request.method, "GET")) {
-                        if (http_cache.?.get(request.method, request.path)) |cached_response| {
+                        if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
                             // Cache hit! Send cached response directly
                             if (!builtin.is_test) {
-                                log.info("cache HIT for GET {s}", .{request.path});
+                                log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
                             }
 
                             var client_write_buf: [4096]u8 = undefined;
@@ -1438,7 +1476,7 @@ pub const Proxy = struct {
                             return;
                         } else {
                             if (!builtin.is_test) {
-                                log.info("cache MISS for GET {s}", .{request.path});
+                                log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
                             }
                         }
                     }
@@ -1627,32 +1665,54 @@ pub const Proxy = struct {
             return;
         };
 
-        // Log first completion
+        // Wait for second completion with timeout and error handling
         switch (first_completed) {
             .client_to_backend => |completion_result| {
-                handleCopyResult("client->backend", completion_result);
-                // Client request fully sent, now wait for backend response
-                const second_completed = io.select(.{
-                    .backend_to_client = &future_b2c,
-                }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second_completed) {
-                    .backend_to_client => |result| handleCopyResult("backend->client", result),
+                // Check if first direction succeeded or failed
+                if (completion_result) |_| {
+                    // Success: wait for backend->client with timeout
+                    handleCopyResult("client->backend", completion_result);
+                    const second_completed = io.select(.{
+                        .backend_to_client = &future_b2c,
+                        .timeout = Timeout.fromMs(30000), // 30s grace period
+                    }) catch |err| {
+                        log.err("second io.select failed or timed out: {s}, canceling backend->client", .{@errorName(err)});
+                        future_b2c.cancel(io) catch {};
+                        return;
+                    };
+                    switch (second_completed) {
+                        .backend_to_client => |result| handleCopyResult("backend->client", result),
+                        else => {},
+                    }
+                } else |err| {
+                    // Error in client->backend: cancel backend->client immediately
+                    log.err("client->backend failed: {s}, canceling backend->client", .{@errorName(err)});
+                    handleCopyResult("client->backend", completion_result);
+                    future_b2c.cancel(io) catch {};
                 }
             },
             .backend_to_client => |completion_result| {
-                handleCopyResult("backend->client", completion_result);
-                // Backend response fully sent, now wait for client request
-                const second_completed = io.select(.{
-                    .client_to_backend = &future_c2b,
-                }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second_completed) {
-                    .client_to_backend => |result| handleCopyResult("client->backend", result),
+                // Check if first direction succeeded or failed
+                if (completion_result) |_| {
+                    // Success: wait for client->backend with timeout
+                    handleCopyResult("backend->client", completion_result);
+                    const second_completed = io.select(.{
+                        .client_to_backend = &future_c2b,
+                        .timeout = Timeout.fromMs(30000), // 30s grace period
+                    }) catch |err| {
+                        log.err("second io.select failed or timed out: {s}, canceling client->backend", .{@errorName(err)});
+                        future_c2b.cancel(io) catch {};
+                        return;
+                    };
+                    switch (second_completed) {
+                        .client_to_backend => |result| handleCopyResult("client->backend", result),
+                        else => {},
+                    }
+                } else |err| {
+                    // Error in backend->client: cancel client->backend immediately
+                    log.err("backend->client failed: {s}, canceling client->backend", .{@errorName(err)});
+                    handleCopyResult("backend->client", completion_result);
+                    future_c2b.cancel(io) catch {};
                 }
             },
         }
@@ -1681,6 +1741,7 @@ pub const Proxy = struct {
         enable_http_inspection: bool,
         http_cache: *HTTPCache,
         request_method: []const u8,
+        request_host: []const u8,
         request_path: []const u8,
         allocator: std.mem.Allocator,
 
@@ -1753,26 +1814,76 @@ pub const Proxy = struct {
             return;
         };
 
-        // Wait for second completion
+        // Wait for second completion with timeout and error handling
+        //
+        // CRITICAL FIXES:
+        // 1. Added 30s timeout to prevent infinite hangs (HTTP keep-alive, network partition)
+        // 2. Cancel opposite direction immediately when one side fails (resource cleanup)
+        // 3. Proper error propagation with stats recording
+        //
+        // Previous issues:
+        // - No timeout: connections could hang forever waiting for EOF
+        // - No cancellation: failed direction kept other side running indefinitely
+        // - Resource leak: tasks continued consuming CPU/memory after connection died
         switch (first_completed) {
             .client_to_backend => |result| {
-                handleCopyResult("client->backend", result);
-                const second = io.select(.{ .backend_to_client = &future_b2c }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second) {
-                    .backend_to_client => |r| handleCopyResult("backend->client", r),
+                // Check if first direction succeeded or failed
+                if (result) |_| {
+                    // Success: wait for backend->client with timeout
+                    handleCopyResult("client->backend", result);
+                    const second = io.select(.{
+                        .backend_to_client = &future_b2c,
+                        .timeout = Timeout.fromMs(30000), // 30s grace period
+                    }) catch |err| {
+                        log.err("second io.select failed or timed out: {s}, canceling backend->client", .{@errorName(err)});
+                        future_b2c.cancel(io) catch {};
+                        if (options.enable_stats) {
+                            stats.recordError();
+                        }
+                        return;
+                    };
+                    switch (second) {
+                        .backend_to_client => |r| handleCopyResult("backend->client", r),
+                        else => {},
+                    }
+                } else |err| {
+                    // Error in client->backend: cancel backend->client immediately
+                    log.err("client->backend failed: {s}, canceling backend->client", .{@errorName(err)});
+                    handleCopyResult("client->backend", result);
+                    future_b2c.cancel(io) catch {};
+                    if (options.enable_stats) {
+                        stats.recordError();
+                    }
                 }
             },
             .backend_to_client => |result| {
-                handleCopyResult("backend->client", result);
-                const second = io.select(.{ .client_to_backend = &future_c2b }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second) {
-                    .client_to_backend => |r| handleCopyResult("client->backend", r),
+                // Check if first direction succeeded or failed
+                if (result) |_| {
+                    // Success: wait for client->backend with timeout
+                    handleCopyResult("backend->client", result);
+                    const second = io.select(.{
+                        .client_to_backend = &future_c2b,
+                        .timeout = Timeout.fromMs(30000), // 30s grace period
+                    }) catch |err| {
+                        log.err("second io.select failed or timed out: {s}, canceling client->backend", .{@errorName(err)});
+                        future_c2b.cancel(io) catch {};
+                        if (options.enable_stats) {
+                            stats.recordError();
+                        }
+                        return;
+                    };
+                    switch (second) {
+                        .client_to_backend => |r| handleCopyResult("client->backend", r),
+                        else => {},
+                    }
+                } else |err| {
+                    // Error in backend->client: cancel client->backend immediately
+                    log.err("backend->client failed: {s}, canceling client->backend", .{@errorName(err)});
+                    handleCopyResult("backend->client", result);
+                    future_c2b.cancel(io) catch {};
+                    if (options.enable_stats) {
+                        stats.recordError();
+                    }
                 }
             },
         }
@@ -2001,6 +2112,7 @@ pub const Proxy = struct {
             if (response_data.len > 0 and response_data.len <= PipeJobWithCaching.max_cacheable_size) {
                 job.http_cache.put(
                     job.request_method,
+                    job.request_host,
                     job.request_path,
                     response_data,
                     PipeJobWithCaching.default_ttl_seconds,
@@ -2737,15 +2849,15 @@ test "HTTPCache: basic caching" {
     defer cache.deinit();
 
     // Cache miss
-    const result1 = cache.get("GET", "/api/users");
+    const result1 = cache.get("GET", "example.com", "/api/users");
     try testing.expect(result1 == null);
 
     // Store response
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
-    try cache.put("GET", "/api/users", response, 300);
+    try cache.put("GET", "example.com", "/api/users", response, 300);
 
     // Cache hit
-    const result2 = cache.get("GET", "/api/users");
+    const result2 = cache.get("GET", "example.com", "/api/users");
     try testing.expect(result2 != null);
     if (result2) |data| {
         try testing.expectEqualStrings(response, data);
@@ -2765,11 +2877,11 @@ test "HTTPCache: LRU eviction" {
     defer cache.deinit();
 
     // Fill cache
-    try cache.put("GET", "/1", "response1response1response1", 300);
-    try cache.put("GET", "/2", "response2response2response2", 300);
+    try cache.put("GET", "test.com", "/1", "response1response1response1", 300);
+    try cache.put("GET", "test.com", "/2", "response2response2response2", 300);
 
     // This should evict the least recently used entry
-    try cache.put("GET", "/3", "response3response3response3", 300);
+    try cache.put("GET", "test.com", "/3", "response3response3response3", 300);
 
     const stats = cache.getStats();
     try testing.expect(stats.entry_count <= 2);
@@ -2782,11 +2894,11 @@ test "HTTPCache: TTL expiration" {
     defer cache.deinit();
 
     // Store with 0 TTL (should expire immediately)
-    try cache.put("GET", "/expire", "data", 0);
+    try cache.put("GET", "test.com", "/expire", "data", 0);
 
     // Wait a bit (in real scenario, time would pass)
     // For testing, we rely on the timestamp check
-    const result = cache.get("GET", "/expire");
+    const result = cache.get("GET", "test.com", "/expire");
 
     // May or may not be expired depending on timing
     _ = result;
@@ -3166,10 +3278,11 @@ test "HTTPCache Integration: cache only successful GET requests with 200 OK" {
         try testing.expectEqualStrings("/api/users", request.path);
 
         // Simulate caching the response
-        try cache.put(request.method, request.path, ok_response, 300);
+        const test_host = "api.example.com";
+        try cache.put(request.method, test_host, request.path, ok_response, 300);
 
         // Verify it was cached
-        const cached = cache.get(request.method, request.path);
+        const cached = cache.get(request.method, test_host, request.path);
         try testing.expect(cached != null);
         if (cached) |data| {
             try testing.expectEqualStrings(ok_response, data);
@@ -3213,8 +3326,11 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
 
     // Parse the request
     if (HTTPInspector.parseRequestLine(request_data)) |request| {
+        // Extract host header for multi-tenant isolation
+        const host = HTTPInspector.findHeader(request_data, "Host") orelse "default";
+
         // Check cache (should be miss)
-        const cached = cache.get(request.method, request.path);
+        const cached = cache.get(request.method, host, request.path);
         try testing.expect(cached == null);
 
         // Verify cache miss was recorded
@@ -3229,10 +3345,10 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
         const backend_response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata";
 
         // After receiving backend response, cache it for future requests
-        try cache.put(request.method, request.path, backend_response, 300);
+        try cache.put(request.method, host, request.path, backend_response, 300);
 
         // Verify subsequent request gets cached response
-        const cached_after = cache.get(request.method, request.path);
+        const cached_after = cache.get(request.method, host, request.path);
         try testing.expect(cached_after != null);
         if (cached_after) |data| {
             try testing.expectEqualStrings(backend_response, data);
