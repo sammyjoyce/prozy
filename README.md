@@ -9,17 +9,27 @@ prozy/
 ├── src/
 │   ├── main.zig              # Main CLI entry point
 │   ├── root.zig              # Core proxy module and library exports
-│   ├── examples/             # Example programs and demos
-│   │   ├── async_demo.zig    # Core async capabilities demo
-│   │   ├── async_demo_works.zig  # Simplified working demo
-│   │   └── demo_complete.zig # Full capabilities demonstration
-│   └── tools/                # Development utilities
-│       └── test_time.zig     # Time API exploration tool
+├── examples/                 # Example programs and demos
+│   ├── async_demo.zig        # Core async capabilities demo
+│   ├── async_demo_works.zig  # Simplified working demo
+│   ├── demo_complete.zig     # Full capabilities demonstration
+│   └── full_features_demo.zig # Complete feature showcase
+├── tests/                    # Test suites
+│   ├── e2e_test.zig          # Integration tests
+│   └── test-server.ts        # Bun test server (port 3003)
+├── docs/                     # Architecture documentation
+│   ├── ARCHITECTURE.md       # Comprehensive architecture guide
+│   ├── ARCHITECTURE_README.md  # Quick reference
+│   ├── prozy-architecture.dot  # GraphViz complete flow diagram
+│   ├── prozy-architecture.svg  # Rendered flow diagram
+│   ├── prozy-components.dot   # GraphViz component diagram
+│   └── prozy-components.svg   # Rendered component diagram
+├── tools/                    # Development utilities
+│   └── test_time.zig         # Time API exploration tool
 ├── build.zig                 # Build configuration
-├── build.zig.zon           # Package metadata
-├── deps.nix                 # Nix dependencies
-├── flake.nix                # Nix flake configuration
-└── README.md                # This file
+├── build.zig.zon            # Package metadata
+├── CLAUDE.md                 # Coding style guide
+└── README.md                 # This file
 ```
 
 ## ✅ Current Status: Complete Working Implementation
@@ -106,6 +116,41 @@ zig build test
 # Test specific module
 zig test src/root.zig
 ```
+
+## 📐 Architecture Documentation
+
+Comprehensive architecture documentation with visual diagrams is available in the [`docs/`](docs/) directory:
+
+- **[Architecture Overview](docs/ARCHITECTURE.md)** - Detailed component descriptions, algorithms, and design decisions
+- **[Architecture Diagrams](docs/ARCHITECTURE_README.md)** - How to generate and view visual diagrams
+
+### Visual Architecture Diagrams
+
+<details>
+<summary>📊 Complete Request Flow (click to expand)</summary>
+
+![Prozy Architecture - Complete Request Flow](docs/prozy-architecture.svg)
+
+*Complete request flow from client to backend, showing all enterprise features: access control, rate limiting, HTTP caching, load balancing, backend health management, and bidirectional async I/O.*
+
+</details>
+
+<details>
+<summary>🔧 Component Relationships (click to expand)</summary>
+
+![Prozy Components](docs/prozy-components.svg)
+
+*Main architectural components and their interactions, including the async I/O runtime, security layer, caching layer, and load balancing system.*
+
+</details>
+
+**Key Architecture Features:**
+- **Async I/O Runtime**: `std.Io.Threaded` with concurrent operations and structured concurrency
+- **7 Enterprise Features**: Access control, rate limiting, HTTP cache, load balancing, backend health, statistics, protocol inspection
+- **O(1) LRU Cache**: Doubly-linked list with RwLock for concurrent reads
+- **Exponential Backoff**: Smart backend recovery (5s → 10s → 20s → ... → 300s)
+- **Two-Pass Load Balancing**: Healthy backends first, retry candidates second
+- **Request Buffering**: 8KB buffer prevents data loss during cache inspection
 
 ## 🏗️ Architecture Overview
 
