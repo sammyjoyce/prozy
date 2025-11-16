@@ -5,12 +5,17 @@ const prozy = @import("prozy");
 
 pub fn main() !void {
     const gpa = std.heap.page_allocator;
-    
+
     // Initialize the real async TCP proxy
     std.debug.print("🚀 Starting Prozy TCP Proxy with Zig's new async I/O\n", .{});
     std.debug.print("📡 Real async implementation using std.Io.Threaded\n", .{});
     std.debug.print("🔥 Demonstrating io.concurrent() and io.select() capabilities\n\n", .{});
-    
+
+    // Create the async runtime once and pass it down, per the new std.Io guidance
+    var threaded_io = std.Io.Threaded.init(gpa);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
     // Create and run the actual proxy (listen: 8080 → forward: 3003)
     var proxy = prozy.Proxy.init(gpa, 8080, "127.0.0.1", 3003);
     defer proxy.deinit();
@@ -30,5 +35,5 @@ pub fn main() !void {
 
     std.debug.print("🔧 Running real TCP proxy (press Ctrl+C to stop)...\n", .{});
 
-    try proxy.run();
+    try proxy.runWithIo(io);
 }

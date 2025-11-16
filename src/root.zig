@@ -1,14 +1,15 @@
 //! Prozy: A simple TCP proxy
 //!
-//! This is a proof of concept for a TCP proxy using Zig.
-//! Currently implements a simple synchronous version,
-//! with plans to upgrade to async I/O when the APIs are stable.
+//! This is a production-grade async TCP proxy using Zig's new std.Io runtime.
+//! It demonstrates the expected pattern from the 0.16 era async APIs: create an
+//! Io executor at the edge (usually `main`), then pass it through the
+//! application just like an allocator so the implementation can target
+//! Threaded, io_uring, kqueue, or any future backend without code changes.
 //!
 //! The proxy showcases the core patterns needed:
-//! - TCP socket listening and accepting
-//! - Bidirectional data copying
-//! - Thread-based concurrency (simple version)
-//! - Async I/O patterns (planned upgrade)
+//! - TCP socket listening and accepting with std.Io.net
+//! - Bidirectional data copying coordinated via io.concurrent/io.select
+//! - Structured concurrency via Io.Group and explicit cancellation
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -911,10 +912,22 @@ pub const Proxy = struct {
     }
 
     pub fn run(self: *Self) !void {
-        return self.runWithOptions(.{});
+        var threaded_io = std.Io.Threaded.init(self.allocator);
+        defer threaded_io.deinit();
+        return self.runWithIoOptions(threaded_io.io(), .{});
     }
 
     pub fn runWithOptions(self: *Self, options: RunOptions) !void {
+        var threaded_io = std.Io.Threaded.init(self.allocator);
+        defer threaded_io.deinit();
+        return self.runWithIoOptions(threaded_io.io(), options);
+    }
+
+    pub fn runWithIo(self: *Self, io: Io) !void {
+        return self.runWithIoOptions(io, .{});
+    }
+
+    pub fn runWithIoOptions(self: *Self, io: Io, options: RunOptions) !void {
         const configured_limit = options.max_connections orelse if (builtin.is_test)
             0
         else
@@ -924,10 +937,6 @@ pub const Proxy = struct {
             self.printArchitectureSummary();
             return;
         }
-
-        var threaded_io = std.Io.Threaded.init(self.allocator);
-        defer threaded_io.deinit();
-        const io = threaded_io.io();
 
         const listen_addr = try resolveListenAddress(options.listen_host, self.proxy_port);
         var server = try listen_addr.listen(io, .{ .reuse_address = options.reuse_address });
@@ -1030,9 +1039,9 @@ pub const Proxy = struct {
                 // Convert bytes to u32 in network byte order (big-endian)
                 const bytes = ip4.bytes;
                 return (@as(u32, bytes[0]) << 24) |
-                       (@as(u32, bytes[1]) << 16) |
-                       (@as(u32, bytes[2]) << 8) |
-                       (@as(u32, bytes[3]));
+                    (@as(u32, bytes[1]) << 16) |
+                    (@as(u32, bytes[2]) << 8) |
+                    (@as(u32, bytes[3]));
             },
             .ip6 => |ip6| {
                 // Hash IPv6 addresses to avoid DoS from all IPv6 mapping to 0
@@ -1462,7 +1471,7 @@ pub const Proxy = struct {
         switch (first_completed) {
             .client_to_backend => |result| {
                 handleCopyResult("client->backend", result);
-                const second = io.select(.{.backend_to_client = &future_b2c}) catch |err| {
+                const second = io.select(.{ .backend_to_client = &future_b2c }) catch |err| {
                     log.err("second io.select failed: {s}", .{@errorName(err)});
                     return;
                 };
@@ -1472,7 +1481,7 @@ pub const Proxy = struct {
             },
             .backend_to_client => |result| {
                 handleCopyResult("backend->client", result);
-                const second = io.select(.{.client_to_backend = &future_c2b}) catch |err| {
+                const second = io.select(.{ .client_to_backend = &future_c2b }) catch |err| {
                     log.err("second io.select failed: {s}", .{@errorName(err)});
                     return;
                 };
@@ -1594,24 +1603,11 @@ pub const Proxy = struct {
         _ = client_connection;
     }
 
-    /// Copy data between two streams (async version planned)
+    /// Copy data between two streams (placeholder)
     pub fn copyStream(source: anytype, destination: anytype) !void {
-        // Future async implementation:
-        // var buffer: [8192]u8 = undefined;
-        // var source_buf: [8192]u8 = undefined;
-        // var dest_buf: [8192]u8 = undefined;
-        //
-        // var source_reader = source.readerStreaming(&source_buf);
-        // var dest_writer = destination.writer(&dest_buf);
-        //
-        // while (true) {
-        //     const bytes_read = try source_reader.read(&buffer);
-        //     if (bytes_read == 0) break;
-        //
-        //     try dest_writer.writeAll(buffer[0..bytes_read]);
-        //     try dest_writer.flush();
-        // }
-
+        // Historical shim retained for API compatibility. The actual async
+        // proxy implementation relies on copyBidirectional{,WithStats}, which
+        // uses io.concurrent/io.select as described in the new std.Io guide.
         _ = source;
         _ = destination;
     }
@@ -1619,9 +1615,21 @@ pub const Proxy = struct {
 
 // Convenience function for quick testing
 pub fn runProxy(allocator: std.mem.Allocator, proxy_port: u16, backend_host: []const u8, backend_port: u16) !void {
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    try runProxyWithIo(allocator, threaded_io.io(), proxy_port, backend_host, backend_port);
+}
+
+pub fn runProxyWithIo(
+    allocator: std.mem.Allocator,
+    io: Io,
+    proxy_port: u16,
+    backend_host: []const u8,
+    backend_port: u16,
+) !void {
     var proxy = Proxy.init(allocator, proxy_port, backend_host, backend_port);
     defer proxy.deinit();
-    try proxy.run();
+    try proxy.runWithIo(io);
 }
 
 test {

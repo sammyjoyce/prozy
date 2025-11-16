@@ -119,6 +119,12 @@ connection_group.async(io, handleClientWithFeatures, .{
 var future_c2b = io.concurrent(copyPipeWithStats, .{job_c2b}) catch |err| switch (err) {
     error.ConcurrencyUnavailable => { /* handle gracefully */ },
 };
+
+// Library entry point stays Io-agnostic; callers pass the executor in
+const prozy = @import("prozy");
+var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+defer proxy.deinit();
+try proxy.runWithIo(io);
 ```
 
 ## Enterprise-Ready Features

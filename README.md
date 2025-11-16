@@ -66,6 +66,20 @@ zig build
 zig build run -- --listen 0.0.0.0 --port 9090 --backend localhost:3000
 ```
 
+### Run Programmatically with std.Io
+```zig
+const allocator = std.heap.page_allocator;
+
+var threaded_io = std.Io.Threaded.init(allocator);
+defer threaded_io.deinit();
+const io = threaded_io.io();
+
+var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+defer proxy.deinit();
+
+try proxy.runWithIo(io);
+```
+
 ### Run the Async Demo Shows
 ```bash
 # Complete async I/O demonstration
@@ -91,8 +105,9 @@ zig test src/root.zig
 
 ### Proxy Implementation Pattern
 ```zig
-// 1. Initialize async runtime
+// 1. Initialize async runtime (once at the edge of your app)
 var threaded_io = std.Io.Threaded.init(allocator);
+defer threaded_io.deinit();
 const io = threaded_io.io();
 
 // 2. Create TCP server
@@ -104,9 +119,9 @@ while (server.accept(io)) |client| {
 }
 
 // 4. In each client handler:
-//    - Connect to backend
-//    - Set up bidirectional copy with io.select()
-//    - Clean up resources with defer
+//    - Connect to backend via backend_addr.connect(io, ...)
+//    - Set up bidirectional copy with io.concurrent()/io.select()
+//    - Clean up resources with defer and future.cancel() when needed
 ```
 
 ### Data Flow Architecture
