@@ -115,11 +115,11 @@ pub const IpKey = union(enum) {
         return result;
     }
 
-    pub fn format(self: IpKey, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+    pub fn format(self: IpKey, comptime fmt: []const u8, options: anytype, writer: anytype) !void {
         _ = fmt;
         _ = options;
         switch (self) {
-            .ipv4 => |v4| try writer.print("IPv4:{}", .{v4}),
+            .ipv4 => |v4| try writer.print("IPv4:{any}", .{v4}),
             .ipv6 => |v6| try writer.print("IPv6:{x}", .{v6}),
         }
     }
@@ -1363,7 +1363,7 @@ pub const Proxy = struct {
             if (options.enable_access_control) {
                 if (self.access_control) |acl| {
                     if (!acl.isAllowed(client_ip)) {
-                        log.warn("connection from {} denied by access control", .{client_ip});
+                        log.warn("connection from {any} denied by access control", .{client_ip});
                         client_stream.close(io);
                         continue;
                     }
@@ -1374,7 +1374,7 @@ pub const Proxy = struct {
             if (options.enable_rate_limiting) {
                 if (self.rate_limiter) |*limiter| {
                     if (!limiter.tryAcquire(client_ip)) {
-                        log.warn("connection from {} denied by rate limiter", .{client_ip});
+                        log.warn("connection from {any} denied by rate limiter", .{client_ip});
                         client_stream.close(io);
                         continue;
                     }
@@ -1383,7 +1383,7 @@ pub const Proxy = struct {
 
             // Only increment accepted counter after all validation passes
             accepted += 1;
-            log.info("accepted connection #{} from {}", .{ accepted, client_ip });
+            log.info("accepted connection #{} from {any}", .{ accepted, client_ip });
 
             if (options.enable_stats) {
                 self.stats.recordConnection();
@@ -1781,15 +1781,13 @@ pub const Proxy = struct {
                     handleCopyResult("client->backend", completion_result);
                     const second_completed = io.select(.{
                         .backend_to_client = &future_b2c,
-                        .timeout = Timeout.fromMs(30000), // 30s grace period
                     }) catch |err| {
-                        log.err("second io.select failed or timed out: {s}, canceling backend->client", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err)});
                         future_b2c.cancel(io) catch {};
                         return;
                     };
                     switch (second_completed) {
                         .backend_to_client => |result| handleCopyResult("backend->client", result),
-                        else => {},
                     }
                 } else |err| {
                     // Error in client->backend: cancel backend->client immediately
@@ -1805,15 +1803,13 @@ pub const Proxy = struct {
                     handleCopyResult("backend->client", completion_result);
                     const second_completed = io.select(.{
                         .client_to_backend = &future_c2b,
-                        .timeout = Timeout.fromMs(30000), // 30s grace period
                     }) catch |err| {
-                        log.err("second io.select failed or timed out: {s}, canceling client->backend", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err)});
                         future_c2b.cancel(io) catch {};
                         return;
                     };
                     switch (second_completed) {
                         .client_to_backend => |result| handleCopyResult("client->backend", result),
-                        else => {},
                     }
                 } else |err| {
                     // Error in backend->client: cancel client->backend immediately
@@ -1940,9 +1936,8 @@ pub const Proxy = struct {
                     handleCopyResult("client->backend", result);
                     const second = io.select(.{
                         .backend_to_client = &future_b2c,
-                        .timeout = Timeout.fromMs(30000), // 30s grace period
                     }) catch |err| {
-                        log.err("second io.select failed or timed out: {s}, canceling backend->client", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err)});
                         future_b2c.cancel(io) catch {};
                         if (options.enable_stats) {
                             stats.recordError();
@@ -1951,7 +1946,6 @@ pub const Proxy = struct {
                     };
                     switch (second) {
                         .backend_to_client => |r| handleCopyResult("backend->client", r),
-                        else => {},
                     }
                 } else |err| {
                     // Error in client->backend: cancel backend->client immediately
@@ -1970,9 +1964,8 @@ pub const Proxy = struct {
                     handleCopyResult("backend->client", result);
                     const second = io.select(.{
                         .client_to_backend = &future_c2b,
-                        .timeout = Timeout.fromMs(30000), // 30s grace period
                     }) catch |err| {
-                        log.err("second io.select failed or timed out: {s}, canceling client->backend", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err)});
                         future_c2b.cancel(io) catch {};
                         if (options.enable_stats) {
                             stats.recordError();
@@ -1981,7 +1974,6 @@ pub const Proxy = struct {
                     };
                     switch (second) {
                         .client_to_backend => |r| handleCopyResult("client->backend", r),
-                        else => {},
                     }
                 } else |err| {
                     // Error in backend->client: cancel client->backend immediately
@@ -2603,8 +2595,8 @@ test "AccessControl: allow policy" {
     defer acl.deinit();
 
     // Default allow policy - all IPs allowed
-    try testing.expect(acl.isAllowed(0x7F000001)); // 127.0.0.1
-    try testing.expect(acl.isAllowed(0xC0A80001)); // 192.168.0.1
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0x7F000001 })); // 127.0.0.1
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0xC0A80001 })); // 192.168.0.1
 }
 
 test "AccessControl: deny policy" {
@@ -2614,8 +2606,8 @@ test "AccessControl: deny policy" {
     defer acl.deinit();
 
     // Default deny policy - all IPs denied
-    try testing.expect(!acl.isAllowed(0x7F000001));
-    try testing.expect(!acl.isAllowed(0xC0A80001));
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0x7F000001 }));
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0xC0A80001 }));
 }
 
 test "AccessControl: allow list" {
@@ -2625,10 +2617,10 @@ test "AccessControl: allow list" {
     defer acl.deinit();
 
     // Add specific IPs to allow list
-    try acl.addToAllowList(0x7F000001); // 127.0.0.1
+    try acl.addToAllowList(.{ .ipv4 = 0x7F000001 }); // 127.0.0.1
 
-    try testing.expect(acl.isAllowed(0x7F000001));
-    try testing.expect(!acl.isAllowed(0xC0A80001));
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0x7F000001 }));
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0xC0A80001 }));
 }
 
 test "AccessControl: deny list" {
@@ -2638,10 +2630,10 @@ test "AccessControl: deny list" {
     defer acl.deinit();
 
     // Add specific IPs to deny list
-    try acl.addToDenyList(0xC0A80001); // 192.168.0.1
+    try acl.addToDenyList(.{ .ipv4 = 0xC0A80001 }); // 192.168.0.1
 
-    try testing.expect(acl.isAllowed(0x7F000001)); // Not in deny list
-    try testing.expect(!acl.isAllowed(0xC0A80001)); // In deny list
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0x7F000001 })); // Not in deny list
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0xC0A80001 })); // In deny list
 }
 
 test "RateLimiter: basic limiting" {
@@ -2650,8 +2642,8 @@ test "RateLimiter: basic limiting" {
     var limiter = RateLimiter.init(allocator, 2, 5); // 2 per IP, 5 global
     defer limiter.deinit();
 
-    const ip1: u32 = 0x7F000001;
-    const ip2: u32 = 0x7F000002;
+    const ip1 = IpKey{ .ipv4 = 0x7F000001 };
+    const ip2 = IpKey{ .ipv4 = 0x7F000002 };
 
     // First IP can acquire up to limit
     try testing.expect(limiter.tryAcquire(ip1));
@@ -2673,8 +2665,8 @@ test "RateLimiter: global limit" {
     var limiter = RateLimiter.init(allocator, 10, 3); // 10 per IP, 3 global
     defer limiter.deinit();
 
-    const ip1: u32 = 0x7F000001;
-    const ip2: u32 = 0x7F000002;
+    const ip1 = IpKey{ .ipv4 = 0x7F000001 };
+    const ip2 = IpKey{ .ipv4 = 0x7F000002 };
 
     // Acquire global limit
     try testing.expect(limiter.tryAcquire(ip1));
@@ -2915,7 +2907,7 @@ test "Proxy: enable access control" {
 
     if (proxy.access_control) |*acl| {
         // Add to allow list
-        try acl.addToAllowList(0x7F000001);
+        try acl.addToAllowList(.{ .ipv4 = 0x7F000001 });
     }
 }
 
@@ -3180,17 +3172,17 @@ test "LoadBalancer: round robin" {
     var lb = LoadBalancer.init(&backends, .round_robin);
 
     // Should rotate through backends
-    const b1 = lb.selectBackend(0);
+    const b1 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b1 != null);
 
-    const b2 = lb.selectBackend(0);
+    const b2 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b2 != null);
 
-    const b3 = lb.selectBackend(0);
+    const b3 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b3 != null);
 
     // Should wrap around
-    const b4 = lb.selectBackend(0);
+    const b4 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b4 != null);
 
     _ = allocator;
@@ -3210,7 +3202,7 @@ test "LoadBalancer: weighted round robin" {
     var backend2_count: u32 = 0;
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        if (lb.selectBackend(0)) |backend| {
+        if (lb.selectBackend(.{ .ipv4 = 0 })) |backend| {
             if (std.mem.eql(u8, backend.host, "backend2")) {
                 backend2_count += 1;
             }
@@ -3235,14 +3227,14 @@ test "LoadBalancer: least connections" {
     var lb = LoadBalancer.init(&backends, .least_connections);
 
     // First backend should have 0 connections
-    const b1 = lb.selectBackend(0);
+    const b1 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b1 != null);
     if (b1) |backend| {
         backend.incrementConnections();
     }
 
     // Should select a different backend with fewer connections
-    const b2 = lb.selectBackend(0);
+    const b2 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b2 != null);
 
     _ = allocator;
@@ -3259,8 +3251,8 @@ test "LoadBalancer: ip hash" {
 
     var lb = LoadBalancer.init(&backends, .ip_hash);
 
-    const ip1: u32 = 0x7F000001;
-    const ip2: u32 = 0x7F000002;
+    const ip1 = IpKey{ .ipv4 = 0x7F000001 };
+    const ip2 = IpKey{ .ipv4 = 0x7F000002 };
 
     // Same IP should consistently get same backend
     const b1 = lb.selectBackend(ip1);
@@ -3292,7 +3284,7 @@ test "LoadBalancer: no healthy backends" {
 
     var lb = LoadBalancer.init(&backends, .round_robin);
 
-    const result = lb.selectBackend(0);
+    const result = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(result == null);
 
     _ = allocator;
@@ -3479,19 +3471,21 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     const path = "/api/short-lived";
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nshort";
 
+    const host = "example.com";
+
     // Cache with very short TTL (0 seconds - immediate expiration)
-    try cache.put(method, path, response, 0);
+    try cache.put(method, host, path, response, 0);
 
     // Immediate lookup might hit or miss depending on timing
     // The key is that the TTL mechanism is tested
-    const cached1 = cache.get(method, path);
+    const cached1 = cache.get(method, host, path);
 
     // Regardless of first lookup, we verify TTL behavior:
     // Put a new entry with longer TTL
-    try cache.put(method, path, response, 300);
+    try cache.put(method, host, path, response, 300);
 
     // This should definitely hit
-    const cached2 = cache.get(method, path);
+    const cached2 = cache.get(method, host, path);
     try testing.expect(cached2 != null);
 
     // Verify cache is working
@@ -3499,9 +3493,9 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     try testing.expect(stats.entry_count == 1);
 
     // Test another path with 0 TTL to verify expiration logic
-    try cache.put("GET", "/api/expired", "data", 0);
+    try cache.put("GET", host, "/api/expired", "data", 0);
     // The entry may expire immediately, demonstrating TTL functionality
-    _ = cache.get("GET", "/api/expired");
+    _ = cache.get("GET", host, "/api/expired");
 
     _ = cached1; // May or may not be null
 }
@@ -3513,6 +3507,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     defer cache.deinit();
 
     // Pre-populate cache with test data
+    const host = "test.com";
     const paths = [_][]const u8{
         "/api/path1",
         "/api/path2",
@@ -3523,7 +3518,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
 
     for (paths) |path| {
         const response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest";
-        try cache.put("GET", path, response, 300);
+        try cache.put("GET", host, path, response, 300);
     }
 
     // Simulate concurrent access (sequential in test, but tests lock correctness)
@@ -3533,7 +3528,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     // Multiple "concurrent" readers
     for (0..10) |i| {
         const path = paths[i % paths.len];
-        const cached = cache.get("GET", path);
+        const cached = cache.get("GET", host, path);
 
         if (cached) |_| {
             hits += 1;
@@ -3553,12 +3548,12 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     // Test concurrent writes (LRU updates via get())
     // The new write lock pattern in get() prevents race conditions
     for (paths) |path| {
-        _ = cache.get("GET", path); // Update LRU order
+        _ = cache.get("GET", host, path); // Update LRU order
     }
 
     // Verify all entries still accessible
     for (paths) |path| {
-        const cached = cache.get("GET", path);
+        const cached = cache.get("GET", host, path);
         try testing.expect(cached != null);
     }
 }
@@ -3571,32 +3566,34 @@ test "HTTPCache Integration: cache size limits and LRU eviction behavior" {
     var cache = HTTPCache.init(allocator, cache_size);
     defer cache.deinit();
 
-    // Each entry: method (3) + path (10) + response (50) = 63 bytes
-    // Cache can hold ~4 entries (256 / 63 = 4.06)
+    const host = "test.com";
+
+    // Each entry: method (3) + host (8) + path (10) + response (50) = 71 bytes
+    // Cache can hold ~3 entries (256 / 71 = 3.60)
 
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345"; // 50 bytes
 
     // Add entries until cache is full
-    try cache.put("GET", "/path0001", response, 300);
-    try cache.put("GET", "/path0002", response, 300);
-    try cache.put("GET", "/path0003", response, 300);
-    try cache.put("GET", "/path0004", response, 300);
+    try cache.put("GET", host, "/path0001", response, 300);
+    try cache.put("GET", host, "/path0002", response, 300);
+    try cache.put("GET", host, "/path0003", response, 300);
+    try cache.put("GET", host, "/path0004", response, 300);
 
     var stats = cache.getStats();
     const entries_after_fill = stats.entry_count;
 
-    // Cache should have 4 entries
+    // Cache should have 3-4 entries
     try testing.expect(entries_after_fill <= 4);
 
     // Add 5th entry - should evict LRU (path0001)
-    try cache.put("GET", "/path0005", response, 300);
+    try cache.put("GET", host, "/path0005", response, 300);
 
     // Verify LRU eviction occurred
-    const evicted = cache.get("GET", "/path0001");
+    const evicted = cache.get("GET", host, "/path0001");
     try testing.expect(evicted == null); // Should be evicted
 
     // Verify newest entry is present
-    const newest = cache.get("GET", "/path0005");
+    const newest = cache.get("GET", host, "/path0005");
     try testing.expect(newest != null);
 
     // Verify cache size accounting is correct
@@ -3620,7 +3617,7 @@ test "LoadBalancer Integration: refactored selection maintains round-robin behav
 
     // Select 12 times (4 full rotations)
     for (0..12) |_| {
-        if (lb.selectBackend(0)) |backend| {
+        if (lb.selectBackend(.{ .ipv4 = 0 })) |backend| {
             if (std.mem.eql(u8, backend.host, "backend1")) {
                 selections[0] += 1;
             } else if (std.mem.eql(u8, backend.host, "backend2")) {
@@ -3659,7 +3656,7 @@ test "LoadBalancer Integration: two-pass selection with unhealthy backends" {
     var backend3_count: u32 = 0;
 
     for (0..10) |_| {
-        if (lb.selectBackend(0)) |backend| {
+        if (lb.selectBackend(.{ .ipv4 = 0 })) |backend| {
             if (std.mem.eql(u8, backend.host, "backend1")) {
                 backend1_count += 1;
             } else if (std.mem.eql(u8, backend.host, "backend2")) {
@@ -3696,14 +3693,14 @@ test "LoadBalancer Integration: retry logic with all backends unhealthy" {
     var lb = LoadBalancer.init(&backends, .round_robin);
 
     // Should return null when no healthy backends
-    const result = lb.selectBackend(0);
+    const result = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(result == null);
 
     // Recover one backend
     backends[0].markHealthy(true);
 
     // Should now succeed
-    const result2 = lb.selectBackend(0);
+    const result2 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(result2 != null);
     if (result2) |backend| {
         try testing.expectEqualStrings("backend1", backend.host);
@@ -3822,23 +3819,24 @@ test "HTTPCache Integration: verify correct size accounting in put operations" {
     var cache = HTTPCache.init(allocator, 500);
     defer cache.deinit();
 
-    // Put entry and verify size accounting includes method + path + response
+    // Put entry and verify size accounting includes method + host + path + response
     const method = "GET"; // 3 bytes
+    const host = "test.com"; // 8 bytes
     const path = "/test"; // 5 bytes
     const response = "HTTP/1.1 200 OK\r\n\r\nHello"; // 25 bytes
-    // Total: 3 + 5 + 25 = 33 bytes
+    // Total: 3 + 8 + 5 + 25 = 41 bytes
 
-    try cache.put(method, path, response, 300);
+    try cache.put(method, host, path, response, 300);
 
     const stats = cache.getStats();
 
-    // Verify size accounting - should be exactly method + path + response lengths
-    const expected_size = method.len + path.len + response.len;
+    // Verify size accounting - should be exactly method + host + path + response lengths
+    const expected_size = method.len + host.len + path.len + response.len;
     try testing.expectEqual(@as(usize, expected_size), stats.current_size);
     try testing.expect(stats.current_size <= 500);
     try testing.expectEqual(@as(u64, 1), stats.entry_count);
 
     // Verify entry is retrievable
-    const cached = cache.get(method, path);
+    const cached = cache.get(method, host, path);
     try testing.expect(cached != null);
 }
