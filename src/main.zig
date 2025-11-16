@@ -35,5 +35,7 @@ pub fn main() !void {
 
     std.debug.print("🔧 Running real TCP proxy (press Ctrl+C to stop)...\n", .{});
 
-    try proxy.runWithIo(io);
+    // Use the primary API: runWithIoOptions with explicit Io parameter
+    // This follows Andrew Kelley's pattern of treating Io like an allocator
+    try proxy.runWithIoOptions(io, .{});
 }

@@ -207,22 +207,49 @@ pub const Proxy = struct {
         }
     }
 
+    /// Convenience wrapper: Creates a std.Io.Threaded runtime and runs the proxy.
+    /// For production use, prefer runWithIoOptions() to pass your own Io executor.
     pub fn run(self: *Self) !void {
         var threaded_io = std.Io.Threaded.init(self.allocator);
         defer threaded_io.deinit();
         return self.runWithIoOptions(threaded_io.io(), .{});
     }
 
+    /// Convenience wrapper: Creates a std.Io.Threaded runtime with custom options.
+    /// For production use, prefer runWithIoOptions() to pass your own Io executor.
     pub fn runWithOptions(self: *Self, options: RunOptions) !void {
         var threaded_io = std.Io.Threaded.init(self.allocator);
         defer threaded_io.deinit();
         return self.runWithIoOptions(threaded_io.io(), options);
     }
 
+    /// Convenience wrapper: Runs the proxy with a provided Io executor and default options.
+    /// For custom options, use runWithIoOptions() directly.
     pub fn runWithIo(self: *Self, io: Io) !void {
         return self.runWithIoOptions(io, .{});
     }
 
+    /// PRIMARY API: Run the proxy with a provided Io executor and custom options.
+    ///
+    /// This is the recommended API following Andrew Kelley's Io pattern:
+    /// - Create std.Io.Threaded (or io_uring/kqueue) in main()
+    /// - Pass the Io executor through your application like an allocator
+    /// - This enables testing different Io backends without changing proxy code
+    ///
+    /// Example:
+    /// ```zig
+    /// var threaded_io = std.Io.Threaded.init(allocator);
+    /// defer threaded_io.deinit();
+    /// const io = threaded_io.io();
+    ///
+    /// var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+    /// defer proxy.deinit();
+    ///
+    /// try proxy.runWithIoOptions(io, .{
+    ///     .enable_caching = true,
+    ///     .enable_load_balancing = true,
+    /// });
+    /// ```
     pub fn runWithIoOptions(self: *Self, io: Io, options: RunOptions) !void {
         const configured_limit = options.max_connections orelse if (builtin.is_test)
             0

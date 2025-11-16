@@ -68,5 +68,6 @@ pub fn main() !void {
     std.log.info("Use case: Production HTTP service", .{});
     std.log.info("======================================", .{});
 
-    try proxy.runWithIo(io);
+    // Run proxy using the primary API (Io passed as first-class parameter)
+    try proxy.runWithIoOptions(io, .{});
 }
