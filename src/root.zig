@@ -434,7 +434,7 @@ pub const Proxy = struct {
 
         std.debug.print("\nCore Implementation Patterns:\n", .{});
         std.debug.print("1. Server listener: accept incoming connections\n", .{});
-        std.debug.print("2. Thread per client via io.concurrent()\n", .{});
+        std.debug.print("2. Dedicated concurrent task per client via io.concurrent()\n", .{});
         std.debug.print("3. Backend connection: resolve + connect\n", .{});
         std.debug.print("4. Bidirectional copy with io.select()\n", .{});
 
