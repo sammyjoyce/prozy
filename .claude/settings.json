@@ -10,7 +10,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/setup_env.sh"
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/zig-setup.sh"
           },
           {
             "type": "command",
@@ -23,6 +23,28 @@
           {
             "type": "command",
             "command": "echo '🤖 Agents available: code-reviewer, performance-analyzer, memory-safety, zig-expert'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "tool_name == 'write' || tool_name == 'edit'",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/zig-format.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "tool_name == 'bash'",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/zig-command-validator.sh"
           }
         ]
       }
@@ -63,15 +85,6 @@
       "Bash:mv *",
       "Edit:build.zig*",
       "Edit:**/*.md"
-    ],
-    "deny": [
-      "Bash:git push --force*",
-      "Bash:rm -rf /",
-      "Bash:rm -rf ~",
-      "Bash:chmod -R 777*",
-      "Bash:git config --global*",
-      "Edit:.git/**",
-      "Write:.git/**"
     ]
   }
 }
