@@ -1266,5 +1266,5 @@ pub fn runProxyWithIo(
 ) !void {
     var proxy = Proxy.init(allocator, proxy_port, backend_host, backend_port);
     defer proxy.deinit();
-    try proxy.runWithIo(io);
+    try proxy.runWithIoOptions(io, .{});
 }

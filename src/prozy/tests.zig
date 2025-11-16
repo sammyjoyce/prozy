@@ -1680,3 +1680,62 @@ test "HTTPCache Integration: prevent cache pollution across different hosts" {
     try testing.expectEqual(@as(u64, 2), stats.entry_count);
     try testing.expectEqual(@as(u64, 2), stats.hits);
 }
+
+test "Proxy runWithIoOptions API with explicit Io executor" {
+    const allocator = testing.allocator;
+
+    // Create Io executor explicitly (demonstrates dependency injection)
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    // Initialize proxy
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Test primary API with explicit Io and options
+    try proxy.runWithIoOptions(io, .{});
+}
+
+test "Proxy runWithIoOptions API with custom configuration" {
+    const allocator = testing.allocator;
+
+    // Create Io executor
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    // Initialize proxy
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Test with custom configuration options
+    try proxy.runWithIoOptions(io, .{
+        .connect_timeout = .none, // Use default timeout
+        .max_connections = 500, // Limit connections
+    });
+}
+
+test "Proxy API hierarchy demonstration" {
+    const allocator = testing.allocator;
+
+    // Create Io executor for explicit APIs
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    // Initialize proxy
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Test all three API levels work
+
+    // 1. Primary API - explicit Io and options
+    try proxy.runWithIoOptions(io, .{});
+
+    // 2. Convenience wrapper - explicit Io, default options
+    try proxy.runWithIo(io);
+
+    // 3. Convenience wrapper - creates Io internally, default options
+    try proxy.run();
+}

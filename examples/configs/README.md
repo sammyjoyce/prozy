@@ -170,7 +170,7 @@ pub fn main() !void {
     proxy.enableRateLimiting(/* per_ip */, /* global */);
     // ... etc
 
-    try proxy.runWithIo(io);
+    try proxy.runWithIoOptions(io, .{});
 }
 ```
 

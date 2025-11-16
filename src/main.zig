@@ -35,5 +35,5 @@ pub fn main() !void {
 
     std.debug.print("🔧 Running real TCP proxy (press Ctrl+C to stop)...\n", .{});
 
-    try proxy.runWithIo(io);
+    try proxy.runWithIoOptions(io, .{});
 }

@@ -126,7 +126,7 @@ var future_c2b = io.concurrent(copyPipeWithStats, .{job_c2b}) catch |err| switch
 const prozy = @import("prozy");
 var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
 defer proxy.deinit();
-try proxy.runWithIo(io);
+try proxy.runWithIoOptions(io, .{});
 
 // Backend health recovery with exponential backoff
 const backend = Backend.init("127.0.0.1", 3003, 1);
@@ -263,6 +263,120 @@ Comprehensive observability with ProxyStats:
 - Backend selection statistics
 
 All metrics use atomic operations for thread-safe concurrent access.
+
+## Migration Guide: Io as a First-Class Parameter
+
+### API Changes
+
+Prozy has been refactored to follow Zig 0.16.x's recommended async I/O pattern by treating the `Io` executor as a first-class parameter. This enables better testing, flexible I/O backend selection, and clearer separation of concerns.
+
+### New API Hierarchy
+
+1. **`runWithIoOptions(io, options)`** - Primary API (recommended)
+   - Explicit `Io` executor and configuration options
+   - Full control over I/O behavior and backend selection
+
+2. **`runWithIo(io)`** - Convenience wrapper
+   - Explicit `Io` executor with default options
+   - Equivalent to: `runWithIoOptions(io, .{})`
+
+3. **`run()`** - Simple convenience
+   - Creates `std.Io.Threaded` internally with default options
+   - Suitable for basic applications
+
+4. **`runWithDefaults()`** - Legacy compatibility
+   - Maintains backward compatibility
+   - Delegates to primary API
+
+### Migration Steps
+
+#### From `runWithIo(io)` to `runWithIoOptions(io, .{})`
+
+**Before:**
+```zig
+var threaded_io = std.Io.Threaded.init(allocator);
+defer threaded_io.deinit();
+const io = threaded_io.io();
+
+var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+defer proxy.deinit();
+try proxy.runWithIo(io);
+```
+
+**After:**
+```zig
+var threaded_io = std.Io.Threaded.init(allocator);
+defer threaded_io.deinit();
+const io = threaded_io.io();
+
+var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+defer proxy.deinit();
+try proxy.runWithIoOptions(io, .{});
+```
+
+#### From `run()` to `runWithIoOptions(io, options)`
+
+**Before:**
+```zig
+var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+defer proxy.deinit();
+try proxy.run();
+```
+
+**After (with explicit Io control):**
+```zig
+var threaded_io = std.Io.Threaded.init(allocator);
+defer threaded_io.deinit();
+const io = threaded_io.io();
+
+var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+defer proxy.deinit();
+try proxy.runWithIoOptions(io, .{
+    .connect_timeout = 5000,
+    .max_connections = 1000,
+});
+```
+
+### Benefits of Migration
+
+1. **Testing**: Inject mock `Io` implementations for unit tests
+2. **Performance**: Choose optimal I/O backend for your platform
+3. **Configuration**: Runtime control over timeouts and limits
+4. **Future-proof**: Easy to adopt new I/O backends without API changes
+
+### Backward Compatibility
+
+All existing code continues to work unchanged. The convenience APIs (`run()`, `runWithIo()`) remain available and delegate to the primary API.
+
+### Recommended Pattern for New Code
+
+```zig
+const std = @import("std");
+const prozy = @import("prozy");
+
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+    
+    // Create and configure Io executor
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+    
+    // Initialize proxy with configuration
+    var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+    defer proxy.deinit();
+    
+    // Enable features as needed
+    proxy.enableCaching(10 * 1024 * 1024);
+    proxy.enableRateLimiting(100, 1000);
+    
+    // Run with explicit Io and options
+    try proxy.runWithIoOptions(io, .{
+        .connect_timeout = 5000,
+        .max_connections = 1000,
+    });
+}
+```
 
 ## Testing Strategy
 

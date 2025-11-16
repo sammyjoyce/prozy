@@ -151,7 +151,7 @@ pub fn main() !void {
 
     // Run proxy
     std.log.info("Prozy starting on port {}", .{proxy.proxy_port});
-    try proxy.runWithIo(io);
+    try proxy.runWithIoOptions(io, .{});
 }
 ```
 
