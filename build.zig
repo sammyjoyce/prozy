@@ -184,6 +184,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(test_time);
 
+    const full_features_demo = b.addExecutable(.{
+        .name = "full_features_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/full_features_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(full_features_demo);
+
     // Example run steps
     const run_async_demo = b.addRunArtifact(async_demo);
     const async_demo_step = b.step("async_demo", "Run async demo");
@@ -200,6 +213,10 @@ pub fn build(b: *std.Build) void {
     const run_test_time = b.addRunArtifact(test_time);
     const test_time_step = b.step("test_time", "Run time utility");
     test_time_step.dependOn(&run_test_time.step);
+
+    const run_full_features = b.addRunArtifact(full_features_demo);
+    const full_features_step = b.step("full_features", "Run full features demonstration");
+    full_features_step.dependOn(&run_full_features.step);
 
     // E2E test executable
     const e2e_test = b.addExecutable(.{
