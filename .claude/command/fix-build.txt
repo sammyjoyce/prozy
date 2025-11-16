@@ -1,0 +1,33 @@
+Diagnose and fix Zig build errors.
+
+Run build and capture errors:
+zig build 2>&1
+
+For each error, analyze:
+
+1. **Root Cause**:
+   - Type mismatch
+   - Undeclared identifier
+   - Missing import/use statement
+   - API incompatibility with Zig 0.16.x
+   - Async I/O pattern error
+
+2. **Fix Strategy**:
+   - Use explicit types (u32 not usize)
+   - Maintain assertion density >= 2
+   - Keep functions under 70 lines
+   - Follow async patterns from CLAUDE.md
+
+3. **Implementation**:
+   - Make minimal changes needed
+   - Preserve code quality
+   - Don't sacrifice safety for quick fixes
+
+4. **Verification**:
+   - Run zig build after fix
+   - Run zig build test to ensure no regressions
+   - Check style compliance
+
+If it's an async I/O issue, consult @CLAUDE.md for correct patterns.
+
+Make surgical fixes - don't refactor unnecessarily.

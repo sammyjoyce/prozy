@@ -1,0 +1,33 @@
+Analyze performance characteristics of specified component with back-of-the-envelope calculations.
+
+Component to analyze: {user will specify, e.g., HTTPCache, LoadBalancer, etc.}
+
+Perform detailed performance analysis:
+
+1. **Review Code**: Examine implementation in @src/
+
+2. **Calculate Performance Metrics**:
+   - Throughput: Requests/second  
+   - Latency: P50, P95, P99 estimates
+   - Memory: Per-connection usage
+   - CPU: Overhead per operation
+
+3. **Identify Bottlenecks** (in order of impact):
+   - Network I/O patterns
+   - Memory allocations
+   - Lock contention
+   - Algorithmic complexity
+
+4. **Optimization Opportunities**:
+   - Concrete improvements
+   - Expected performance gains (e.g., "10x throughput")
+   - Implementation complexity
+
+5. **Benchmarking Plan**:
+   - What to measure
+   - How to measure it
+   - Success criteria
+
+Use the four resources framework: Network → Disk → Memory → CPU (slowest to fastest)
+
+Show your math and provide specific numbers.
