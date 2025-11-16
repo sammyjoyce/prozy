@@ -75,7 +75,7 @@ const Clock = Io.Clock;
 // Timeout configuration for bidirectional copy operations
 const BIDIRECTIONAL_TIMEOUT_SECONDS: i64 = 30;
 
-// Re-export types from other modules (will be created in later steps)
+// Re-export types from other modules
 const IpKey = @import("transport.zig").IpKey;
 const ProxyStats = @import("stats.zig").ProxyStats;
 const AccessControl = @import("access.zig").AccessControl;
@@ -87,6 +87,11 @@ const LoadBalancer = @import("backend.zig").LoadBalancer;
 const resolveListenAddress = @import("transport.zig").resolveListenAddress;
 const connectToBackend = @import("transport.zig").connectToBackend;
 const extractClientIp = @import("transport.zig").extractClientIp;
+
+// Phase 3: Routing infrastructure
+const Router = @import("router.zig").Router;
+const HttpMode = @import("routing.zig").HttpMode;
+const RoutingDecision = @import("routing.zig").RoutingDecision;
 
 pub const RunOptions = struct {
     /// Host/interface to bind the proxy listener to. Default is loopback.
@@ -128,6 +133,11 @@ pub const Proxy = struct {
     http_inspector: HTTPInspector,
     http_cache: ?HTTPCache = null,
     load_balancer: ?LoadBalancer = null,
+
+    // Phase 3: Routing and lifecycle
+    router: ?*Router = null,
+    mode: HttpMode = .reverse_proxy,
+    shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator, proxy_port: u16, backend_host: []const u8, backend_port: u16) Self {
         return Self{
@@ -205,6 +215,18 @@ pub const Proxy = struct {
             log.info("Cache size: {} / {} bytes", .{ cache_stats.current_size, cache_stats.max_size });
             log.info("Cache entries: {}", .{cache_stats.entry_count});
         }
+    }
+
+    /// Request graceful shutdown (Phase 3)
+    /// This will cause the accept loop to terminate after the current iteration
+    pub fn shutdown(self: *Self) void {
+        self.shutdown_requested.store(true, .monotonic);
+        log.info("graceful shutdown requested", .{});
+    }
+
+    /// Check if shutdown has been requested
+    pub fn isShutdownRequested(self: *const Self) bool {
+        return self.shutdown_requested.load(.monotonic);
     }
 
     /// Convenience wrapper: Creates a std.Io.Threaded runtime and runs the proxy.
@@ -289,12 +311,15 @@ pub const Proxy = struct {
                 log.info("load balancing: ENABLED ({} backends, strategy: {})", .{ lb.backends.len, lb.strategy });
             }
         }
+        if (self.router) |router| {
+            log.info("routing mode: {} ({} routes, {} clusters)", .{ router.mode, router.routes.len, router.clusters.len });
+        }
 
         var connection_group: std.Io.Group = .init;
         defer connection_group.wait(io);
 
         var accepted: usize = 0;
-        while (accepted < configured_limit) {
+        while (!self.isShutdownRequested() and accepted < configured_limit) {
             log.info("calling server.accept() [accepted={}/{}]", .{ accepted, configured_limit });
             const client_stream = server.accept(io) catch |err| {
                 log.err("accept failed: {s}", .{@errorName(err)});
@@ -376,6 +401,99 @@ pub const Proxy = struct {
         std.debug.print("- Io.Group for lifecycle management\n", .{});
         std.debug.print("- io.concurrent + io.select for duplex pipes\n", .{});
         std.debug.print("- Reader/Writer interfaces with buffering\n", .{});
+    }
+
+    /// Handle CONNECT tunnel (Phase 3)
+    /// This implements HTTPS proxying by establishing a raw TCP tunnel
+    ///
+    /// Flow:
+    /// 1. Respond with "HTTP/1.1 200 Connection Established\r\n\r\n"
+    /// 2. Connect to the backend
+    /// 3. Hand off to bidirectional copy for raw TCP forwarding
+    ///
+    /// This is used for HTTPS proxying where the client sends:
+    /// CONNECT example.com:443 HTTP/1.1
+    fn handleConnectTunnel(
+        client_stream: net.Stream,
+        io: Io,
+        backend_host: []const u8,
+        backend_port: u16,
+        connect_timeout: Timeout,
+        stats: *ProxyStats,
+        http_inspector: *const HTTPInspector,
+        options: RunOptions,
+    ) void {
+        defer client_stream.close(io);
+
+        if (!builtin.is_test) {
+            log.info("CONNECT tunnel to {s}:{}", .{ backend_host, backend_port });
+        }
+
+        // Send 200 Connection Established response
+        const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        var client_write_buf: [4096]u8 = undefined;
+        var client_writer = client_stream.writer(io, &client_write_buf);
+
+        Writer.writeAll(&client_writer.interface, response) catch |err| {
+            log.err("failed to send CONNECT response: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                stats.recordError();
+            }
+            return;
+        };
+        Writer.flush(&client_writer.interface) catch |err| {
+            log.err("failed to flush CONNECT response: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                stats.recordError();
+            }
+            return;
+        };
+
+        if (!builtin.is_test) {
+            log.info("sent 200 Connection Established, establishing tunnel", .{});
+        }
+
+        // Connect to backend
+        const backend_stream = connectToBackend(io, backend_host, backend_port, connect_timeout) catch |err| {
+            log.err("CONNECT tunnel backend connect failed: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                stats.recordBackendFailure();
+                stats.recordError();
+            }
+            return;
+        };
+        defer backend_stream.close(io);
+
+        if (!builtin.is_test) {
+            log.info("CONNECT tunnel established, starting bidirectional copy", .{});
+        }
+
+        // Set up buffered readers and writers for bidirectional copy
+        var client_read_buf: [4096]u8 = undefined;
+        var backend_read_buf: [4096]u8 = undefined;
+        var backend_write_buf: [4096]u8 = undefined;
+
+        var client_reader = client_stream.reader(io, &client_read_buf);
+        var backend_reader = backend_stream.reader(io, &backend_read_buf);
+        var backend_writer = backend_stream.writer(io, &backend_write_buf);
+
+        // Reuse client_writer from above (already initialized)
+
+        // Start bidirectional copy (raw TCP tunnel)
+        copyBidirectionalWithStats(
+            io,
+            &client_reader.interface,
+            &backend_writer.interface,
+            &backend_reader.interface,
+            &client_writer.interface,
+            stats,
+            http_inspector,
+            options,
+        );
+
+        if (!builtin.is_test) {
+            log.info("CONNECT tunnel closed", .{});
+        }
     }
 
     fn handleClientWithFeatures(
