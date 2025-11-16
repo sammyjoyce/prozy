@@ -170,10 +170,14 @@ const backend_port = std.process.getEnvVarOwned(allocator, "BACKEND_PORT")
 
 ### Configuration Examples
 
-See `examples/` directory for:
-- `full_features_demo.zig` - All features enabled
-- `demo_complete.zig` - Production-like setup
-- Custom configurations for specific use cases
+See `examples/configs/` directory for:
+- `simple_proxy.zig` - Basic TCP forwarding
+- `caching_proxy.zig` - With HTTP response caching
+- `load_balanced_proxy.zig` - Multi-backend load balancing
+- `secure_proxy.zig` - Access control and rate limiting
+- `production_proxy.zig` - Full enterprise feature set
+
+Or run `zig build full_features` to see all features demonstrated.
 
 ## Deployment Patterns
 

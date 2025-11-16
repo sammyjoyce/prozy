@@ -619,9 +619,15 @@ prozy/
 │       ├── copyBidirectional (1591-1730)  # Async I/O copying
 │       └── Tests             (1732+)      # 40+ unit tests
 ├── examples/
-│   ├── demo_complete.zig            # Full proxy showcase
-│   ├── full_features_demo.zig       # All features demonstration
-│   └── async_demo_works.zig         # Async I/O capabilities
+│   ├── async_io_demo.zig           # Async I/O capabilities demo
+│   ├── full_features_demo.zig      # All proxy features showcase
+│   ├── http_response_parsing_demo.zig # HTTP parsing utilities
+│   └── configs/                    # Proxy configuration templates
+│       ├── simple_proxy.zig
+│       ├── caching_proxy.zig
+│       ├── load_balanced_proxy.zig
+│       ├── secure_proxy.zig
+│       └── production_proxy.zig
 ├── tests/
 │   ├── e2e_test.zig                 # Integration tests
 │   └── test-server.ts               # Bun test server (port 3003)

@@ -10,10 +10,15 @@ prozy/
 │   ├── main.zig              # Main CLI entry point
 │   ├── root.zig              # Core proxy module and library exports
 ├── examples/                 # Example programs and demos
-│   ├── async_demo.zig        # Core async capabilities demo
-│   ├── async_demo_works.zig  # Simplified working demo
-│   ├── demo_complete.zig     # Full capabilities demonstration
-│   └── full_features_demo.zig # Complete feature showcase
+│   ├── async_io_demo.zig     # Async I/O capabilities demonstration
+│   ├── full_features_demo.zig # Complete proxy features showcase
+│   ├── http_response_parsing_demo.zig # HTTP parsing utilities
+│   └── configs/              # Proxy configuration templates
+│       ├── simple_proxy.zig        # Basic TCP forwarding
+│       ├── caching_proxy.zig       # With HTTP caching
+│       ├── load_balanced_proxy.zig # Multi-backend routing
+│       ├── secure_proxy.zig        # Access control + rate limiting
+│       └── production_proxy.zig    # Full enterprise features
 ├── tests/                    # Test suites
 │   ├── e2e_test.zig          # Integration tests
 │   └── test-server.ts        # Bun test server (port 3003)
@@ -96,16 +101,16 @@ defer proxy.deinit();
 try proxy.runWithIo(io);
 ```
 
-### Run the Async Demo Shows
+### Run Examples
 ```bash
-# Complete async I/O demonstration
-zig build async_demo
+# Async I/O capabilities demo
+zig build async_io_demo
 
-# Comprehensive feature showcase
-zig build demo_complete
+# Full proxy features showcase
+zig build full_features
 
-# Working version for reference
-zig build async_demo_works
+# HTTP response parsing demo
+zig build http_response_demo
 ```
 
 ### Testing

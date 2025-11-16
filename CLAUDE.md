@@ -70,8 +70,9 @@ zig test src/root.zig --test-filter "AccessControl"
 zig build test_e2e
 
 # Example demos
-zig build async_demo_works
+zig build async_io_demo
 zig build full_features
+zig build http_response_demo
 ```
 
 ## Configuration
@@ -320,10 +321,15 @@ All metrics use atomic operations for thread-safe concurrent access.
 - Cache effectiveness
 
 ### Example Applications
-- `async_demo_works`: Demonstrates all async I/O capabilities
-- `demo_complete`: Full proxy showcase with configuration
-- `full_features_demo`: **Complete demonstration of all proxy features**
-- `test_time`: Time utilities for performance measurement
+- `async_io_demo`: Comprehensive async I/O capabilities demonstration
+- `full_features_demo`: Complete demonstration of all proxy features
+- `http_response_parsing_demo`: HTTP parsing and caching utilities
+- Proxy configurations in `examples/configs/`:
+  - `simple_proxy.zig`: Basic TCP forwarding
+  - `caching_proxy.zig`: With HTTP response caching
+  - `load_balanced_proxy.zig`: Multi-backend load balancing
+  - `secure_proxy.zig`: Access control and rate limiting
+  - `production_proxy.zig`: Full enterprise feature set
 
 ## Development Notes
 

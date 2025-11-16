@@ -141,30 +141,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
 
     // Create example executables
-    const async_demo = b.addExecutable(.{
-        .name = "async_demo",
+    const async_io_demo = b.addExecutable(.{
+        .name = "async_io_demo",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/async_demo.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(async_demo);
-
-    const async_demo_works = b.addExecutable(.{
-        .name = "async_demo_works",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/async_demo_works.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    b.installArtifact(async_demo_works);
-
-    const demo_complete = b.addExecutable(.{
-        .name = "demo_complete",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/demo_complete.zig"),
+            .root_source_file = b.path("examples/async_io_demo.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -172,7 +152,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(demo_complete);
+    b.installArtifact(async_io_demo);
 
     const test_time = b.addExecutable(.{
         .name = "test_time",
@@ -211,17 +191,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(http_response_parsing_demo);
 
     // Example run steps
-    const run_async_demo = b.addRunArtifact(async_demo);
-    const async_demo_step = b.step("async_demo", "Run async demo");
-    async_demo_step.dependOn(&run_async_demo.step);
-
-    const run_async_demo_works = b.addRunArtifact(async_demo_works);
-    const async_demo_works_step = b.step("async_demo_works", "Run working async demo");
-    async_demo_works_step.dependOn(&run_async_demo_works.step);
-
-    const run_demo_complete = b.addRunArtifact(demo_complete);
-    const demo_complete_step = b.step("demo_complete", "Run complete demo");
-    demo_complete_step.dependOn(&run_demo_complete.step);
+    const run_async_io_demo = b.addRunArtifact(async_io_demo);
+    const async_io_demo_step = b.step("async_io_demo", "Run async I/O demo");
+    async_io_demo_step.dependOn(&run_async_io_demo.step);
 
     const run_test_time = b.addRunArtifact(test_time);
     const test_time_step = b.step("test_time", "Run time utility");

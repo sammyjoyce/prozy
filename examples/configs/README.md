@@ -16,7 +16,7 @@ This directory contains example configurations for common proxy deployment patte
 
 **Build & Run**:
 ```bash
-zig build-exe configs/simple_proxy.zig --dep prozy --mod prozy::src/root.zig
+zig build-exe examples/configs/simple_proxy.zig --dep prozy --mod prozy::src/root.zig
 ./simple_proxy
 ```
 
@@ -144,7 +144,7 @@ try acl.addDeniedIp(malicious_ip);
 ### Step 1: Copy a Template
 
 ```bash
-cp configs/simple_proxy.zig my_custom_proxy.zig
+cp examples/configs/simple_proxy.zig my_custom_proxy.zig
 ```
 
 ### Step 2: Customize
