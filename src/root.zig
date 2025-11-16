@@ -239,6 +239,19 @@ pub const HTTPInspector = struct {
 
 /// HTTP response cache with LRU eviction for performance optimization
 pub const HTTPCache = struct {
+    const CacheNode = struct {
+        key: u64,
+        response: []u8,
+        method: []u8,
+        path: []u8,
+        created_at: i64,
+        ttl: u32,
+        size: usize,
+        access_count: u32,
+        prev: ?*CacheNode,
+        next: ?*CacheNode,
+    };
+
     const CacheEntry = struct {
         response: []u8,
         method: []u8,
@@ -256,73 +269,95 @@ pub const HTTPCache = struct {
     }
 
     allocator: std.mem.Allocator,
-    cache: std.AutoHashMap(u64, CacheEntry),
+    cache: std.AutoHashMap(u64, *CacheNode),
     max_size: usize,
     current_size: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
     hits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     misses: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    mutex: std.Thread.Mutex = .{},
+    rwlock: std.Thread.RwLock = .{},
+    head: ?*CacheNode = null,
+    tail: ?*CacheNode = null,
 
     pub fn init(allocator: std.mem.Allocator, max_size: usize) HTTPCache {
         return .{
             .allocator = allocator,
-            .cache = std.AutoHashMap(u64, CacheEntry).init(allocator),
+            .cache = std.AutoHashMap(u64, *CacheNode).init(allocator),
             .max_size = max_size,
         };
     }
 
     pub fn deinit(self: *HTTPCache) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
 
         var it = self.cache.iterator();
         while (it.next()) |kv| {
-            self.allocator.free(kv.value_ptr.response);
-            self.allocator.free(kv.value_ptr.method);
-            self.allocator.free(kv.value_ptr.path);
+            const node = kv.value_ptr.*;
+            self.allocator.free(node.response);
+            self.allocator.free(node.method);
+            self.allocator.free(node.path);
+            self.allocator.destroy(node);
         }
         self.cache.deinit();
     }
 
     pub fn get(self: *HTTPCache, method: []const u8, path: []const u8) ?[]const u8 {
         const key = hashKey(method, path);
-        self.mutex.lock();
-        defer self.mutex.unlock();
 
-        if (self.cache.getPtr(key)) |entry| {
+        // First try read lock for checking existence
+        self.rwlock.lockShared();
+        const node_ptr = self.cache.get(key);
+        self.rwlock.unlockShared();
+
+        if (node_ptr == null) {
+            _ = self.misses.fetchAdd(1, .monotonic);
+            return null;
+        }
+
+        // Upgrade to write lock to update access order and check expiration
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+
+        // Recheck after acquiring write lock (could have been evicted)
+        if (self.cache.get(key)) |node| {
             // Check if expired
             const now = getTimestamp();
-            if (now - entry.created_at > entry.ttl) {
-                self.evict(key);
+            if (now - node.created_at > node.ttl) {
+                self.evictNode(node);
                 _ = self.misses.fetchAdd(1, .monotonic);
                 return null;
             }
-            entry.access_count += 1;
+
+            // Move to front of LRU list (most recently used)
+            self.moveToFront(node);
+            node.access_count += 1;
             _ = self.hits.fetchAdd(1, .monotonic);
-            return entry.response;
+            return node.response;
         }
+
         _ = self.misses.fetchAdd(1, .monotonic);
         return null;
     }
 
     pub fn put(self: *HTTPCache, method: []const u8, path: []const u8, response: []const u8, ttl: u32) !void {
         const key = hashKey(method, path);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+
+        // Don't cache if response is too large
+        if (response.len > self.max_size / 2) {
+            return;
+        }
+
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
 
         // Evict old entry if exists
-        if (self.cache.get(key)) |_| {
-            self.evict(key);
+        if (self.cache.get(key)) |existing_node| {
+            self.evictNode(existing_node);
         }
 
         // Check if we need to evict to make space
         while (self.current_size.load(.monotonic) + response.len > self.max_size and self.cache.count() > 0) {
             self.evictLRU();
-        }
-
-        // Don't cache if response is too large
-        if (response.len > self.max_size / 2) {
-            return;
         }
 
         // Allocate and copy data
@@ -345,7 +380,17 @@ pub const HTTPCache = struct {
         }
         @memcpy(path_copy, path);
 
-        const entry = CacheEntry{
+        // Create new node
+        const node = try self.allocator.create(CacheNode);
+        errdefer {
+            self.allocator.free(response_copy);
+            self.allocator.free(method_copy);
+            self.allocator.free(path_copy);
+            self.allocator.destroy(node);
+        }
+
+        node.* = .{
+            .key = key,
             .response = response_copy,
             .method = method_copy,
             .path = path_copy,
@@ -353,14 +398,21 @@ pub const HTTPCache = struct {
             .ttl = ttl,
             .size = response.len,
             .access_count = 0,
+            .prev = null,
+            .next = null,
         };
 
-        self.cache.put(key, entry) catch |err| {
+        // Add to cache map
+        self.cache.put(key, node) catch |err| {
             self.allocator.free(response_copy);
             self.allocator.free(method_copy);
             self.allocator.free(path_copy);
+            self.allocator.destroy(node);
             return err;
         };
+
+        // Add to front of LRU list
+        self.addToFront(node);
         _ = self.current_size.fetchAdd(response.len, .monotonic);
     }
 
@@ -371,36 +423,70 @@ pub const HTTPCache = struct {
         return hasher.final();
     }
 
-    fn evictLRU(self: *HTTPCache) void {
-        var oldest_key: ?u64 = null;
-        var oldest_time: i64 = std.math.maxInt(i64);
-        var lowest_access: u32 = std.math.maxInt(u32);
+    /// Add node to front of LRU list (most recently used)
+    fn addToFront(self: *HTTPCache, node: *CacheNode) void {
+        node.next = self.head;
+        node.prev = null;
 
-        var it = self.cache.iterator();
-        while (it.next()) |kv| {
-            // LRU based on access count and age
-            if (kv.value_ptr.access_count < lowest_access or
-                (kv.value_ptr.access_count == lowest_access and kv.value_ptr.created_at < oldest_time))
-            {
-                oldest_time = kv.value_ptr.created_at;
-                lowest_access = kv.value_ptr.access_count;
-                oldest_key = kv.key_ptr.*;
-            }
+        if (self.head) |head| {
+            head.prev = node;
         }
+        self.head = node;
 
-        if (oldest_key) |key| {
-            self.evict(key);
+        if (self.tail == null) {
+            self.tail = node;
         }
     }
 
-    fn evict(self: *HTTPCache, key: u64) void {
-        if (self.cache.fetchRemove(key)) |kv| {
-            const entry = kv.value;
-            _ = self.current_size.fetchSub(entry.size, .monotonic);
-            self.allocator.free(entry.response);
-            self.allocator.free(entry.method);
-            self.allocator.free(entry.path);
+    /// Remove node from LRU list
+    fn removeFromList(self: *HTTPCache, node: *CacheNode) void {
+        if (node.prev) |prev| {
+            prev.next = node.next;
+        } else {
+            self.head = node.next;
         }
+
+        if (node.next) |next| {
+            next.prev = node.prev;
+        } else {
+            self.tail = node.prev;
+        }
+
+        node.prev = null;
+        node.next = null;
+    }
+
+    /// Move node to front of LRU list (mark as most recently used)
+    fn moveToFront(self: *HTTPCache, node: *CacheNode) void {
+        if (self.head == node) return; // Already at front
+
+        self.removeFromList(node);
+        self.addToFront(node);
+    }
+
+    /// Evict LRU entry (from tail) - O(1) operation
+    fn evictLRU(self: *HTTPCache) void {
+        if (self.tail) |tail_node| {
+            self.evictNode(tail_node);
+        }
+    }
+
+    /// Evict specific node
+    fn evictNode(self: *HTTPCache, node: *CacheNode) void {
+        // Remove from linked list
+        self.removeFromList(node);
+
+        // Remove from hash map
+        _ = self.cache.remove(node.key);
+
+        // Update size
+        _ = self.current_size.fetchSub(node.size, .monotonic);
+
+        // Free memory
+        self.allocator.free(node.response);
+        self.allocator.free(node.method);
+        self.allocator.free(node.path);
+        self.allocator.destroy(node);
     }
 
     pub fn getStats(self: *const HTTPCache) CacheStats {
@@ -435,6 +521,8 @@ pub const Backend = struct {
     weight: u32 = 1,
     healthy: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
     active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    unhealthy_since: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+    recovery_interval_seconds: u32 = 30, // Try to recover after 30 seconds
 
     pub fn init(host: []const u8, port: u16, weight: u32) Backend {
         return .{
@@ -446,10 +534,32 @@ pub const Backend = struct {
 
     pub fn markHealthy(self: *Backend, healthy: bool) void {
         self.healthy.store(healthy, .monotonic);
+        if (!healthy) {
+            // Record when backend became unhealthy
+            const now = HTTPCache.getTimestamp();
+            self.unhealthy_since.store(now, .monotonic);
+        } else {
+            // Reset unhealthy timestamp when recovered
+            self.unhealthy_since.store(0, .monotonic);
+        }
     }
 
     pub fn isHealthy(self: *const Backend) bool {
         return self.healthy.load(.monotonic);
+    }
+
+    /// Check if backend should be retried (for health recovery)
+    pub fn shouldRetry(self: *const Backend) bool {
+        if (self.isHealthy()) return true;
+
+        // Check if recovery interval has passed
+        const unhealthy_timestamp = self.unhealthy_since.load(.monotonic);
+        if (unhealthy_timestamp == 0) return false;
+
+        const now = HTTPCache.getTimestamp();
+        const seconds_unhealthy = now - unhealthy_timestamp;
+
+        return seconds_unhealthy >= self.recovery_interval_seconds;
     }
 
     pub fn incrementConnections(self: *Backend) void {
@@ -506,10 +616,20 @@ pub const LoadBalancer = struct {
     fn roundRobin(self: *LoadBalancer) ?*Backend {
         const start_index = self.current_index.fetchAdd(1, .monotonic);
 
+        // First pass: try healthy backends
         for (0..self.backends.len) |i| {
             const index = (start_index + i) % self.backends.len;
             const backend = &self.backends[index];
             if (backend.isHealthy()) {
+                return backend;
+            }
+        }
+
+        // Second pass: try backends that should be retried for recovery
+        for (0..self.backends.len) |i| {
+            const index = (start_index + i) % self.backends.len;
+            const backend = &self.backends[index];
+            if (backend.shouldRetry()) {
                 return backend;
             }
         }
@@ -521,6 +641,7 @@ pub const LoadBalancer = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // First pass: healthy backends
         var total_weight: u32 = 0;
         for (self.backends) |backend| {
             if (backend.isHealthy()) {
@@ -528,18 +649,40 @@ pub const LoadBalancer = struct {
             }
         }
 
-        if (total_weight == 0) return null;
+        if (total_weight > 0) {
+            const index = self.current_index.fetchAdd(1, .monotonic);
+            const total_weight_usize = @as(usize, @intCast(total_weight));
+            var target = @as(u32, @intCast(index % total_weight_usize));
 
-        const index = self.current_index.fetchAdd(1, .monotonic);
-        const total_weight_usize = @as(usize, @intCast(total_weight));
-        var target = @as(u32, @intCast(index % total_weight_usize));
-
-        for (self.backends) |*backend| {
-            if (!backend.isHealthy()) continue;
-            if (target < backend.weight) {
-                return backend;
+            for (self.backends) |*backend| {
+                if (!backend.isHealthy()) continue;
+                if (target < backend.weight) {
+                    return backend;
+                }
+                target -= backend.weight;
             }
-            target -= backend.weight;
+        }
+
+        // Second pass: backends ready for retry
+        total_weight = 0;
+        for (self.backends) |backend| {
+            if (backend.shouldRetry()) {
+                total_weight += backend.weight;
+            }
+        }
+
+        if (total_weight > 0) {
+            const index = self.current_index.fetchAdd(1, .monotonic);
+            const total_weight_usize = @as(usize, @intCast(total_weight));
+            var target = @as(u32, @intCast(index % total_weight_usize));
+
+            for (self.backends) |*backend| {
+                if (!backend.shouldRetry()) continue;
+                if (target < backend.weight) {
+                    return backend;
+                }
+                target -= backend.weight;
+            }
         }
 
         return null;
@@ -552,8 +695,22 @@ pub const LoadBalancer = struct {
         var min_connections: u32 = std.math.maxInt(u32);
         var selected: ?*Backend = null;
 
+        // First pass: healthy backends
         for (self.backends) |*backend| {
             if (!backend.isHealthy()) continue;
+            const connections = backend.getConnections();
+            if (connections < min_connections) {
+                min_connections = connections;
+                selected = backend;
+            }
+        }
+
+        if (selected != null) return selected;
+
+        // Second pass: backends ready for retry
+        min_connections = std.math.maxInt(u32);
+        for (self.backends) |*backend| {
+            if (!backend.shouldRetry()) continue;
             const connections = backend.getConnections();
             if (connections < min_connections) {
                 min_connections = connections;
@@ -570,20 +727,39 @@ pub const LoadBalancer = struct {
 
         const random = self.rng.random();
 
+        // First pass: healthy backends
         var healthy_backends: usize = 0;
         for (self.backends) |backend| {
             if (backend.isHealthy()) healthy_backends += 1;
         }
 
-        if (healthy_backends == 0) return null;
+        if (healthy_backends > 0) {
+            const target = random.uintLessThan(usize, healthy_backends);
+            var count: usize = 0;
 
-        const target = random.uintLessThan(usize, healthy_backends);
-        var count: usize = 0;
+            for (self.backends) |*backend| {
+                if (backend.isHealthy()) {
+                    if (count == target) return backend;
+                    count += 1;
+                }
+            }
+        }
 
-        for (self.backends) |*backend| {
-            if (backend.isHealthy()) {
-                if (count == target) return backend;
-                count += 1;
+        // Second pass: backends ready for retry
+        var retry_backends: usize = 0;
+        for (self.backends) |backend| {
+            if (backend.shouldRetry()) retry_backends += 1;
+        }
+
+        if (retry_backends > 0) {
+            const target = random.uintLessThan(usize, retry_backends);
+            var count: usize = 0;
+
+            for (self.backends) |*backend| {
+                if (backend.shouldRetry()) {
+                    if (count == target) return backend;
+                    count += 1;
+                }
             }
         }
 
@@ -591,19 +767,22 @@ pub const LoadBalancer = struct {
     }
 
     fn ipHash(self: *LoadBalancer, client_ip: u32) ?*Backend {
-        var healthy_backends: usize = 0;
-        for (self.backends) |backend| {
-            if (backend.isHealthy()) healthy_backends += 1;
-        }
-
-        if (healthy_backends == 0) return null;
-
         const index = client_ip % @as(u32, @intCast(self.backends.len));
 
+        // First pass: healthy backends
         for (0..self.backends.len) |i| {
             const backend_index = (index + i) % self.backends.len;
             const backend = &self.backends[backend_index];
             if (backend.isHealthy()) {
+                return backend;
+            }
+        }
+
+        // Second pass: backends ready for retry
+        for (0..self.backends.len) |i| {
+            const backend_index = (index + i) % self.backends.len;
+            const backend = &self.backends[backend_index];
+            if (backend.shouldRetry()) {
                 return backend;
             }
         }
@@ -959,9 +1138,6 @@ pub const Proxy = struct {
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
     ) void {
-        // TODO: Integrate HTTP caching - requires buffering and parsing HTTP requests/responses
-        _ = http_cache;
-
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
         var selected_backend: ?*Backend = null;
 
@@ -982,6 +1158,51 @@ pub const Proxy = struct {
 
         if (options.enable_connection_logging and !builtin.is_test) {
             log.info("new connection from client", .{});
+        }
+
+        // Try to use HTTP cache if enabled
+        if (options.enable_caching and http_cache != null) {
+            // Buffer initial request to check cache
+            var request_buffer: [8192]u8 = undefined;
+            var client_read_buf: [4096]u8 = undefined;
+            var client_reader = client_stream.reader(io, &client_read_buf);
+
+            // Read first chunk of request
+            var slices = [_][]u8{request_buffer[0..]};
+            const bytes_read = client_reader.interface.readVec(&slices) catch 0;
+
+            if (bytes_read > 0) {
+                // Try to parse HTTP request
+                if (HTTPInspector.parseRequestLine(request_buffer[0..bytes_read])) |request| {
+                    // Only cache GET requests
+                    if (std.mem.eql(u8, request.method, "GET")) {
+                        if (http_cache.?.get(request.method, request.path)) |cached_response| {
+                            // Cache hit! Send cached response directly
+                            if (!builtin.is_test) {
+                                log.info("cache HIT for GET {s}", .{request.path});
+                            }
+
+                            var client_write_buf: [4096]u8 = undefined;
+                            var client_writer = client_stream.writer(io, &client_write_buf);
+
+                            Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
+                                log.warn("failed to write cached response: {s}", .{@errorName(err)});
+                                return;
+                            };
+                            Writer.flush(&client_writer.interface) catch {};
+
+                            if (options.enable_stats) {
+                                stats.recordBytesBackendToClient(@intCast(cached_response.len));
+                            }
+                            return;
+                        } else {
+                            if (!builtin.is_test) {
+                                log.info("cache MISS for GET {s}", .{request.path});
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Select backend (use load balancer if enabled)
@@ -1018,10 +1239,23 @@ pub const Proxy = struct {
             }
             if (selected_backend) |backend| {
                 backend.markHealthy(false);
+                if (!builtin.is_test) {
+                    log.warn("marked backend {s}:{} as unhealthy", .{ backend.host, backend.port });
+                }
             }
             return;
         };
         defer backend_stream.close(io);
+
+        // Connection succeeded - mark backend as healthy (recovery mechanism)
+        if (selected_backend) |backend| {
+            if (!backend.isHealthy()) {
+                backend.markHealthy(true);
+                if (!builtin.is_test) {
+                    log.info("backend {s}:{} recovered to healthy state", .{ backend.host, backend.port });
+                }
+            }
+        }
 
         if (options.enable_connection_logging and !builtin.is_test) {
             log.info("[{}] connected to backend {s}:{}", .{ start_time, actual_backend_host, actual_backend_port });
