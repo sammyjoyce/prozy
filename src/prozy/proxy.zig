@@ -373,6 +373,7 @@ pub const Proxy = struct {
                 if (self.load_balancer) |*lb| lb else null,
                 if (self.http_cache) |*cache| cache else null,
                 self.allocator,
+                self.router, // Phase 3: Pass router for advanced routing
             });
         }
 
@@ -509,10 +510,12 @@ pub const Proxy = struct {
         rate_limiter: ?*RateLimiter,
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
-        _: std.mem.Allocator,
+        allocator: std.mem.Allocator,
+        router: ?*Router, // Phase 3: Optional router for advanced routing
     ) void {
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
         var selected_backend: ?*Backend = null;
+        var routing_decision: ?RoutingDecision = null; // Phase 3: Track routing decision for cleanup
 
         // Track buffered request data that must be forwarded after cache miss
         var request_buffer: [8192]u8 = undefined;
@@ -531,14 +534,117 @@ pub const Proxy = struct {
             if (selected_backend) |backend| {
                 backend.decrementConnections();
             }
+            // Phase 3: Release cluster semaphore if using router
+            if (routing_decision) |decision| {
+                decision.cluster.release();
+            }
         }
 
         if (options.enable_connection_logging and !builtin.is_test) {
             log.info("new connection from client", .{});
         }
 
-        // Try to use HTTP cache if enabled
-        if (options.enable_caching and http_cache != null) {
+        // Phase 3: Router-based request handling
+        // Read and parse initial request for routing decision
+        var parsed_request: ?HTTPInspector.HTTPRequest = null;
+        var request_headers: []const u8 = &[_]u8{};
+
+        if (router != null or options.enable_caching or options.enable_http_inspection) {
+            // Buffer initial request for inspection/routing
+            var client_read_buf: [4096]u8 = undefined;
+            var client_reader = client_stream.reader(io, &client_read_buf);
+
+            // Read first chunk of request
+            var slices = [_][]u8{request_buffer[0..]};
+            const bytes_read = client_reader.interface.readVec(&slices) catch 0;
+            buffered_request_size = bytes_read;
+
+            if (bytes_read > 0) {
+                // Parse HTTP request line
+                parsed_request = HTTPInspector.parseRequestLine(request_buffer[0..bytes_read]);
+                request_headers = request_buffer[0..bytes_read];
+            }
+        }
+
+        // Phase 3: If router is configured, use it for routing decision
+        if (router) |rtr| {
+            if (parsed_request) |req| {
+                // Check for CONNECT method - delegate to tunnel handler
+                if (std.mem.eql(u8, req.method, "CONNECT")) {
+                    // Parse target from path (format: "host:port")
+                    // For now, use the default backend
+                    // TODO: Parse host:port from req.path
+                    if (!builtin.is_test) {
+                        log.info("CONNECT request detected, delegating to tunnel handler", .{});
+                    }
+                    handleConnectTunnel(
+                        client_stream,
+                        io,
+                        backend_host,
+                        backend_port,
+                        connect_timeout,
+                        stats,
+                        http_inspector,
+                        options,
+                    );
+                    return;
+                }
+
+                // Route the request using the router
+                const decision = rtr.routeRequest(&req, request_headers, client_ip) catch |err| {
+                    log.err("routing failed: {s}", .{@errorName(err)});
+                    if (options.enable_stats) {
+                        stats.recordError();
+                    }
+
+                    // Send error response
+                    const error_response = switch (err) {
+                        error.NoRoute => "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\nNo route found",
+                        error.NoHealthyBackend => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 21\r\n\r\nNo healthy backends",
+                        error.ClusterAtCapacity => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\n\r\nCluster at capacity",
+                        else => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 14\r\n\r\nRouting error",
+                    };
+
+                    var error_write_buf: [4096]u8 = undefined;
+                    var error_writer = client_stream.writer(io, &error_write_buf);
+                    Writer.writeAll(&error_writer.interface, error_response) catch {};
+                    Writer.flush(&error_writer.interface) catch {};
+                    return;
+                };
+
+                // Store routing decision for cleanup
+                routing_decision = decision;
+
+                // Use backend from routing decision
+                selected_backend = decision.backend;
+                decision.backend.incrementConnections();
+
+                if (!builtin.is_test) {
+                    log.info("router selected backend: {s}:{} (cluster: {s})", .{
+                        decision.backend.host,
+                        decision.backend.port,
+                        decision.cluster.name,
+                    });
+                }
+
+                // Continue with backend connection using router's decision
+                // (skip load balancer logic below)
+            } else {
+                log.warn("router configured but failed to parse request", .{});
+                if (options.enable_stats) {
+                    stats.recordError();
+                }
+                return;
+            }
+        }
+
+        // Try to use HTTP cache if enabled (and not using router, or router allows caching)
+        const cache_enabled = if (routing_decision) |decision|
+            options.enable_caching and decision.cache_allowed and http_cache != null
+        else
+            options.enable_caching and http_cache != null;
+
+        if (cache_enabled and http_cache != null and buffered_request_size == 0) {
             // Buffer initial request to check cache
             var client_read_buf: [4096]u8 = undefined;
             var client_reader = client_stream.reader(io, &client_read_buf);
@@ -600,11 +706,28 @@ pub const Proxy = struct {
             }
         }
 
-        // Select backend (use load balancer if enabled)
+        // Select backend (use router if configured, otherwise fall back to load balancer)
         var actual_backend_host = backend_host;
         var actual_backend_port = backend_port;
+        var actual_connect_timeout = connect_timeout;
 
-        if (options.enable_load_balancing) {
+        // Phase 3: If router selected a backend, use it
+        if (routing_decision) |decision| {
+            actual_backend_host = decision.backend.host;
+            actual_backend_port = decision.backend.port;
+
+            // Apply router's timeout policy
+            const timeout_ms = decision.timeouts.connect_timeout_ms;
+            actual_connect_timeout = if (timeout_ms > 0)
+                Timeout{ .ms = timeout_ms }
+            else
+                .none;
+
+            if (!builtin.is_test) {
+                log.info("using router-selected backend with timeout {}ms", .{timeout_ms});
+            }
+        } else if (options.enable_load_balancing) {
+            // Fall back to load balancer if no router
             if (load_balancer) |lb| {
                 if (lb.selectBackend(client_ip)) |backend| {
                     selected_backend = backend;
@@ -626,7 +749,7 @@ pub const Proxy = struct {
         }
 
         // Connect to backend
-        const backend_stream = connectToBackend(io, actual_backend_host, actual_backend_port, connect_timeout) catch |err| {
+        const backend_stream = connectToBackend(io, actual_backend_host, actual_backend_port, actual_connect_timeout) catch |err| {
             log.err("backend connect failed: {s}", .{@errorName(err)});
             if (options.enable_stats) {
                 stats.recordBackendFailure();
