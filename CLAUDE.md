@@ -204,11 +204,13 @@ High-performance HTTP response caching with intelligent request handling:
 6. *Cache population: Planned for future release*
 
 **Cache Features:**
-- Method + Path based cache keys (using Wyhash)
+- Method + Host + Path based cache keys (using Wyhash) for multi-tenant isolation
+- **Host header validation**: Requests without Host headers are NOT cached (prevents cache pollution)
 - Automatic cleanup of expired entries
 - No caching for oversized responses (>50% of max cache size)
 - Real-time hit rate calculation
 - Cache hit/miss logging for observability
+- Warning logs for missing Host headers (identifies misconfigured clients)
 
 ### 6. Traffic Routing & Policy-Based Forwarding ✅
 Intelligent load balancing with **5 strategies**:
@@ -473,6 +475,10 @@ Recent fixes addressed critical architectural issues identified during PR review
 3. **Refactored LoadBalancer for maintainability**: Extracted two-pass backend selection logic (healthy backends first, retry candidates second) into reusable helper functions, reducing code duplication across 5 strategies.
 
 4. **Improved cache concurrency**: Replaced Mutex with RwLock to allow multiple concurrent readers while maintaining exclusive writes for cache updates.
+
+5. **Implemented 30-second timeout for bidirectional copy**: Added timeout enforcement using `io.concurrent(sleep, ...)` combined with `io.select()` to prevent hung connections when one direction completes but the other side keeps the connection alive (HTTP keep-alive, network partitions, slow clients).
+
+6. **Fixed Host header security issue**: Eliminated "default" fallback for missing Host headers to prevent cache pollution across different virtual hosts/APIs. Requests without Host headers now bypass caching entirely while still being forwarded to backends, with warning logs to identify misconfigured clients.
 
 These improvements demonstrate our commitment to addressing feedback proactively and maintaining code quality throughout development.
 

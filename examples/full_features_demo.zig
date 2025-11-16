@@ -34,12 +34,12 @@ pub fn main() !void {
 
     if (proxy.access_control) |*acl| {
         // Example: Allow localhost
-        const localhost_ip: u32 = 0x7F000001; // 127.0.0.1
+        const localhost_ip = prozy.IpKey{ .ipv4 = 0x7F000001 }; // 127.0.0.1
         try acl.addToAllowList(localhost_ip);
         std.debug.print("   ✅ Localhost (127.0.0.1) added to allow list\n", .{});
 
         // Example: Deny a specific IP
-        const blocked_ip: u32 = 0xC0A80064; // 192.168.0.100
+        const blocked_ip = prozy.IpKey{ .ipv4 = 0xC0A80064 }; // 192.168.0.100
         try acl.addToDenyList(blocked_ip);
         std.debug.print("   ✅ 192.168.0.100 added to deny list\n", .{});
     }

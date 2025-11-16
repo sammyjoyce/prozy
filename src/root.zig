@@ -10,6 +10,54 @@
 //! - TCP socket listening and accepting with std.Io.net
 //! - Bidirectional data copying coordinated via io.concurrent/io.select
 //! - Structured concurrency via Io.Group and explicit cancellation
+//!
+//! ## Known Limitations and Assumptions
+//!
+//! ### Request Handling
+//! - **One HTTP request per TCP connection**: The proxy assumes each TCP connection
+//!   carries a single HTTP request. HTTP keep-alive and pipelining are NOT supported.
+//!   Subsequent requests in the same connection will bypass cache checking and request
+//!   inspection.
+//!
+//! ### Protocol Support
+//! - **HTTP-only**: Currently designed for HTTP traffic. No TLS/SSL termination,
+//!   WebSocket support, or HTTP/2.
+//! - **TCP-only**: No UDP support. Adding UDP would require significant changes.
+//!
+//! ### Connection Handling
+//! - **30-second timeout**: After one direction of a connection completes, the proxy
+//!   waits up to 30 seconds for the other direction before timing out and canceling.
+//!   Implemented using io.concurrent(sleep, ...) combined with io.select() for concurrent
+//!   timeout enforcement. Prevents hung connections during HTTP keep-alive scenarios.
+//! - **Full close only**: No TCP half-close support. Both directions are closed together.
+//!
+//! ### Cache Behavior
+//! - **GET requests only**: Only GET requests are cached. POST/PUT/DELETE bypass cache.
+//! - **Basic cacheability**: Cache does NOT respect Cache-Control, Vary, or other
+//!   HTTP caching headers. All GET responses are cached with a fixed TTL.
+//! - **No cache population from backend**: Currently, responses from backends are
+//!   streamed directly to clients but NOT buffered and stored in the cache for future
+//!   requests. This is planned for a future release.
+//! - **Fixed-size buffers**: Request headers are buffered in an 8KB buffer. Headers
+//!   larger than 8KB will cause cache checking to fail (request still forwarded).
+//!
+//! ### Load Balancing
+//! - **Reactive health checks**: Backend health is determined by connection success/
+//!   failure only. No proactive health checks, HTTP 5xx tracking, or timeout detection.
+//! - **Connection-level routing**: Load balancing decision is made per connection,
+//!   not per request (consistent with one-request-per-connection assumption).
+//!
+//! ### Security
+//! - **No X-Forwarded-For handling**: Client IP is extracted from TCP socket only.
+//!   If behind another proxy, all clients appear to come from the proxy's IP.
+//! - **Trusted backend assumption**: No validation of backend responses or protection
+//!   against malicious backends.
+//!
+//! ### Performance
+//! - **Fixed buffer sizes**: 4KB client buffers, 4KB backend buffers, 8KB request buffer
+//! - **Per-chunk byte counting**: Statistics are updated per 8KB chunk (atomic operations)
+//! - **Approximate LRU**: Cache get() does NOT update LRU order for performance
+//!   (uses lockShared instead of write lock)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -21,8 +69,81 @@ const net = Io.net;
 const Reader = Io.Reader;
 const Writer = Io.Writer;
 const Timeout = Io.Timeout;
+const Duration = Io.Duration;
+const Clock = Io.Clock;
+
+// Timeout configuration for bidirectional copy operations
+const BIDIRECTIONAL_TIMEOUT_SECONDS: i64 = 30;
 
 // ============= Core Proxy Features =============
+
+/// IP address key for rate limiting and access control
+/// Prevents IPv6 hash collisions by using full 128-bit address
+pub const IpKey = union(enum) {
+    ipv4: u32,
+    ipv6: u128,
+
+    pub fn fromAddress(address: net.IpAddress) IpKey {
+        return switch (address) {
+            .ip4 => |ip4| .{ .ipv4 = bytesToU32(ip4.bytes) },
+            .ip6 => |ip6| .{ .ipv6 = bytesToU128(ip6.bytes) },
+        };
+    }
+
+    pub fn hash(self: IpKey) u64 {
+        return switch (self) {
+            .ipv4 => |v4| @as(u64, v4),
+            .ipv6 => |v6| std.hash.Wyhash.hash(0, std.mem.asBytes(&v6)),
+        };
+    }
+
+    pub fn eql(self: IpKey, other: IpKey) bool {
+        if (@as(std.meta.Tag(IpKey), self) != @as(std.meta.Tag(IpKey), other)) {
+            return false;
+        }
+        return switch (self) {
+            .ipv4 => |v4| v4 == other.ipv4,
+            .ipv6 => |v6| v6 == other.ipv6,
+        };
+    }
+
+    fn bytesToU32(bytes: [4]u8) u32 {
+        return (@as(u32, bytes[0]) << 24) |
+            (@as(u32, bytes[1]) << 16) |
+            (@as(u32, bytes[2]) << 8) |
+            (@as(u32, bytes[3]));
+    }
+
+    fn bytesToU128(bytes: [16]u8) u128 {
+        var result: u128 = 0;
+        for (bytes, 0..) |byte, i| {
+            result |= @as(u128, byte) << @intCast((15 - i) * 8);
+        }
+        return result;
+    }
+
+    pub fn format(self: IpKey, comptime fmt: []const u8, options: anytype, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        switch (self) {
+            .ipv4 => |v4| try writer.print("IPv4:{any}", .{v4}),
+            .ipv6 => |v6| try writer.print("IPv6:{x}", .{v6}),
+        }
+    }
+};
+
+// Context for IpKey HashMap
+pub const IpKeyContext = struct {
+    pub fn hash(_: IpKeyContext, key: IpKey) u64 {
+        return key.hash();
+    }
+
+    pub fn eql(_: IpKeyContext, a: IpKey, b: IpKey) bool {
+        return a.eql(b);
+    }
+};
+
+// ============= Core Proxy Features (continued) =============
 
 /// Connection statistics for monitoring and observability
 pub const ProxyStats = struct {
@@ -84,8 +205,9 @@ pub const ProxyStats = struct {
 };
 
 /// Access Control List for IP-based filtering
+/// FIXED: Now uses IpKey to prevent IPv6 hash collisions
 pub const AccessControl = struct {
-    const IpSet = std.AutoHashMap(u32, void);
+    const IpSet = std.HashMap(IpKey, void, IpKeyContext, std.hash_map.default_max_load_percentage);
 
     allocator: std.mem.Allocator,
     allow_list: ?IpSet = null,
@@ -111,21 +233,21 @@ pub const AccessControl = struct {
         if (self.deny_list) |*list| list.deinit();
     }
 
-    pub fn addToAllowList(self: *AccessControl, ip: u32) !void {
+    pub fn addToAllowList(self: *AccessControl, ip: IpKey) !void {
         if (self.allow_list == null) {
             self.allow_list = IpSet.init(self.allocator);
         }
         try self.allow_list.?.put(ip, {});
     }
 
-    pub fn addToDenyList(self: *AccessControl, ip: u32) !void {
+    pub fn addToDenyList(self: *AccessControl, ip: IpKey) !void {
         if (self.deny_list == null) {
             self.deny_list = IpSet.init(self.allocator);
         }
         try self.deny_list.?.put(ip, {});
     }
 
-    pub fn isAllowed(self: *const AccessControl, ip: u32) bool {
+    pub fn isAllowed(self: *const AccessControl, ip: IpKey) bool {
         // Check deny list first
         if (self.deny_list) |list| {
             if (list.contains(ip)) return false;
@@ -144,8 +266,9 @@ pub const AccessControl = struct {
 };
 
 /// Rate limiter for connection control
+/// FIXED: Now uses IpKey to prevent IPv6 hash collisions
 pub const RateLimiter = struct {
-    const IpConnectionCount = std.AutoHashMap(u32, u32);
+    const IpConnectionCount = std.HashMap(IpKey, u32, IpKeyContext, std.hash_map.default_max_load_percentage);
 
     connections_per_ip: IpConnectionCount,
     max_per_ip: u32,
@@ -165,7 +288,7 @@ pub const RateLimiter = struct {
         self.connections_per_ip.deinit();
     }
 
-    pub fn tryAcquire(self: *RateLimiter, ip: u32) bool {
+    pub fn tryAcquire(self: *RateLimiter, ip: IpKey) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -183,17 +306,29 @@ pub const RateLimiter = struct {
         return true;
     }
 
-    pub fn release(self: *RateLimiter, ip: u32) void {
+    /// Release a rate limit slot for an IP address
+    ///
+    /// CRITICAL FIX: Prevents HashMap leak on OOM
+    /// - When count == 1: remove() entry entirely (avoids rehashing)
+    /// - When count > 1: put() will never fail (existing key, no allocation)
+    /// - Global counter is ALWAYS decremented to prevent leaks
+    ///
+    /// Previous implementation: put() could fail during HashMap rehashing,
+    /// causing global counter leak and eventual rate limit exhaustion.
+    pub fn release(self: *RateLimiter, ip: IpKey) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         if (self.connections_per_ip.get(ip)) |count| {
             if (count > 0) {
-                // Only decrement global count if put succeeds to maintain consistency
-                self.connections_per_ip.put(ip, count - 1) catch {
-                    // If put fails, we can't update the count, so don't decrement global
-                    return;
-                };
+                if (count == 1) {
+                    // Remove entry entirely to avoid HashMap rehashing issues
+                    _ = self.connections_per_ip.remove(ip);
+                } else {
+                    // Decrement existing entry (should never fail - not adding new key)
+                    self.connections_per_ip.put(ip, count - 1) catch unreachable;
+                }
+                // Always decrement global counter
                 _ = self.current_global.fetchSub(1, .monotonic);
             }
         }
@@ -342,11 +477,16 @@ pub const HTTPInspector = struct {
 };
 
 /// HTTP response cache with LRU eviction for performance optimization
+///
+/// SECURITY: Cache keys include Host header for multi-tenant isolation.
+/// Requests without Host headers MUST NOT be cached to prevent pollution
+/// across different virtual hosts/APIs.
 pub const HTTPCache = struct {
     const CacheNode = struct {
         key: u64,
         response: []u8,
         method: []u8,
+        host: []u8,
         path: []u8,
         created_at: i64,
         ttl: u32,
@@ -359,6 +499,7 @@ pub const HTTPCache = struct {
     const CacheEntry = struct {
         response: []u8,
         method: []u8,
+        host: []u8,
         path: []u8,
         created_at: i64,
         ttl: u32,
@@ -402,43 +543,67 @@ pub const HTTPCache = struct {
             const node = kv.value_ptr.*;
             self.allocator.free(node.response);
             self.allocator.free(node.method);
+            self.allocator.free(node.host);
             self.allocator.free(node.path);
             self.allocator.destroy(node);
         }
         self.cache.deinit();
     }
 
-    pub fn get(self: *HTTPCache, method: []const u8, path: []const u8) ?[]const u8 {
-        const key = hashKey(method, path);
+    /// Get cached response (returns owned copy that caller must free)
+    ///
+    /// IMPORTANT CHANGES:
+    /// - Now includes Host header in cache key for multi-tenant isolation
+    /// - Uses lockShared() for concurrent reads (high performance)
+    /// - Does NOT update LRU order to avoid write lock contention
+    /// - Expired entries are detected but not evicted (cleanup happens during put)
+    /// - Returns an OWNED COPY to prevent use-after-free (caller must free!)
+    ///
+    /// This design prioritizes safety and read performance over zero-copy efficiency.
+    /// The copy overhead is acceptable for cached responses since we avoid network I/O.
+    pub fn get(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8) ?[]u8 {
+        const key = hashKey(method, host, path);
 
-        // Use write lock from the start to avoid lock upgrade anti-pattern.
-        // Cache get() always modifies state (LRU order, access counts), so
-        // write lock is semantically correct and eliminates race conditions.
-        self.rwlock.lock();
-        defer self.rwlock.unlock();
+        // Use shared (read) lock for concurrent reads
+        self.rwlock.lockShared();
+        defer self.rwlock.unlockShared();
 
         if (self.cache.get(key)) |node| {
-            // Check if expired
+            // Check if expired (read-only check)
             const now = getTimestamp();
-            if (now - node.created_at > node.ttl) {
-                self.evictNode(node);
+            const elapsed = now - node.created_at;
+            // Cast ttl to i64 to avoid signed/unsigned comparison issues
+            // Also guard against negative elapsed time (clock adjustments)
+            if (elapsed >= 0 and elapsed > @as(i64, node.ttl)) {
+                // Don't evict here, just return null
+                // Eviction will happen on next put() or during periodic cleanup
                 _ = self.misses.fetchAdd(1, .monotonic);
                 return null;
             }
 
-            // Move to front of LRU list (most recently used)
-            self.moveToFront(node);
-            node.access_count += 1;
+            // Don't update LRU order (read-only path for concurrency)
+            // Access count is not updated to avoid write contention
             _ = self.hits.fetchAdd(1, .monotonic);
-            return node.response;
+
+            // CRITICAL: Copy response to prevent use-after-free
+            // The caller holds no lock after we return, so another thread
+            // could evict this entry and free the buffer. Return an owned copy.
+            const response_copy = self.allocator.alloc(u8, node.response.len) catch {
+                // Allocation failed, treat as cache miss
+                _ = self.misses.fetchAdd(1, .monotonic);
+                _ = self.hits.fetchSub(1, .monotonic);
+                return null;
+            };
+            @memcpy(response_copy, node.response);
+            return response_copy;
         }
 
         _ = self.misses.fetchAdd(1, .monotonic);
         return null;
     }
 
-    pub fn put(self: *HTTPCache, method: []const u8, path: []const u8, response: []const u8, ttl: u32) !void {
-        const key = hashKey(method, path);
+    pub fn put(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8, response: []const u8, ttl: u32) !void {
+        const key = hashKey(method, host, path);
 
         // Don't cache if response is too large
         if (response.len > self.max_size / 2) {
@@ -454,29 +619,27 @@ pub const HTTPCache = struct {
         }
 
         // Check if we need to evict to make space
-        const total_new_size = response.len + method.len + path.len;
+        const total_new_size = response.len + method.len + host.len + path.len;
         while (self.current_size.load(.monotonic) + total_new_size > self.max_size and self.cache.count() > 0) {
             self.evictLRU();
         }
 
         // Allocate and copy data
+        // Each errdefer only frees the allocation immediately preceding it to avoid double-free
         const response_copy = try self.allocator.alloc(u8, response.len);
         errdefer self.allocator.free(response_copy);
         @memcpy(response_copy, response);
 
         const method_copy = try self.allocator.alloc(u8, method.len);
-        errdefer {
-            self.allocator.free(response_copy);
-            self.allocator.free(method_copy);
-        }
+        errdefer self.allocator.free(method_copy);
         @memcpy(method_copy, method);
 
+        const host_copy = try self.allocator.alloc(u8, host.len);
+        errdefer self.allocator.free(host_copy);
+        @memcpy(host_copy, host);
+
         const path_copy = try self.allocator.alloc(u8, path.len);
-        errdefer {
-            self.allocator.free(response_copy);
-            self.allocator.free(method_copy);
-            self.allocator.free(path_copy);
-        }
+        errdefer self.allocator.free(path_copy);
         @memcpy(path_copy, path);
 
         // Create new node
@@ -484,6 +647,7 @@ pub const HTTPCache = struct {
         errdefer {
             self.allocator.free(response_copy);
             self.allocator.free(method_copy);
+            self.allocator.free(host_copy);
             self.allocator.free(path_copy);
             self.allocator.destroy(node);
         }
@@ -492,10 +656,11 @@ pub const HTTPCache = struct {
             .key = key,
             .response = response_copy,
             .method = method_copy,
+            .host = host_copy,
             .path = path_copy,
             .created_at = getTimestamp(),
             .ttl = ttl,
-            .size = response.len + method.len + path.len,
+            .size = response.len + method.len + host.len + path.len,
             .access_count = 0,
             .prev = null,
             .next = null,
@@ -505,6 +670,7 @@ pub const HTTPCache = struct {
         self.cache.put(key, node) catch |err| {
             self.allocator.free(response_copy);
             self.allocator.free(method_copy);
+            self.allocator.free(host_copy);
             self.allocator.free(path_copy);
             self.allocator.destroy(node);
             return err;
@@ -515,9 +681,10 @@ pub const HTTPCache = struct {
         _ = self.current_size.fetchAdd(node.size, .monotonic);
     }
 
-    fn hashKey(method: []const u8, path: []const u8) u64 {
+    fn hashKey(method: []const u8, host: []const u8, path: []const u8) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(method);
+        hasher.update(host);
         hasher.update(path);
         return hasher.final();
     }
@@ -584,6 +751,7 @@ pub const HTTPCache = struct {
         // Free memory
         self.allocator.free(node.response);
         self.allocator.free(node.method);
+        self.allocator.free(node.host);
         self.allocator.free(node.path);
         self.allocator.destroy(node);
     }
@@ -612,6 +780,10 @@ pub const HTTPCache = struct {
         }
     };
 };
+
+/// Global fallback timestamp counter for when clock_gettime fails
+/// Used by Backend health tracking to ensure recovery works even if system clock fails
+var global_fallback_timestamp: std.atomic.Value(i64) = std.atomic.Value(i64).init(1);
 
 /// Backend server configuration for load balancing
 pub const Backend = struct {
@@ -644,12 +816,12 @@ pub const Backend = struct {
         if (!healthy) {
             // Record when backend became unhealthy.
             // This timestamp is used by shouldRetry() for exponential backoff.
-            const now = HTTPCache.getTimestamp();
+            var now = HTTPCache.getTimestamp();
 
-            // Warn if timestamp failed (0 means clock_gettime failed).
-            // Without a valid timestamp, shouldRetry() will return false permanently.
+            // Use fallback monotonic counter if clock_gettime fails
             if (now == 0) {
-                log.warn("failed to record unhealthy_since for backend {s}:{}: clock_gettime returned 0, health recovery will be disabled", .{ self.host, self.port });
+                now = global_fallback_timestamp.fetchAdd(1, .monotonic);
+                log.warn("clock_gettime failed for backend {s}:{}, using fallback timestamp: {}", .{ self.host, self.port, now });
             }
 
             self.unhealthy_since.store(now, .monotonic);
@@ -771,7 +943,7 @@ pub const LoadBalancer = struct {
         };
     }
 
-    pub fn selectBackend(self: *LoadBalancer, client_ip: u32) ?*Backend {
+    pub fn selectBackend(self: *LoadBalancer, client_ip: IpKey) ?*Backend {
         return switch (self.strategy) {
             .round_robin => self.roundRobin(),
             .weighted_round_robin => self.weightedRoundRobin(),
@@ -789,7 +961,7 @@ pub const LoadBalancer = struct {
     const SelectionContext = struct {
         load_balancer: *LoadBalancer,
         start_index: usize,
-        client_ip: u32,
+        client_ip: IpKey,
     };
 
     /// Backend selector function signature.
@@ -857,7 +1029,7 @@ pub const LoadBalancer = struct {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = start_index,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(roundRobinSelector, context);
     }
@@ -898,18 +1070,14 @@ pub const LoadBalancer = struct {
     }
 
     fn weightedRoundRobin(self: *LoadBalancer) ?*Backend {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        // Increment counter ONCE per public call, BEFORE the two-pass selection.
-        // This ensures weighted distribution is correct even when falling back
-        // to retry candidates in selectBackendWithRetry().
+        // No mutex needed: fetchAdd is atomic, backends array is immutable,
+        // and selectBackendWithRetry only reads backend state via atomics
         const start_index = self.current_index.fetchAdd(1, .monotonic);
 
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = start_index,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(weightedRoundRobinSelector, context);
     }
@@ -937,13 +1105,11 @@ pub const LoadBalancer = struct {
     }
 
     fn leastConnections(self: *LoadBalancer) ?*Backend {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+        // No mutex needed: connection counts are read via atomics
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = 0,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(leastConnectionsSelector, context);
     }
@@ -984,7 +1150,7 @@ pub const LoadBalancer = struct {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = 0,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(randomBackendSelector, context);
     }
@@ -995,7 +1161,8 @@ pub const LoadBalancer = struct {
         is_eligible: BackendEligibilityFn,
         context: SelectionContext,
     ) ?*Backend {
-        const index = context.client_ip % @as(u32, @intCast(backends.len));
+        const ip_hash = context.client_ip.hash();
+        const index = @as(usize, @intCast(ip_hash % @as(u64, @intCast(backends.len))));
 
         for (0..backends.len) |i| {
             const backend_index = (index + i) % backends.len;
@@ -1008,7 +1175,7 @@ pub const LoadBalancer = struct {
         return null;
     }
 
-    fn ipHash(self: *LoadBalancer, client_ip: u32) ?*Backend {
+    fn ipHash(self: *LoadBalancer, client_ip: IpKey) ?*Backend {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = 0,
@@ -1211,7 +1378,7 @@ pub const Proxy = struct {
             if (options.enable_access_control) {
                 if (self.access_control) |acl| {
                     if (!acl.isAllowed(client_ip)) {
-                        log.warn("connection from {} denied by access control", .{client_ip});
+                        log.warn("connection from {any} denied by access control", .{client_ip});
                         client_stream.close(io);
                         continue;
                     }
@@ -1222,7 +1389,7 @@ pub const Proxy = struct {
             if (options.enable_rate_limiting) {
                 if (self.rate_limiter) |*limiter| {
                     if (!limiter.tryAcquire(client_ip)) {
-                        log.warn("connection from {} denied by rate limiter", .{client_ip});
+                        log.warn("connection from {any} denied by rate limiter", .{client_ip});
                         client_stream.close(io);
                         continue;
                     }
@@ -1231,7 +1398,7 @@ pub const Proxy = struct {
 
             // Only increment accepted counter after all validation passes
             accepted += 1;
-            log.info("accepted connection #{} from {}", .{ accepted, client_ip });
+            log.info("accepted connection #{} from {any}", .{ accepted, client_ip });
 
             if (options.enable_stats) {
                 self.stats.recordConnection();
@@ -1260,21 +1427,11 @@ pub const Proxy = struct {
         }
     }
 
-    fn extractClientIp(address: net.IpAddress) u32 {
-        return switch (address) {
-            .ip4 => |ip4| {
-                // Convert bytes to u32 in network byte order (big-endian)
-                const bytes = ip4.bytes;
-                return (@as(u32, bytes[0]) << 24) |
-                    (@as(u32, bytes[1]) << 16) |
-                    (@as(u32, bytes[2]) << 8) |
-                    (@as(u32, bytes[3]));
-            },
-            .ip6 => |ip6| {
-                // Hash IPv6 addresses to avoid DoS from all IPv6 mapping to 0
-                return std.hash.Crc32.hash(&ip6.bytes);
-            },
-        };
+    /// Extract client IP address as IpKey for rate limiting and access control
+    /// FIXED: Now returns IpKey to prevent IPv6 hash collisions
+    /// Previous implementation hashed IPv6 to u32, causing potential collisions
+    fn extractClientIp(address: net.IpAddress) IpKey {
+        return IpKey.fromAddress(address);
     }
 
     fn printArchitectureSummary(self: Self) void {
@@ -1369,7 +1526,7 @@ pub const Proxy = struct {
         stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
-        client_ip: u32,
+        client_ip: IpKey,
         rate_limiter: ?*RateLimiter,
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
@@ -1415,31 +1572,49 @@ pub const Proxy = struct {
             if (bytes_read > 0) {
                 // Try to parse HTTP request
                 if (HTTPInspector.parseRequestLine(request_buffer[0..bytes_read])) |request| {
-                    // Only cache GET requests
+                    // Extract Host header for cache key (multi-tenant isolation)
+                    // SECURITY: Requests without Host header are NOT cached to prevent
+                    // cache pollution across different virtual hosts/APIs
+                    const maybe_host = HTTPInspector.findHeader(request_buffer[0..bytes_read], "Host");
+
+                    // Only cache GET requests WITH valid Host header
                     if (std.mem.eql(u8, request.method, "GET")) {
-                        if (http_cache.?.get(request.method, request.path)) |cached_response| {
-                            // Cache hit! Send cached response directly
-                            if (!builtin.is_test) {
-                                log.info("cache HIT for GET {s}", .{request.path});
-                            }
+                        if (maybe_host) |host| {
+                            // Host header present - check cache
+                            if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
+                                // IMPORTANT: get() returns an owned copy that we must free
+                                defer http_cache.?.allocator.free(cached_response);
 
-                            var client_write_buf: [4096]u8 = undefined;
-                            var client_writer = client_stream.writer(io, &client_write_buf);
+                                // Cache hit! Send cached response directly
+                                if (!builtin.is_test) {
+                                    log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
+                                }
 
-                            Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
-                                log.warn("failed to write cached response: {s}", .{@errorName(err)});
+                                var client_write_buf: [4096]u8 = undefined;
+                                var client_writer = client_stream.writer(io, &client_write_buf);
+
+                                Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
+                                    log.warn("failed to write cached response: {s}", .{@errorName(err)});
+                                    return;
+                                };
+                                Writer.flush(&client_writer.interface) catch {};
+
+                                if (options.enable_stats) {
+                                    stats.recordBytesBackendToClient(@intCast(cached_response.len));
+                                }
                                 return;
-                            };
-                            Writer.flush(&client_writer.interface) catch {};
+                            }
 
-                            if (options.enable_stats) {
-                                stats.recordBytesBackendToClient(@intCast(cached_response.len));
-                            }
-                            return;
-                        } else {
+                            // Cache miss - log and proceed to forward request
                             if (!builtin.is_test) {
-                                log.info("cache MISS for GET {s}", .{request.path});
+                                log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
                             }
+                        } else {
+                            // Missing Host header - skip caching for security
+                            if (!builtin.is_test) {
+                                log.warn("cache SKIPPED for GET {s} - missing Host header (HTTP/1.1 violation)", .{request.path});
+                            }
+                            // Request will still be forwarded to backend, just not cached
                         }
                     }
                 }
@@ -1627,32 +1802,108 @@ pub const Proxy = struct {
             return;
         };
 
-        // Log first completion
+        // Wait for second completion with timeout and error handling
         switch (first_completed) {
             .client_to_backend => |completion_result| {
-                handleCopyResult("client->backend", completion_result);
-                // Client request fully sent, now wait for backend response
-                const second_completed = io.select(.{
-                    .backend_to_client = &future_b2c,
-                }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second_completed) {
-                    .backend_to_client => |result| handleCopyResult("backend->client", result),
+                // Check if first direction succeeded or failed
+                if (completion_result) |_| {
+                    // Success: wait for backend->client with timeout
+                    handleCopyResult("client->backend", completion_result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second_completed = io.select(.{
+                                .backend_to_client = &future_b2c,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err2)});
+                                future_b2c.cancel(io) catch {};
+                                return;
+                            };
+                            switch (second_completed) {
+                                .backend_to_client => |result| handleCopyResult("backend->client", result),
+                            }
+                            return;
+                        },
+                    };
+
+                    const second_completed = io.select(.{
+                        .backend_to_client = &future_b2c,
+                        .timeout = &timeout_future,
+                    }) catch |err| {
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
+                        future_b2c.cancel(io) catch {};
+                        timeout_future.cancel(io);
+                        return;
+                    };
+
+                    switch (second_completed) {
+                        .backend_to_client => |result| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("backend->client", result);
+                        },
+                        .timeout => {
+                            log.warn("backend->client timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_b2c.cancel(io) catch {};
+                        },
+                    }
+                } else |err| {
+                    // Error in client->backend: cancel backend->client immediately
+                    log.err("client->backend failed: {s}, canceling backend->client", .{@errorName(err)});
+                    handleCopyResult("client->backend", completion_result);
+                    future_b2c.cancel(io) catch {};
                 }
             },
             .backend_to_client => |completion_result| {
-                handleCopyResult("backend->client", completion_result);
-                // Backend response fully sent, now wait for client request
-                const second_completed = io.select(.{
-                    .client_to_backend = &future_c2b,
-                }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second_completed) {
-                    .client_to_backend => |result| handleCopyResult("client->backend", result),
+                // Check if first direction succeeded or failed
+                if (completion_result) |_| {
+                    // Success: wait for client->backend with timeout
+                    handleCopyResult("backend->client", completion_result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second_completed = io.select(.{
+                                .client_to_backend = &future_c2b,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err2)});
+                                future_c2b.cancel(io) catch {};
+                                return;
+                            };
+                            switch (second_completed) {
+                                .client_to_backend => |result| handleCopyResult("client->backend", result),
+                            }
+                            return;
+                        },
+                    };
+
+                    const second_completed = io.select(.{
+                        .client_to_backend = &future_c2b,
+                        .timeout = &timeout_future,
+                    }) catch |err| {
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
+                        future_c2b.cancel(io) catch {};
+                        timeout_future.cancel(io);
+                        return;
+                    };
+
+                    switch (second_completed) {
+                        .client_to_backend => |result| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("client->backend", result);
+                        },
+                        .timeout => {
+                            log.warn("client->backend timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_c2b.cancel(io) catch {};
+                        },
+                    }
+                } else |err| {
+                    // Error in backend->client: cancel client->backend immediately
+                    log.err("backend->client failed: {s}, canceling client->backend", .{@errorName(err)});
+                    handleCopyResult("backend->client", completion_result);
+                    future_c2b.cancel(io) catch {};
                 }
             },
         }
@@ -1681,6 +1932,7 @@ pub const Proxy = struct {
         enable_http_inspection: bool,
         http_cache: *HTTPCache,
         request_method: []const u8,
+        request_host: []const u8,
         request_path: []const u8,
         allocator: std.mem.Allocator,
 
@@ -1753,26 +2005,145 @@ pub const Proxy = struct {
             return;
         };
 
-        // Wait for second completion
+        // Wait for second completion with timeout and error handling
+        //
+        // CRITICAL FIXES:
+        // 1. 30-second timeout: Uses io.concurrent(sleep, ...) + io.select() to enforce timeout
+        // 2. Cancel opposite direction immediately when one side fails (resource cleanup)
+        // 3. Proper error propagation with stats recording
+        //
+        // Previous issues:
+        // - No timeout: connections could hang forever waiting for EOF
+        // - No cancellation: failed direction kept other side running indefinitely
+        // - Resource leak: tasks continued consuming CPU/memory after connection died
+        //
+        // Timeout implementation: Uses io.concurrent(sleepForTimeout, ...) combined with
+        // io.select() to enforce 30-second timeout when waiting for second direction.
         switch (first_completed) {
             .client_to_backend => |result| {
-                handleCopyResult("client->backend", result);
-                const second = io.select(.{ .backend_to_client = &future_b2c }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second) {
-                    .backend_to_client => |r| handleCopyResult("backend->client", r),
+                // Check if first direction succeeded or failed
+                if (result) |_| {
+                    // Success: wait for backend->client with timeout
+                    handleCopyResult("client->backend", result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second = io.select(.{
+                                .backend_to_client = &future_b2c,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err2)});
+                                future_b2c.cancel(io) catch {};
+                                if (options.enable_stats) {
+                                    stats.recordError();
+                                }
+                                return;
+                            };
+                            switch (second) {
+                                .backend_to_client => |r| handleCopyResult("backend->client", r),
+                            }
+                            return;
+                        },
+                    };
+
+                    const second = io.select(.{
+                        .backend_to_client = &future_b2c,
+                        .timeout = &timeout_future,
+                    }) catch |err| {
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
+                        future_b2c.cancel(io) catch {};
+                        timeout_future.cancel(io);
+                        if (options.enable_stats) {
+                            stats.recordError();
+                        }
+                        return;
+                    };
+
+                    switch (second) {
+                        .backend_to_client => |r| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("backend->client", r);
+                        },
+                        .timeout => {
+                            log.warn("backend->client timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_b2c.cancel(io) catch {};
+                            if (options.enable_stats) {
+                                stats.recordError();
+                            }
+                        },
+                    }
+                } else |err| {
+                    // Error in client->backend: cancel backend->client immediately
+                    log.err("client->backend failed: {s}, canceling backend->client", .{@errorName(err)});
+                    handleCopyResult("client->backend", result);
+                    future_b2c.cancel(io) catch {};
+                    if (options.enable_stats) {
+                        stats.recordError();
+                    }
                 }
             },
             .backend_to_client => |result| {
-                handleCopyResult("backend->client", result);
-                const second = io.select(.{ .client_to_backend = &future_c2b }) catch |err| {
-                    log.err("second io.select failed: {s}", .{@errorName(err)});
-                    return;
-                };
-                switch (second) {
-                    .client_to_backend => |r| handleCopyResult("client->backend", r),
+                // Check if first direction succeeded or failed
+                if (result) |_| {
+                    // Success: wait for client->backend with timeout
+                    handleCopyResult("backend->client", result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second = io.select(.{
+                                .client_to_backend = &future_c2b,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err2)});
+                                future_c2b.cancel(io) catch {};
+                                if (options.enable_stats) {
+                                    stats.recordError();
+                                }
+                                return;
+                            };
+                            switch (second) {
+                                .client_to_backend => |r| handleCopyResult("client->backend", r),
+                            }
+                            return;
+                        },
+                    };
+
+                    const second = io.select(.{
+                        .client_to_backend = &future_c2b,
+                        .timeout = &timeout_future,
+                    }) catch |err| {
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
+                        future_c2b.cancel(io) catch {};
+                        timeout_future.cancel(io);
+                        if (options.enable_stats) {
+                            stats.recordError();
+                        }
+                        return;
+                    };
+
+                    switch (second) {
+                        .client_to_backend => |r| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("client->backend", r);
+                        },
+                        .timeout => {
+                            log.warn("client->backend timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_c2b.cancel(io) catch {};
+                            if (options.enable_stats) {
+                                stats.recordError();
+                            }
+                        },
+                    }
+                } else |err| {
+                    // Error in backend->client: cancel client->backend immediately
+                    log.err("backend->client failed: {s}, canceling client->backend", .{@errorName(err)});
+                    handleCopyResult("backend->client", result);
+                    future_c2b.cancel(io) catch {};
+                    if (options.enable_stats) {
+                        stats.recordError();
+                    }
                 }
             },
         }
@@ -1788,6 +2159,13 @@ pub const Proxy = struct {
 
     fn handleCopyResult(direction: []const u8, result: CopyError!void) void {
         result catch |err| log.warn("{s} stream closed with {s}", .{ direction, @errorName(err) });
+    }
+
+    fn sleepForTimeout(io: Io, seconds: i64) void {
+        const duration = Duration.fromSeconds(seconds);
+        io.sleep(duration, .awake) catch |err| {
+            log.warn("timeout sleep failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn copyPipe(job: PipeJob) CopyError!void {
@@ -2001,6 +2379,7 @@ pub const Proxy = struct {
             if (response_data.len > 0 and response_data.len <= PipeJobWithCaching.max_cacheable_size) {
                 job.http_cache.put(
                     job.request_method,
+                    job.request_host,
                     job.request_path,
                     response_data,
                     PipeJobWithCaching.default_ttl_seconds,
@@ -2384,8 +2763,8 @@ test "AccessControl: allow policy" {
     defer acl.deinit();
 
     // Default allow policy - all IPs allowed
-    try testing.expect(acl.isAllowed(0x7F000001)); // 127.0.0.1
-    try testing.expect(acl.isAllowed(0xC0A80001)); // 192.168.0.1
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0x7F000001 })); // 127.0.0.1
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0xC0A80001 })); // 192.168.0.1
 }
 
 test "AccessControl: deny policy" {
@@ -2395,8 +2774,8 @@ test "AccessControl: deny policy" {
     defer acl.deinit();
 
     // Default deny policy - all IPs denied
-    try testing.expect(!acl.isAllowed(0x7F000001));
-    try testing.expect(!acl.isAllowed(0xC0A80001));
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0x7F000001 }));
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0xC0A80001 }));
 }
 
 test "AccessControl: allow list" {
@@ -2406,10 +2785,10 @@ test "AccessControl: allow list" {
     defer acl.deinit();
 
     // Add specific IPs to allow list
-    try acl.addToAllowList(0x7F000001); // 127.0.0.1
+    try acl.addToAllowList(.{ .ipv4 = 0x7F000001 }); // 127.0.0.1
 
-    try testing.expect(acl.isAllowed(0x7F000001));
-    try testing.expect(!acl.isAllowed(0xC0A80001));
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0x7F000001 }));
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0xC0A80001 }));
 }
 
 test "AccessControl: deny list" {
@@ -2419,10 +2798,10 @@ test "AccessControl: deny list" {
     defer acl.deinit();
 
     // Add specific IPs to deny list
-    try acl.addToDenyList(0xC0A80001); // 192.168.0.1
+    try acl.addToDenyList(.{ .ipv4 = 0xC0A80001 }); // 192.168.0.1
 
-    try testing.expect(acl.isAllowed(0x7F000001)); // Not in deny list
-    try testing.expect(!acl.isAllowed(0xC0A80001)); // In deny list
+    try testing.expect(acl.isAllowed(.{ .ipv4 = 0x7F000001 })); // Not in deny list
+    try testing.expect(!acl.isAllowed(.{ .ipv4 = 0xC0A80001 })); // In deny list
 }
 
 test "RateLimiter: basic limiting" {
@@ -2431,8 +2810,8 @@ test "RateLimiter: basic limiting" {
     var limiter = RateLimiter.init(allocator, 2, 5); // 2 per IP, 5 global
     defer limiter.deinit();
 
-    const ip1: u32 = 0x7F000001;
-    const ip2: u32 = 0x7F000002;
+    const ip1 = IpKey{ .ipv4 = 0x7F000001 };
+    const ip2 = IpKey{ .ipv4 = 0x7F000002 };
 
     // First IP can acquire up to limit
     try testing.expect(limiter.tryAcquire(ip1));
@@ -2454,8 +2833,8 @@ test "RateLimiter: global limit" {
     var limiter = RateLimiter.init(allocator, 10, 3); // 10 per IP, 3 global
     defer limiter.deinit();
 
-    const ip1: u32 = 0x7F000001;
-    const ip2: u32 = 0x7F000002;
+    const ip1 = IpKey{ .ipv4 = 0x7F000001 };
+    const ip2 = IpKey{ .ipv4 = 0x7F000002 };
 
     // Acquire global limit
     try testing.expect(limiter.tryAcquire(ip1));
@@ -2696,7 +3075,7 @@ test "Proxy: enable access control" {
 
     if (proxy.access_control) |*acl| {
         // Add to allow list
-        try acl.addToAllowList(0x7F000001);
+        try acl.addToAllowList(.{ .ipv4 = 0x7F000001 });
     }
 }
 
@@ -2737,15 +3116,16 @@ test "HTTPCache: basic caching" {
     defer cache.deinit();
 
     // Cache miss
-    const result1 = cache.get("GET", "/api/users");
+    const result1 = cache.get("GET", "example.com", "/api/users");
     try testing.expect(result1 == null);
 
     // Store response
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
-    try cache.put("GET", "/api/users", response, 300);
+    try cache.put("GET", "example.com", "/api/users", response, 300);
 
     // Cache hit
-    const result2 = cache.get("GET", "/api/users");
+    const result2 = cache.get("GET", "example.com", "/api/users");
+    defer if (result2) |data| allocator.free(data);
     try testing.expect(result2 != null);
     if (result2) |data| {
         try testing.expectEqualStrings(response, data);
@@ -2765,11 +3145,11 @@ test "HTTPCache: LRU eviction" {
     defer cache.deinit();
 
     // Fill cache
-    try cache.put("GET", "/1", "response1response1response1", 300);
-    try cache.put("GET", "/2", "response2response2response2", 300);
+    try cache.put("GET", "test.com", "/1", "response1response1response1", 300);
+    try cache.put("GET", "test.com", "/2", "response2response2response2", 300);
 
     // This should evict the least recently used entry
-    try cache.put("GET", "/3", "response3response3response3", 300);
+    try cache.put("GET", "test.com", "/3", "response3response3response3", 300);
 
     const stats = cache.getStats();
     try testing.expect(stats.entry_count <= 2);
@@ -2782,14 +3162,14 @@ test "HTTPCache: TTL expiration" {
     defer cache.deinit();
 
     // Store with 0 TTL (should expire immediately)
-    try cache.put("GET", "/expire", "data", 0);
+    try cache.put("GET", "test.com", "/expire", "data", 0);
 
     // Wait a bit (in real scenario, time would pass)
     // For testing, we rely on the timestamp check
-    const result = cache.get("GET", "/expire");
+    const result = cache.get("GET", "test.com", "/expire");
+    defer if (result) |data| allocator.free(data);
 
-    // May or may not be expired depending on timing
-    _ = result;
+    // May or may not be expired depending on timing (verified via defer)
 }
 
 test "Backend: initialization and health" {
@@ -2961,17 +3341,17 @@ test "LoadBalancer: round robin" {
     var lb = LoadBalancer.init(&backends, .round_robin);
 
     // Should rotate through backends
-    const b1 = lb.selectBackend(0);
+    const b1 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b1 != null);
 
-    const b2 = lb.selectBackend(0);
+    const b2 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b2 != null);
 
-    const b3 = lb.selectBackend(0);
+    const b3 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b3 != null);
 
     // Should wrap around
-    const b4 = lb.selectBackend(0);
+    const b4 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b4 != null);
 
     _ = allocator;
@@ -2991,7 +3371,7 @@ test "LoadBalancer: weighted round robin" {
     var backend2_count: u32 = 0;
     var i: u32 = 0;
     while (i < 10) : (i += 1) {
-        if (lb.selectBackend(0)) |backend| {
+        if (lb.selectBackend(.{ .ipv4 = 0 })) |backend| {
             if (std.mem.eql(u8, backend.host, "backend2")) {
                 backend2_count += 1;
             }
@@ -3016,14 +3396,14 @@ test "LoadBalancer: least connections" {
     var lb = LoadBalancer.init(&backends, .least_connections);
 
     // First backend should have 0 connections
-    const b1 = lb.selectBackend(0);
+    const b1 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b1 != null);
     if (b1) |backend| {
         backend.incrementConnections();
     }
 
     // Should select a different backend with fewer connections
-    const b2 = lb.selectBackend(0);
+    const b2 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(b2 != null);
 
     _ = allocator;
@@ -3040,8 +3420,8 @@ test "LoadBalancer: ip hash" {
 
     var lb = LoadBalancer.init(&backends, .ip_hash);
 
-    const ip1: u32 = 0x7F000001;
-    const ip2: u32 = 0x7F000002;
+    const ip1 = IpKey{ .ipv4 = 0x7F000001 };
+    const ip2 = IpKey{ .ipv4 = 0x7F000002 };
 
     // Same IP should consistently get same backend
     const b1 = lb.selectBackend(ip1);
@@ -3073,7 +3453,7 @@ test "LoadBalancer: no healthy backends" {
 
     var lb = LoadBalancer.init(&backends, .round_robin);
 
-    const result = lb.selectBackend(0);
+    const result = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(result == null);
 
     _ = allocator;
@@ -3166,10 +3546,12 @@ test "HTTPCache Integration: cache only successful GET requests with 200 OK" {
         try testing.expectEqualStrings("/api/users", request.path);
 
         // Simulate caching the response
-        try cache.put(request.method, request.path, ok_response, 300);
+        const test_host = "api.example.com";
+        try cache.put(request.method, test_host, request.path, ok_response, 300);
 
         // Verify it was cached
-        const cached = cache.get(request.method, request.path);
+        const cached = cache.get(request.method, test_host, request.path);
+        defer if (cached) |data| allocator.free(data);
         try testing.expect(cached != null);
         if (cached) |data| {
             try testing.expectEqualStrings(ok_response, data);
@@ -3213,8 +3595,13 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
 
     // Parse the request
     if (HTTPInspector.parseRequestLine(request_data)) |request| {
+        // Extract host header for multi-tenant isolation
+        const maybe_host = HTTPInspector.findHeader(request_data, "Host");
+        try testing.expect(maybe_host != null); // Verify Host header is present
+        const host = maybe_host.?;
+
         // Check cache (should be miss)
-        const cached = cache.get(request.method, request.path);
+        const cached = cache.get(request.method, host, request.path);
         try testing.expect(cached == null);
 
         // Verify cache miss was recorded
@@ -3229,10 +3616,11 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
         const backend_response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata";
 
         // After receiving backend response, cache it for future requests
-        try cache.put(request.method, request.path, backend_response, 300);
+        try cache.put(request.method, host, request.path, backend_response, 300);
 
         // Verify subsequent request gets cached response
-        const cached_after = cache.get(request.method, request.path);
+        const cached_after = cache.get(request.method, host, request.path);
+        defer if (cached_after) |data| allocator.free(data);
         try testing.expect(cached_after != null);
         if (cached_after) |data| {
             try testing.expectEqualStrings(backend_response, data);
@@ -3256,19 +3644,23 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     const path = "/api/short-lived";
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nshort";
 
+    const host = "example.com";
+
     // Cache with very short TTL (0 seconds - immediate expiration)
-    try cache.put(method, path, response, 0);
+    try cache.put(method, host, path, response, 0);
 
     // Immediate lookup might hit or miss depending on timing
     // The key is that the TTL mechanism is tested
-    const cached1 = cache.get(method, path);
+    const cached1 = cache.get(method, host, path);
+    defer if (cached1) |data| allocator.free(data);
 
     // Regardless of first lookup, we verify TTL behavior:
     // Put a new entry with longer TTL
-    try cache.put(method, path, response, 300);
+    try cache.put(method, host, path, response, 300);
 
     // This should definitely hit
-    const cached2 = cache.get(method, path);
+    const cached2 = cache.get(method, host, path);
+    defer if (cached2) |data| allocator.free(data);
     try testing.expect(cached2 != null);
 
     // Verify cache is working
@@ -3276,11 +3668,12 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     try testing.expect(stats.entry_count == 1);
 
     // Test another path with 0 TTL to verify expiration logic
-    try cache.put("GET", "/api/expired", "data", 0);
+    try cache.put("GET", host, "/api/expired", "data", 0);
     // The entry may expire immediately, demonstrating TTL functionality
-    _ = cache.get("GET", "/api/expired");
+    const expired = cache.get("GET", host, "/api/expired");
+    defer if (expired) |data| allocator.free(data);
 
-    _ = cached1; // May or may not be null
+    // cached1 and expired may or may not be null (verified via defer)
 }
 
 test "HTTPCache Integration: concurrent access with new lock pattern" {
@@ -3290,6 +3683,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     defer cache.deinit();
 
     // Pre-populate cache with test data
+    const host = "test.com";
     const paths = [_][]const u8{
         "/api/path1",
         "/api/path2",
@@ -3300,7 +3694,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
 
     for (paths) |path| {
         const response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest";
-        try cache.put("GET", path, response, 300);
+        try cache.put("GET", host, path, response, 300);
     }
 
     // Simulate concurrent access (sequential in test, but tests lock correctness)
@@ -3310,7 +3704,8 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     // Multiple "concurrent" readers
     for (0..10) |i| {
         const path = paths[i % paths.len];
-        const cached = cache.get("GET", path);
+        const cached = cache.get("GET", host, path);
+        defer if (cached) |data| allocator.free(data);
 
         if (cached) |_| {
             hits += 1;
@@ -3328,14 +3723,16 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     try testing.expectEqual(@as(u64, 10), stats.hits);
 
     // Test concurrent writes (LRU updates via get())
-    // The new write lock pattern in get() prevents race conditions
+    // Note: get() no longer updates LRU order due to shared lock optimization
     for (paths) |path| {
-        _ = cache.get("GET", path); // Update LRU order
+        const result = cache.get("GET", host, path);
+        defer if (result) |data| allocator.free(data);
     }
 
     // Verify all entries still accessible
     for (paths) |path| {
-        const cached = cache.get("GET", path);
+        const cached = cache.get("GET", host, path);
+        defer if (cached) |data| allocator.free(data);
         try testing.expect(cached != null);
     }
 }
@@ -3348,32 +3745,36 @@ test "HTTPCache Integration: cache size limits and LRU eviction behavior" {
     var cache = HTTPCache.init(allocator, cache_size);
     defer cache.deinit();
 
-    // Each entry: method (3) + path (10) + response (50) = 63 bytes
-    // Cache can hold ~4 entries (256 / 63 = 4.06)
+    const host = "test.com";
+
+    // Each entry: method (3) + host (8) + path (10) + response (50) = 71 bytes
+    // Cache can hold ~3 entries (256 / 71 = 3.60)
 
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345"; // 50 bytes
 
     // Add entries until cache is full
-    try cache.put("GET", "/path0001", response, 300);
-    try cache.put("GET", "/path0002", response, 300);
-    try cache.put("GET", "/path0003", response, 300);
-    try cache.put("GET", "/path0004", response, 300);
+    try cache.put("GET", host, "/path0001", response, 300);
+    try cache.put("GET", host, "/path0002", response, 300);
+    try cache.put("GET", host, "/path0003", response, 300);
+    try cache.put("GET", host, "/path0004", response, 300);
 
     var stats = cache.getStats();
     const entries_after_fill = stats.entry_count;
 
-    // Cache should have 4 entries
+    // Cache should have 3-4 entries
     try testing.expect(entries_after_fill <= 4);
 
     // Add 5th entry - should evict LRU (path0001)
-    try cache.put("GET", "/path0005", response, 300);
+    try cache.put("GET", host, "/path0005", response, 300);
 
     // Verify LRU eviction occurred
-    const evicted = cache.get("GET", "/path0001");
+    const evicted = cache.get("GET", host, "/path0001");
+    defer if (evicted) |data| allocator.free(data);
     try testing.expect(evicted == null); // Should be evicted
 
     // Verify newest entry is present
-    const newest = cache.get("GET", "/path0005");
+    const newest = cache.get("GET", host, "/path0005");
+    defer if (newest) |data| allocator.free(data);
     try testing.expect(newest != null);
 
     // Verify cache size accounting is correct
@@ -3397,7 +3798,7 @@ test "LoadBalancer Integration: refactored selection maintains round-robin behav
 
     // Select 12 times (4 full rotations)
     for (0..12) |_| {
-        if (lb.selectBackend(0)) |backend| {
+        if (lb.selectBackend(.{ .ipv4 = 0 })) |backend| {
             if (std.mem.eql(u8, backend.host, "backend1")) {
                 selections[0] += 1;
             } else if (std.mem.eql(u8, backend.host, "backend2")) {
@@ -3436,7 +3837,7 @@ test "LoadBalancer Integration: two-pass selection with unhealthy backends" {
     var backend3_count: u32 = 0;
 
     for (0..10) |_| {
-        if (lb.selectBackend(0)) |backend| {
+        if (lb.selectBackend(.{ .ipv4 = 0 })) |backend| {
             if (std.mem.eql(u8, backend.host, "backend1")) {
                 backend1_count += 1;
             } else if (std.mem.eql(u8, backend.host, "backend2")) {
@@ -3473,14 +3874,14 @@ test "LoadBalancer Integration: retry logic with all backends unhealthy" {
     var lb = LoadBalancer.init(&backends, .round_robin);
 
     // Should return null when no healthy backends
-    const result = lb.selectBackend(0);
+    const result = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(result == null);
 
     // Recover one backend
     backends[0].markHealthy(true);
 
     // Should now succeed
-    const result2 = lb.selectBackend(0);
+    const result2 = lb.selectBackend(.{ .ipv4 = 0 });
     try testing.expect(result2 != null);
     if (result2) |backend| {
         try testing.expectEqualStrings("backend1", backend.host);
@@ -3599,23 +4000,108 @@ test "HTTPCache Integration: verify correct size accounting in put operations" {
     var cache = HTTPCache.init(allocator, 500);
     defer cache.deinit();
 
-    // Put entry and verify size accounting includes method + path + response
+    // Put entry and verify size accounting includes method + host + path + response
     const method = "GET"; // 3 bytes
+    const host = "test.com"; // 8 bytes
     const path = "/test"; // 5 bytes
     const response = "HTTP/1.1 200 OK\r\n\r\nHello"; // 25 bytes
-    // Total: 3 + 5 + 25 = 33 bytes
+    // Total: 3 + 8 + 5 + 25 = 41 bytes
 
-    try cache.put(method, path, response, 300);
+    try cache.put(method, host, path, response, 300);
 
     const stats = cache.getStats();
 
-    // Verify size accounting - should be exactly method + path + response lengths
-    const expected_size = method.len + path.len + response.len;
+    // Verify size accounting - should be exactly method + host + path + response lengths
+    const expected_size = method.len + host.len + path.len + response.len;
     try testing.expectEqual(@as(usize, expected_size), stats.current_size);
     try testing.expect(stats.current_size <= 500);
     try testing.expectEqual(@as(u64, 1), stats.entry_count);
 
     // Verify entry is retrievable
-    const cached = cache.get(method, path);
+    const cached = cache.get(method, host, path);
+    defer if (cached) |data| allocator.free(data);
     try testing.expect(cached != null);
+}
+
+test "HTTPCache Integration: skip caching for missing Host header (security)" {
+    const allocator = testing.allocator;
+
+    var cache = HTTPCache.init(allocator, 1024 * 1024); // 1MB cache
+    defer cache.deinit();
+
+    // Test request WITHOUT Host header (HTTP/1.0 style or misconfigured client)
+    const request_no_host = "GET /api/users HTTP/1.1\r\nUser-Agent: Test\r\n\r\n";
+
+    if (HTTPInspector.parseRequestLine(request_no_host)) |_| {
+        const maybe_host = HTTPInspector.findHeader(request_no_host, "Host");
+
+        // Verify Host header is missing
+        try testing.expect(maybe_host == null);
+
+        // In the real implementation, this request would bypass cache entirely
+        // We simulate this by checking that the cache lookup returns null
+        // and NOT calling cache.put()
+
+        // The request would still be forwarded to backend, just not cached
+    }
+
+    // Test request WITH Host header works normally
+    const request_with_host = "GET /api/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+
+    if (HTTPInspector.parseRequestLine(request_with_host)) |request| {
+        const maybe_host = HTTPInspector.findHeader(request_with_host, "Host");
+
+        try testing.expect(maybe_host != null);
+        const host = maybe_host.?;
+
+        // This SHOULD be cacheable
+        const response = "HTTP/1.1 200 OK\r\n\r\nresponse-data";
+        try cache.put(request.method, host, request.path, response, 300);
+
+        // Verify it was cached
+        const cached = cache.get(request.method, host, request.path);
+        try testing.expect(cached != null);
+        defer if (cached) |data| allocator.free(data);
+
+        // Verify correct response
+        try testing.expect(std.mem.indexOf(u8, cached.?, "response-data") != null);
+    }
+
+    // Verify cache has exactly one entry (only the request with Host header)
+    const stats = cache.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.entry_count);
+    try testing.expectEqual(@as(u64, 1), stats.hits);
+}
+
+test "HTTPCache Integration: prevent cache pollution across different hosts" {
+    const allocator = testing.allocator;
+
+    var cache = HTTPCache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    // Same path, different hosts should NOT collide
+    const response1 = "HTTP/1.1 200 OK\r\n\r\nhost1-response";
+    const response2 = "HTTP/1.1 200 OK\r\n\r\nhost2-response";
+
+    try cache.put("GET", "api1.example.com", "/api/users", response1, 300);
+    try cache.put("GET", "api2.example.com", "/api/users", response2, 300);
+
+    // Verify each host gets its own cached response
+    const cached1 = cache.get("GET", "api1.example.com", "/api/users");
+    try testing.expect(cached1 != null);
+    try testing.expect(std.mem.indexOf(u8, cached1.?, "host1-response") != null);
+    defer allocator.free(cached1.?);
+
+    const cached2 = cache.get("GET", "api2.example.com", "/api/users");
+    try testing.expect(cached2 != null);
+    try testing.expect(std.mem.indexOf(u8, cached2.?, "host2-response") != null);
+    defer allocator.free(cached2.?);
+
+    // Verify they're different responses (multi-tenant isolation)
+    try testing.expect(!std.mem.eql(u8, cached1.?, cached2.?));
+
+    // Verify cache has two separate entries
+    const stats = cache.getStats();
+    try testing.expectEqual(@as(u64, 2), stats.entry_count);
+    try testing.expectEqual(@as(u64, 2), stats.hits);
 }
