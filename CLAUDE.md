@@ -268,7 +268,7 @@ Splitting code into functions requires taste. Some rules of thumb:
 
 - All errors must be handled. An analysis of production failures in distributed data-intensive systems found that the majority of catastrophic failures could have been prevented by simple testing of error handling code.
 
-> "Specifically, we found that almost all (92%) of the catastrophic system failures are the result of incorrect handling of non-fatal errors explicitly signaled in software."
+> "Specifically, we found that almost all (92%) of the catastrophic system failures are the result of incorrect handling of non-fatal errors explicitly signaled in software." — Ding et al., "Simple Testing Can Prevent Most Critical Failures"
 
 - **Always motivate, always say why**. Never forget to say why. Because if you explain the rationale for a decision, it not only increases the hearer's understanding, and makes them more likely to adhere or comply, but it also shares criteria with them with which to evaluate the decision and its importance.
 - **Explicitly pass options to library functions at the call site, instead of relying on the defaults**. For example, write `@prefetch(a, .{ .cache = .data, .rw = .read, .locality = 3 });` over `@prefetch(a, .{});`. This improves readability but most of all avoids latent, potentially catastrophic bugs in case the library ever changes its defaults.
