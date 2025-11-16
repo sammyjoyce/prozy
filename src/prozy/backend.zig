@@ -77,14 +77,23 @@ pub const Backend = struct {
         // Check if recovery interval has passed
         const unhealthy_timestamp = self.unhealthy_since.load(.monotonic);
 
-        // If unhealthy_timestamp is 0, it means either:
-        // (1) Backend never marked as unhealthy (initial state), or
-        // (2) clock_gettime() failed and we couldn't record the timestamp.
-        // In either case, we conservatively return false to prevent
-        // thundering herd. See markHealthy() for logging on clock failures.
+        // If unhealthy_timestamp is 0, backend was never marked as unhealthy (initial state)
         if (unhealthy_timestamp == 0) return false;
 
-        const now = getTimestamp();
+        // Get current timestamp with fallback support
+        var now = getTimestamp();
+
+        // If clock_gettime fails, use fallback monotonic counter
+        // This ensures we can still compare with fallback timestamps from markHealthy()
+        if (now == 0) {
+            now = global_fallback_timestamp.load(.monotonic);
+        }
+
+        // Handle potential timestamp wrap-around or backwards clock
+        // If now < unhealthy_timestamp, the clock went backwards or we're using fallback
+        // In this case, conservatively allow retry to avoid permanently blocking backends
+        if (now < unhealthy_timestamp) return true;
+
         const seconds_unhealthy = now - unhealthy_timestamp;
 
         // Use exponential backoff interval
@@ -269,8 +278,8 @@ pub const LoadBalancer = struct {
     ) ?*Backend {
         // Calculate total weight of eligible backends.
         var total_weight: u32 = 0;
-        for (backends) |backend| {
-            if (is_eligible(&backend)) {
+        for (backends) |*backend| {
+            if (is_eligible(backend)) {
                 total_weight += backend.weight;
             }
         }
@@ -349,8 +358,8 @@ pub const LoadBalancer = struct {
     ) ?*Backend {
         // Count eligible backends.
         var eligible_count: usize = 0;
-        for (backends) |backend| {
-            if (is_eligible(&backend)) eligible_count += 1;
+        for (backends) |*backend| {
+            if (is_eligible(backend)) eligible_count += 1;
         }
 
         if (eligible_count == 0) return null;

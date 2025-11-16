@@ -171,17 +171,6 @@ pub const HTTPCache = struct {
         next: ?*CacheNode,
     };
 
-    const CacheEntry = struct {
-        response: []u8,
-        method: []u8,
-        host: []u8,
-        path: []u8,
-        created_at: i64,
-        ttl: u32,
-        size: usize,
-        access_count: u32,
-    };
-
     allocator: std.mem.Allocator,
     cache: std.AutoHashMap(u64, *CacheNode),
     max_size: usize,
@@ -256,7 +245,8 @@ pub const HTTPCache = struct {
             // could evict this entry and free the buffer. Return an owned copy.
             const response_copy = self.allocator.alloc(u8, node.response.len) catch {
                 // Allocation failed, treat as cache miss
-                _ = self.misses.fetchSub(1, .monotonic);
+                // Only decrement hits (incremented at line 252)
+                // Don't decrement misses (never incremented in this path)
                 _ = self.hits.fetchSub(1, .monotonic);
                 return null;
             };

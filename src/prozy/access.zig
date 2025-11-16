@@ -1,5 +1,6 @@
 const std = @import("std");
 const IpKey = @import("transport.zig").IpKey;
+const log = std.log.scoped(.rate_limiter);
 const IpKeyContext = @import("transport.zig").IpKeyContext;
 
 /// Access control for IP-based filtering
@@ -123,8 +124,14 @@ pub const RateLimiter = struct {
                     // Remove entry entirely to avoid HashMap rehashing issues
                     _ = self.connections_per_ip.remove(ip);
                 } else {
-                    // Decrement existing entry (should never fail - not adding new key)
-                    self.connections_per_ip.put(ip, count - 1) catch unreachable;
+                    // Decrement existing entry
+                    // While updating an existing key typically doesn't require HashMap reallocation,
+                    // allocation can still fail if the HashMap needs to grow due to tombstone
+                    // accumulation or rehashing. Handle OOM gracefully instead of panicking.
+                    self.connections_per_ip.put(ip, count - 1) catch |err| {
+                        log.warn("Failed to decrement IP counter for {any}: {s}", .{ ip, @errorName(err) });
+                        // Still decrement global counter to maintain consistency
+                    };
                 }
                 // Always decrement global counter
                 _ = self.current_global.fetchSub(1, .monotonic);

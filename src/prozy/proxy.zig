@@ -351,52 +351,6 @@ pub const Proxy = struct {
         std.debug.print("- Reader/Writer interfaces with buffering\n", .{});
     }
 
-    fn handleClient(
-        client_stream: net.Stream,
-        io: Io,
-        backend_host: []const u8,
-        backend_port: u16,
-        connect_timeout: Timeout,
-    ) void {
-        defer client_stream.close(io);
-
-        if (!builtin.is_test) {
-            log.info("handling new client connection", .{});
-        }
-
-        if (!builtin.is_test) log.info("connecting to backend {s}:{}", .{ backend_host, backend_port });
-        const backend_stream = connectToBackend(io, backend_host, backend_port, connect_timeout) catch |err| {
-            log.err("backend connect failed: {s}", .{@errorName(err)});
-            return;
-        };
-        defer backend_stream.close(io);
-
-        if (!builtin.is_test) {
-            log.info("connected to backend {s}:{}", .{ backend_host, backend_port });
-        }
-
-        if (!builtin.is_test) log.info("setting up readers and writers", .{});
-        var client_read_buf: [4096]u8 = undefined;
-        var backend_read_buf: [4096]u8 = undefined;
-        var client_write_buf: [4096]u8 = undefined;
-        var backend_write_buf: [4096]u8 = undefined;
-
-        var client_reader = client_stream.reader(io, &client_read_buf);
-        var backend_reader = backend_stream.reader(io, &backend_read_buf);
-        var client_writer = client_stream.writer(io, &client_write_buf);
-        var backend_writer = backend_stream.writer(io, &backend_write_buf);
-
-        if (!builtin.is_test) log.info("starting bidirectional copy", .{});
-        copyBidirectional(
-            io,
-            &client_reader.interface,
-            &backend_writer.interface,
-            &backend_reader.interface,
-            &client_writer.interface,
-        );
-        if (!builtin.is_test) log.info("bidirectional copy completed", .{});
-    }
-
     fn handleClientWithFeatures(
         client_stream: net.Stream,
         io: Io,
