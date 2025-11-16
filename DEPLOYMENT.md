@@ -203,7 +203,6 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/cache/prozy
 
 # Resource limits
 LimitNOFILE=65536
@@ -232,7 +231,7 @@ sudo systemctl status prozy
 Create `Dockerfile`:
 
 ```dockerfile
-FROM alpine:latest AS builder
+FROM alpine:3.18 AS builder
 
 # Install Zig
 RUN apk add --no-cache wget xz
@@ -247,7 +246,7 @@ COPY . .
 RUN zig build -Doptimize=ReleaseFast
 
 # Runtime image
-FROM alpine:latest
+FROM alpine:3.18
 RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /build/zig-out/bin/prozy /usr/local/bin/prozy
@@ -456,7 +455,7 @@ timeout 2 bash -c "</dev/tcp/localhost/8080" && echo "UP" || echo "DOWN"
 
 Prozy doesn't include TLS termination. Use a TLS-terminating reverse proxy:
 
-```bash
+```nginx
 # Nginx as TLS terminator → Prozy
 upstream prozy_backend {
     server 127.0.0.1:8080;

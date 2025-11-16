@@ -231,7 +231,7 @@ test "Feature: specific behavior" {
 ### Before Submitting
 
 1. **Run all tests**: `zig build test && zig build test_e2e`
-2. **Format code**: `zig fmt src/ examples/ tests/`
+2. **Format code**: `zig fmt src/ examples/ tests/ configs/`
 3. **Check assertions**: Ensure minimum 2 per function
 4. **Update documentation**: README, CLAUDE.md, or docs/ as needed
 5. **Add tests**: For all new functionality

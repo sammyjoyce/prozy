@@ -344,7 +344,6 @@ RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 LockPersonality=true
-ReadWritePaths=/var/cache/prozy
 
 # Resource limits
 LimitNOFILE=65536
