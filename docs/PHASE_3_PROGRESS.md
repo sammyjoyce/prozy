@@ -1,8 +1,9 @@
 # Phase 3 Progress Report
 
-**Status**: ~75% Complete
+**Status**: ~85% Complete
 **Branch**: `claude/phase-3-routing-transforms-011MRBExabnuzbH6RtYcPKmD`
-**Commits**: 2 commits pushed
+**Commits**: 4 commits pushed
+**Last Updated**: Phase 3 routing integration complete
 
 ## Completed Features ✅
 
@@ -99,6 +100,90 @@ proxy.shutdown();  // Atomic flag set
 // All connection tasks complete before shutdown
 ```
 
+### 5. Router Integration (Commit 4: `346b3a2`)
+
+**Complete Request Handling Integration**:
+
+**Early Request Parsing**:
+- Buffer initial request (8KB)
+- Parse HTTP request line and headers
+- Single parse for routing + caching (no duplication)
+
+**Routing Decision Flow**:
+```zig
+// 1. Parse request
+parsed_request = HTTPInspector.parseRequestLine(buffer);
+
+// 2. Check for CONNECT
+if (method == "CONNECT") {
+    handleConnectTunnel(...);
+    return;
+}
+
+// 3. Route via Router
+const decision = router.routeRequest(&req, headers, client_ip);
+
+// 4. Use decision's backend and policies
+actual_backend = decision.backend;
+actual_timeout = decision.timeouts.connect_timeout_ms;
+cache_allowed = decision.cache_allowed;
+```
+
+**Backend Selection Priority**:
+1. Router-selected backend (highest priority)
+2. Load balancer-selected backend
+3. Default backend (fallback)
+
+**Policy Application**:
+- ✅ Timeout policies from RoutingDecision
+- ✅ Cache policies from RoutingDecision
+- ✅ Concurrency limits via Cluster semaphore
+- ✅ Transform hooks (infrastructure ready)
+
+**Error Handling**:
+- NoRoute → 404 Not Found
+- NoHealthyBackend → 503 Service Unavailable
+- ClusterAtCapacity → 503 Service Unavailable
+- Other → 500 Internal Server Error
+
+**Resource Management**:
+```zig
+defer {
+    client_stream.close(io);
+    if (routing_decision) |decision| {
+        decision.cluster.release(); // Semaphore cleanup
+    }
+}
+```
+
+### 6. Example Applications
+
+**examples/api_gateway.zig** - Reverse Proxy with Routing:
+- Multiple routes with different policies
+- Backend clusters with weighted load balancing
+- Per-route caching (10min API, 1hour static)
+- Per-route timeouts (optimized per use case)
+- Concurrency limits per cluster
+- Demonstrates: reverse_proxy mode, route matching, policy composition
+
+**examples/tunnel_proxy.zig** - CONNECT Tunnel:
+- Automatic CONNECT method detection
+- 200 Connection Established response
+- Raw TCP tunnel establishment
+- Transparent TLS forwarding
+- Demonstrates: HTTPS proxying, tunnel mode
+
+**Usage**:
+```bash
+# API Gateway
+zig run examples/api_gateway.zig
+curl -H 'Host: api.example.com' http://localhost:8080/v1/users
+
+# CONNECT Tunnel
+zig run examples/tunnel_proxy.zig
+curl --proxy http://localhost:8080 https://httpbin.org/get
+```
+
 ## Documentation ✅
 
 ### `docs/PHASE_3_IMPLEMENTATION.md` (900 lines)
@@ -131,19 +216,9 @@ Complete architecture documentation:
 - ✅ Architecture guides
 - ✅ Usage examples
 
-## Remaining Work (~25%)
+## Remaining Work (~15%)
 
-### 1. Router-Based Request Handling
-**Status**: Pending
-**Effort**: 2-3 hours
-
-Modify `handleClientWithFeatures` to:
-- Call `router.routeRequest()` when router is configured
-- Apply request transformations
-- Use routing decision for backend selection
-- Release cluster semaphore on exit
-
-### 2. Admin Server
+### 1. Admin Server
 **Status**: Pending
 **Effort**: 3-4 hours
 
@@ -222,17 +297,22 @@ Create demos:
 ## Git Statistics
 
 **Files Changed**:
-- Created: 3 files (routing.zig, router.zig, PHASE_3_IMPLEMENTATION.md)
+- Created: 5 files (routing.zig, router.zig, 2 examples, 2 docs)
 - Modified: 2 files (root.zig, proxy.zig)
 
 **Lines of Code**:
-- Added: ~1,800 lines
+- Routing infrastructure: ~860 lines
+- Router integration: ~150 lines in proxy.zig
+- Examples: ~230 lines
 - Tests: ~250 lines
-- Documentation: ~900 lines
+- Documentation: ~1,200 lines
+- **Total: ~2,700 lines**
 
 **Commits**:
-1. `08b533d` - Routing infrastructure
-2. `1c8fbeb` - Proxy integration + CONNECT
+1. `08b533d` - Routing infrastructure (routing.zig, router.zig)
+2. `1c8fbeb` - Proxy integration + CONNECT tunnel handler
+3. `160da6d` - Phase 3 progress report
+4. `346b3a2` - Router integration with request handling + examples
 
 ## Key Achievements
 
@@ -281,7 +361,7 @@ Create demos:
 
 ## Summary
 
-Phase 3 is **75% complete** with the core routing infrastructure fully implemented and tested. The remaining work is primarily integration (router-based request handling), operational features (admin server, health checks), and quality assurance (tests, examples).
+Phase 3 is **85% complete** with full routing integration, CONNECT tunneling, and working examples. The remaining work is primarily operational features (admin server, health checks) and quality assurance (integration tests).
 
 **What Works Now**:
 - ✅ All routing types and policies
@@ -290,15 +370,20 @@ Phase 3 is **75% complete** with the core routing infrastructure fully implement
 - ✅ Graceful shutdown
 - ✅ Forward proxy URI parsing
 - ✅ Concurrency control
+- ✅ **Router integration in request handler**
+- ✅ **Backend selection from routing decisions**
+- ✅ **Policy application (timeouts, caching, concurrency)**
+- ✅ **Error handling with proper HTTP responses**
+- ✅ **Working example applications**
 
 **What's Next**:
-- ⏳ Wire Router into connection handler
 - ⏳ Admin server for observability
 - ⏳ Proactive health checks
+- ⏳ Request/response transformations
 - ⏳ Config reload
-- ⏳ Tests and examples
+- ⏳ Integration tests
 
-The foundation is solid. The remaining work builds on this base without requiring architectural changes.
+The core routing functionality is complete and working. Remaining work is operational features that enhance observability and management.
 
 ---
 
