@@ -110,7 +110,7 @@ fn showcaseTcpNetworking(gpa: std.mem.Allocator) !void {
     };
     defer server.deinit(io);
     
-    std.debug.print("   ✅ TCP server listening on {f}\n", .{server.socket.address});
+    std.debug.print("   ✅ TCP server listening on {any}\n", .{server.socket.address});
     
     // Test connection (will fail but shows API)
     const test_addr = std.Io.net.IpAddress{ 
@@ -132,7 +132,8 @@ fn showcaseProxyCapabilities(gpa: std.mem.Allocator) !void {
     
     // Create proxy instance (listen: 0 → forward to port 3000)
     var proxy = prozy_root.Proxy.init(gpa, 0, "127.0.0.1", 3000);
-    
+    defer proxy.deinit();
+
     std.debug.print("   ✅ Proxy instance created\n", .{});
     std.debug.print("   ✅ Proxy components:\n", .{});
     std.debug.print("      • Async TCP server with std.Io.Threaded\n", .{});
@@ -141,7 +142,7 @@ fn showcaseProxyCapabilities(gpa: std.mem.Allocator) !void {
     std.debug.print("      • Buffered I/O with Stream readers/writers\n", .{});
     std.debug.print("      • Proper resource cleanup and cancellation\n", .{});
     std.debug.print("      • IPv4/IPv6 support and DNS resolution\n", .{});
-    
+
     // Run proxy in showcase mode (max_connections = 0)
     try proxy.run();
     

@@ -96,9 +96,10 @@ pub const AccessControl = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, default_policy: Policy) !AccessControl {
+        _ = allocator; // Allocator will be used when adding entries
         return .{
-            .allow_list = IpSet.init(allocator),
-            .deny_list = IpSet.init(allocator),
+            .allow_list = null,
+            .deny_list = null,
             .default_policy = default_policy,
         };
     }
@@ -108,16 +109,18 @@ pub const AccessControl = struct {
         if (self.deny_list) |*list| list.deinit();
     }
 
-    pub fn addToAllowList(self: *AccessControl, ip: u32) !void {
-        if (self.allow_list) |*list| {
-            try list.put(ip, {});
+    pub fn addToAllowList(self: *AccessControl, allocator: std.mem.Allocator, ip: u32) !void {
+        if (self.allow_list == null) {
+            self.allow_list = IpSet.init(allocator);
         }
+        try self.allow_list.?.put(ip, {});
     }
 
-    pub fn addToDenyList(self: *AccessControl, ip: u32) !void {
-        if (self.deny_list) |*list| {
-            try list.put(ip, {});
+    pub fn addToDenyList(self: *AccessControl, allocator: std.mem.Allocator, ip: u32) !void {
+        if (self.deny_list == null) {
+            self.deny_list = IpSet.init(allocator);
         }
+        try self.deny_list.?.put(ip, {});
     }
 
     pub fn isAllowed(self: *const AccessControl, ip: u32) bool {
@@ -207,10 +210,10 @@ pub const HTTPInspector = struct {
 
     /// Parse HTTP request line (GET /path HTTP/1.1)
     pub fn parseRequestLine(buffer: []const u8) ?HTTPRequest {
-        var it = std.mem.split(u8, buffer, "\r\n");
+        var it = std.mem.splitSequence(u8, buffer, "\r\n");
         const first_line = it.next() orelse return null;
 
-        var parts = std.mem.split(u8, first_line, " ");
+        var parts = std.mem.splitSequence(u8, first_line, " ");
         const method = parts.next() orelse return null;
         const path = parts.next() orelse return null;
         const version = parts.next() orelse return null;
@@ -311,11 +314,11 @@ pub const Proxy = struct {
         log.info("Backend failures: {}", .{stats.backend_connect_failures});
     }
 
-    pub fn run(self: Self) !void {
+    pub fn run(self: *Self) !void {
         return self.runWithOptions(.{});
     }
 
-    pub fn runWithOptions(self: Self, options: RunOptions) !void {
+    pub fn runWithOptions(self: *Self, options: RunOptions) !void {
         const configured_limit = options.max_connections orelse if (builtin.is_test)
             0
         else
@@ -370,7 +373,7 @@ pub const Proxy = struct {
             if (options.enable_access_control) {
                 if (self.access_control) |acl| {
                     if (!acl.isAllowed(client_ip)) {
-                        log.warn("connection from {} denied by access control", .{client_stream.socket.address});
+                        log.warn("connection from {any} denied by access control", .{client_stream.socket.address});
                         client_stream.close(io);
                         continue;
                     }
@@ -381,14 +384,14 @@ pub const Proxy = struct {
             if (options.enable_rate_limiting) {
                 if (self.rate_limiter) |*limiter| {
                     if (!limiter.tryAcquire(client_ip)) {
-                        log.warn("connection from {} denied by rate limiter", .{client_stream.socket.address});
+                        log.warn("connection from {any} denied by rate limiter", .{client_stream.socket.address});
                         client_stream.close(io);
                         continue;
                     }
                 }
             }
 
-            log.info("accepted connection #{} from {}", .{ accepted, client_stream.socket.address });
+            log.info("accepted connection #{} from {any}", .{ accepted, client_stream.socket.address });
 
             if (options.enable_stats) {
                 self.stats.recordConnection();
@@ -400,7 +403,7 @@ pub const Proxy = struct {
                 self.backend_host,
                 self.backend_port,
                 options.connect_timeout,
-                &self.stats,
+                @as(*ProxyStats, @constCast(&self.stats)),
                 &self.http_inspector,
                 options,
                 client_ip,
@@ -416,7 +419,7 @@ pub const Proxy = struct {
 
     fn extractClientIp(address: net.IpAddress) u32 {
         return switch (address) {
-            .ip4 => |ip4| ip4.host,
+            .ip4 => |ip4| @bitCast(ip4.bytes),
             .ip6 => 0, // Simplified: convert IPv6 to 0 for now
         };
     }
@@ -510,13 +513,13 @@ pub const Proxy = struct {
         backend_host: []const u8,
         backend_port: u16,
         connect_timeout: Timeout,
-        stats: *const ProxyStats,
+        stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
         client_ip: u32,
         rate_limiter_ptr: usize,
     ) void {
-        const start_time = std.time.milliTimestamp();
+        const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
         defer {
             client_stream.close(io);
             if (options.enable_stats) {
@@ -529,7 +532,7 @@ pub const Proxy = struct {
         }
 
         if (options.enable_connection_logging and !builtin.is_test) {
-            log.info("[{}] new connection from client", .{start_time});
+            log.info("new connection from client", .{});
         }
 
         // Connect to backend
@@ -570,9 +573,14 @@ pub const Proxy = struct {
             options,
         );
 
-        const duration = std.time.milliTimestamp() - start_time;
-        if (options.enable_connection_logging and !builtin.is_test) {
-            log.info("[{}] connection completed, duration: {}ms", .{ start_time, duration });
+        if (options.enable_connection_logging and !builtin.is_test and start_time != null) {
+            if (std.time.Instant.now()) |end_time| {
+                const duration_ns = end_time.since(start_time.?);
+                const duration_ms = duration_ns / std.time.ns_per_ms;
+                log.info("connection completed, duration: {}ms", .{duration_ms});
+            } else |_| {
+                log.info("connection completed", .{});
+            }
         }
     }
 
@@ -669,7 +677,7 @@ pub const Proxy = struct {
     const PipeJobWithStats = struct {
         reader: *Reader,
         writer: *Writer,
-        stats: *const ProxyStats,
+        stats: *ProxyStats,
         direction: Direction,
         http_inspector: *const HTTPInspector,
         enable_http_inspection: bool,
@@ -686,7 +694,7 @@ pub const Proxy = struct {
         backend_writer: *Writer,
         backend_reader: *Reader,
         client_writer: *Writer,
-        stats: *const ProxyStats,
+        stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
     ) void {
@@ -901,6 +909,7 @@ pub const Proxy = struct {
 // Convenience function for quick testing
 pub fn runProxy(allocator: std.mem.Allocator, proxy_port: u16, backend_host: []const u8, backend_port: u16) !void {
     var proxy = Proxy.init(allocator, proxy_port, backend_host, backend_port);
+    defer proxy.deinit();
     try proxy.run();
 }
 
@@ -915,7 +924,8 @@ const testing = std.testing;
 test "Proxy initialization" {
     const allocator = testing.allocator;
 
-    const proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
 
     try testing.expectEqual(proxy.proxy_port, 8080);
     try testing.expectEqualStrings(proxy.backend_host, "127.0.0.1");
@@ -926,11 +936,13 @@ test "Proxy initialization" {
 test "Proxy initialization with different configurations" {
     const allocator = testing.allocator;
 
-    const proxy_high_port = Proxy.init(allocator, 9090, "127.0.0.1", 9000);
+    var proxy_high_port = Proxy.init(allocator, 9090, "127.0.0.1", 9000);
+    defer proxy_high_port.deinit();
     try testing.expectEqual(proxy_high_port.proxy_port, 9090);
     try testing.expectEqual(proxy_high_port.backend_port, 9000);
 
-    const proxy_localhost = Proxy.init(allocator, 3000, "localhost", 3001);
+    var proxy_localhost = Proxy.init(allocator, 3000, "localhost", 3001);
+    defer proxy_localhost.deinit();
     try testing.expectEqualStrings(proxy_localhost.backend_host, "localhost");
     try testing.expectEqual(proxy_localhost.backend_port, 3001);
 }
@@ -938,8 +950,10 @@ test "Proxy initialization with different configurations" {
 test "Multiple proxy instances are independent" {
     const allocator = testing.allocator;
 
-    const proxy_a = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
-    const proxy_b = Proxy.init(allocator, 9090, "localhost", 9000);
+    var proxy_a = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy_a.deinit();
+    var proxy_b = Proxy.init(allocator, 9090, "localhost", 9000);
+    defer proxy_b.deinit();
 
     try testing.expect(proxy_a.proxy_port != proxy_b.proxy_port);
     try testing.expect(!std.mem.eql(u8, proxy_a.backend_host, proxy_b.backend_host));
@@ -954,6 +968,7 @@ test "Proxy run method executes without errors" {
     const allocator = testing.allocator;
 
     var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
 
     // The current implementation just prints architecture info
     try proxy.run();
@@ -963,6 +978,7 @@ test "Proxy handleConnection method signature" {
     const allocator = testing.allocator;
 
     var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
 
     // Currently does nothing but exists and is callable
     proxy.handleConnection(@as(*anyopaque, undefined)) catch {};
@@ -971,7 +987,8 @@ test "Proxy handleConnection method signature" {
 test "Proxy copyStream method signature" {
     const allocator = testing.allocator;
 
-    _ = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
 
     // Currently does nothing but exists and is callable
     Proxy.copyStream(@as(*anyopaque, undefined), @as(*anyopaque, undefined)) catch {};
@@ -988,12 +1005,14 @@ test "Proxy with edge case configurations" {
     const allocator = testing.allocator;
 
     // Test with port 0 (should use any available port)
-    const proxy_zero_port = Proxy.init(allocator, 0, "127.0.0.1", 8000);
+    var proxy_zero_port = Proxy.init(allocator, 0, "127.0.0.1", 8000);
+    defer proxy_zero_port.deinit();
     try testing.expectEqual(proxy_zero_port.proxy_port, 0);
     try proxy_zero_port.run();
 
     // Test with maximum port numbers
-    const proxy_max_port = Proxy.init(allocator, 65535, "127.0.0.1", 65534);
+    var proxy_max_port = Proxy.init(allocator, 65535, "127.0.0.1", 65534);
+    defer proxy_max_port.deinit();
     try testing.expectEqual(proxy_max_port.proxy_port, 65535);
     try testing.expectEqual(proxy_max_port.backend_port, 65534);
     try proxy_max_port.run();
@@ -1010,6 +1029,7 @@ test "Integration: Complete proxy workflow" {
     const allocator = testing.allocator;
 
     var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
     try testing.expectEqual(proxy.proxy_port, 8080);
     try testing.expectEqualStrings(proxy.backend_host, "127.0.0.1");
     try testing.expectEqual(proxy.backend_port, 8000);
@@ -1019,20 +1039,24 @@ test "Integration: Complete proxy workflow" {
 test "Integration: Multiple proxy configurations" {
     const allocator = testing.allocator;
 
-    const proxy_localhost = Proxy.init(allocator, 3000, "localhost", 3001);
+    var proxy_localhost = Proxy.init(allocator, 3000, "localhost", 3001);
+    defer proxy_localhost.deinit();
     try testing.expectEqualStrings(proxy_localhost.backend_host, "localhost");
     try proxy_localhost.run();
 
-    const proxy_ip = Proxy.init(allocator, 4000, "192.168.1.100", 4001);
+    var proxy_ip = Proxy.init(allocator, 4000, "192.168.1.100", 4001);
+    defer proxy_ip.deinit();
     try testing.expectEqualStrings(proxy_ip.backend_host, "192.168.1.100");
     try testing.expectEqual(proxy_ip.backend_port, 4001);
     try proxy_ip.run();
 
-    const proxy_low_port = Proxy.init(allocator, 1024, "127.0.0.1", 80);
+    var proxy_low_port = Proxy.init(allocator, 1024, "127.0.0.1", 80);
+    defer proxy_low_port.deinit();
     try testing.expectEqual(proxy_low_port.proxy_port, 1024);
     try proxy_low_port.run();
 
-    const proxy_high_port = Proxy.init(allocator, 30000, "127.0.0.1", 8080);
+    var proxy_high_port = Proxy.init(allocator, 30000, "127.0.0.1", 8080);
+    defer proxy_high_port.deinit();
     try testing.expectEqual(proxy_high_port.proxy_port, 30000);
     try proxy_high_port.run();
 }
@@ -1041,6 +1065,7 @@ test "Integration: Proxy method interfaces" {
     const allocator = testing.allocator;
 
     var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
     try proxy.run();
     proxy.handleConnection(@as(*anyopaque, undefined)) catch {};
     Proxy.copyStream(@as(*anyopaque, undefined), @as(*anyopaque, undefined)) catch {};
@@ -1057,12 +1082,15 @@ test "Integration: Error handling scenarios" {
     const allocator = testing.allocator;
 
     var proxy_zero = Proxy.init(allocator, 0, "127.0.0.1", 0);
+    defer proxy_zero.deinit();
     try proxy_zero.run();
 
     var proxy_max = Proxy.init(allocator, 65535, "127.0.0.1", 65534);
+    defer proxy_max.deinit();
     try proxy_max.run();
 
     var proxy_hostname = Proxy.init(allocator, 8080, "my-server.local", 3000);
+    defer proxy_hostname.deinit();
     try testing.expectEqualStrings(proxy_hostname.backend_host, "my-server.local");
     try proxy_hostname.run();
 }
@@ -1079,8 +1107,9 @@ test "Integration: Performance characteristics" {
             9000 + @as(u16, @intCast(i)),
         );
     }
+    defer for (&proxies) |*proxy| proxy.deinit();
 
-    for (proxies) |proxy| {
+    for (&proxies) |*proxy| {
         try proxy.run();
     }
 }
@@ -1088,7 +1117,8 @@ test "Integration: Performance characteristics" {
 test "Integration: API stability" {
     const allocator = testing.allocator;
 
-    const proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
     try proxy.run();
     try runProxy(allocator, 8080, "127.0.0.1", 8000);
     testing.refAllDecls(Proxy);
@@ -1098,15 +1128,20 @@ test "Integration: API stability" {
 test "Integration: Real world scenarios" {
     const allocator = testing.allocator;
 
-    const web_proxy = Proxy.init(allocator, 80, "backend-server", 8080);
+    var web_proxy = Proxy.init(allocator, 80, "backend-server", 8080);
+    defer web_proxy.deinit();
     try web_proxy.run();
 
-    const dev_proxy = Proxy.init(allocator, 3000, "localhost", 5432);
+    var dev_proxy = Proxy.init(allocator, 3000, "localhost", 5432);
+    defer dev_proxy.deinit();
     try dev_proxy.run();
 
-    const lb_proxy1 = Proxy.init(allocator, 8080, "backend1", 3000);
-    const lb_proxy2 = Proxy.init(allocator, 8081, "backend2", 3000);
-    const lb_proxy3 = Proxy.init(allocator, 8082, "backend3", 3000);
+    var lb_proxy1 = Proxy.init(allocator, 8080, "backend1", 3000);
+    defer lb_proxy1.deinit();
+    var lb_proxy2 = Proxy.init(allocator, 8081, "backend2", 3000);
+    defer lb_proxy2.deinit();
+    var lb_proxy3 = Proxy.init(allocator, 8082, "backend3", 3000);
+    defer lb_proxy3.deinit();
 
     try lb_proxy1.run();
     try lb_proxy2.run();
@@ -1215,7 +1250,7 @@ test "AccessControl: allow list" {
     defer acl.deinit();
 
     // Add specific IPs to allow list
-    try acl.addToAllowList(0x7F000001); // 127.0.0.1
+    try acl.addToAllowList(allocator, 0x7F000001); // 127.0.0.1
 
     try testing.expect(acl.isAllowed(0x7F000001));
     try testing.expect(!acl.isAllowed(0xC0A80001));
@@ -1228,7 +1263,7 @@ test "AccessControl: deny list" {
     defer acl.deinit();
 
     // Add specific IPs to deny list
-    try acl.addToDenyList(0xC0A80001); // 192.168.0.1
+    try acl.addToDenyList(allocator, 0xC0A80001); // 192.168.0.1
 
     try testing.expect(acl.isAllowed(0x7F000001)); // Not in deny list
     try testing.expect(!acl.isAllowed(0xC0A80001)); // In deny list
@@ -1340,10 +1375,9 @@ test "Proxy: enable access control" {
     try proxy.enableAccessControl(.deny);
     try testing.expect(proxy.access_control != null);
 
-    if (proxy.access_control) |acl| {
+    if (proxy.access_control) |*acl| {
         // Add to allow list
-        var acl_mut = acl;
-        try acl_mut.addToAllowList(0x7F000001);
+        try acl.addToAllowList(allocator, 0x7F000001);
     }
 }
 
