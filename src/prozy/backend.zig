@@ -4,7 +4,7 @@ const IpKey = @import("transport.zig").IpKey;
 // Note: Backend uses getTimestamp() for health tracking timestamps.
 // This is imported from http.zig which contains HTTPCache and related utilities.
 const http = @import("http.zig");
-const getTimestamp = http.HTTPCache.getTimestamp;
+const getTimestamp = http.getTimestamp;
 
 const log = std.log;
 
