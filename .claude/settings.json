@@ -26,226 +26,52 @@
           }
         ]
       }
-    ],
-    "BeforeCommit": [
-      {
-        "matcher": "*.zig",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "zig fmt $FILE"
-          }
-        ]
-      }
-    ],
-    "AfterEdit": [
-      {
-        "matcher": "src/*.zig",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo '✏️  Edited $FILE - remember to run tests'"
-          }
-        ]
-      }
     ]
   },
   "permissions": {
     "allow": [
-      {
-        "type": "bash",
-        "matcher": "zig build",
-        "description": "Build the proxy with Zig"
-      },
-      {
-        "type": "bash",
-        "matcher": "zig build test",
-        "description": "Run unit tests"
-      },
-      {
-        "type": "bash",
-        "matcher": "zig build test_e2e",
-        "description": "Run end-to-end integration tests"
-      },
-      {
-        "type": "bash",
-        "matcher": "zig build -Doptimize=*",
-        "description": "Build with optimization flags"
-      },
-      {
-        "type": "bash",
-        "matcher": "zig test src/*.zig*",
-        "description": "Run specific test files"
-      },
-      {
-        "type": "bash",
-        "matcher": "zig fmt src/*",
-        "description": "Format source code"
-      },
-      {
-        "type": "bash",
-        "matcher": "zig fmt *.zig",
-        "description": "Format Zig files"
-      },
-      {
-        "type": "bash",
-        "matcher": "bun tests/*.ts",
-        "description": "Run Bun test server"
-      },
-      {
-        "type": "bash",
-        "matcher": "git status",
-        "description": "Check git status"
-      },
-      {
-        "type": "bash",
-        "matcher": "git diff*",
-        "description": "View changes"
-      },
-      {
-        "type": "bash",
-        "matcher": "git log*",
-        "description": "View commit history"
-      },
-      {
-        "type": "bash",
-        "matcher": "git add*",
-        "description": "Stage files for commit"
-      },
-      {
-        "type": "read",
-        "matcher": "**/*.zig",
-        "description": "Read Zig source files"
-      },
-      {
-        "type": "read",
-        "matcher": "**/*.md",
-        "description": "Read documentation files"
-      },
-      {
-        "type": "read",
-        "matcher": "**/build.zig*",
-        "description": "Read build configuration"
-      },
-      {
-        "type": "read",
-        "matcher": "**/*.ts",
-        "description": "Read TypeScript test files"
-      },
-      {
-        "type": "read",
-        "matcher": "scripts/*",
-        "description": "Read setup and utility scripts"
-      },
-      {
-        "type": "read",
-        "matcher": ".envrc",
-        "description": "Read direnv configuration"
-      },
-      {
-        "type": "read",
-        "matcher": "flake.*",
-        "description": "Read Nix flake configuration"
-      }
+      "Bash:zig build",
+      "Bash:zig build test",
+      "Bash:zig build test_e2e",
+      "Bash:zig build -Doptimize=*",
+      "Bash:zig test src/*.zig*",
+      "Bash:zig fmt src/*",
+      "Bash:zig fmt *.zig",
+      "Bash:bun tests/*.ts",
+      "Bash:git status",
+      "Bash:git diff*",
+      "Bash:git log*",
+      "Bash:git add*",
+      "Read:**/*.zig",
+      "Read:**/*.md",
+      "Read:**/build.zig*",
+      "Read:**/*.ts",
+      "Read:scripts/*",
+      "Read:.envrc",
+      "Read:flake.*"
     ],
     "ask": [
-      {
-        "type": "edit",
-        "matcher": "src/*.zig",
-        "description": "Editing source code requires confirmation"
-      },
-      {
-        "type": "write",
-        "matcher": "**/*.zig",
-        "description": "Creating new Zig files requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "git commit*",
-        "description": "Committing changes requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "git push*",
-        "description": "Pushing to remote requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "git rebase*",
-        "description": "Rebasing requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "git merge*",
-        "description": "Merging requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "git reset*",
-        "description": "Resetting changes requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "git checkout*",
-        "description": "Switching branches requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "rm *",
-        "description": "Deleting files requires confirmation"
-      },
-      {
-        "type": "bash",
-        "matcher": "mv *",
-        "description": "Moving files requires confirmation"
-      },
-      {
-        "type": "edit",
-        "matcher": "build.zig*",
-        "description": "Editing build configuration requires confirmation"
-      },
-      {
-        "type": "edit",
-        "matcher": "**/*.md",
-        "description": "Editing documentation requires confirmation"
-      }
+      "Edit:src/*.zig",
+      "Write:**/*.zig",
+      "Bash:git commit*",
+      "Bash:git push*",
+      "Bash:git rebase*",
+      "Bash:git merge*",
+      "Bash:git reset*",
+      "Bash:git checkout*",
+      "Bash:rm *",
+      "Bash:mv *",
+      "Edit:build.zig*",
+      "Edit:**/*.md"
     ],
     "deny": [
-      {
-        "type": "bash",
-        "matcher": "git push --force*",
-        "description": "Force pushing is not allowed"
-      },
-      {
-        "type": "bash",
-        "matcher": "rm -rf /",
-        "description": "Dangerous recursive delete not allowed"
-      },
-      {
-        "type": "bash",
-        "matcher": "rm -rf ~",
-        "description": "Dangerous home directory delete not allowed"
-      },
-      {
-        "type": "bash",
-        "matcher": "chmod -R 777*",
-        "description": "Dangerous permission changes not allowed"
-      },
-      {
-        "type": "bash",
-        "matcher": "git config --global*",
-        "description": "Global git config changes not allowed"
-      },
-      {
-        "type": "edit",
-        "matcher": ".git/**",
-        "description": "Editing git internals not allowed"
-      },
-      {
-        "type": "write",
-        "matcher": ".git/**",
-        "description": "Writing to git internals not allowed"
-      }
+      "Bash:git push --force*",
+      "Bash:rm -rf /",
+      "Bash:rm -rf ~",
+      "Bash:chmod -R 777*",
+      "Bash:git config --global*",
+      "Edit:.git/**",
+      "Write:.git/**"
     ]
   }
 }
