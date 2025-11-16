@@ -1,0 +1,15 @@
+Run the Prozy test suite with comprehensive coverage analysis.
+
+Execute: zig build test
+
+Based on the test results, analyze:
+1. Which components are well-tested (>80% coverage)
+2. Which components need more tests (<50% coverage)
+3. Specific test cases needed for untested code paths
+4. Edge cases to focus on: error handling, concurrent scenarios, buffer boundaries
+
+Reference test files in tests/ and provide concrete suggestions for new tests following Prozy patterns:
+- Assertion density >= 2 per test function
+- Test positive AND negative space
+- Cover concurrent scenarios
+- Test resource cleanup (defer statements)

@@ -1,0 +1,38 @@
+Perform comprehensive code review of recent changes using all Prozy review standards.
+
+First, show the diff:
+git diff main...HEAD
+
+Review the changes against CLAUDE.md style guide:
+
+1. **Safety Review** (code-reviewer agent):
+   - Assertion density >= 2 per function
+   - Error handling complete
+   - Resource cleanup with defer
+   - No recursion
+
+2. **Performance Review** (performance-analyzer agent):
+   - Async I/O patterns correct
+   - No allocations after init
+   - Batching opportunities
+   - Back-of-the-envelope calculations
+
+3. **Memory Safety** (memory-safety agent):
+   - No leaks (memory, file descriptors, connections)
+   - Concurrent access protected
+   - Buffer safety verified
+   - Zero allocation after init policy enforced
+
+4. **Style Compliance**:
+   - Functions <= 70 lines
+   - Explicit types (u32 not usize)
+   - Proper naming with units
+   - Comments explain WHY
+
+Provide:
+- CRITICAL ISSUES that block merging
+- Performance concerns with impact estimates  
+- Style violations
+- What was done excellently
+
+Use file:line references for all findings.

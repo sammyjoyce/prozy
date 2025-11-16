@@ -9,7 +9,6 @@
 ///! - ✅ HTTP protocol inspection
 ///! - ✅ Comprehensive statistics and monitoring
 ///! - ✅ Async I/O with extreme performance
-
 const std = @import("std");
 const prozy = @import("prozy");
 
@@ -203,8 +202,12 @@ pub fn main() !void {
     std.debug.print("📝 Note: Running in demo mode (max_connections = 0)\n", .{});
     std.debug.print("    To run as real proxy, set max_connections > 0\n\n", .{});
 
+    var threaded_io = std.Io.Threaded.init(gpa);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
     // Run proxy (demo mode: 0 connections just shows architecture)
-    try proxy.runWithOptions(.{
+    try proxy.runWithIoOptions(io, .{
         .max_connections = 0, // Demo mode
         .enable_stats = true,
         .enable_access_control = true,

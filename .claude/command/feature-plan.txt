@@ -1,0 +1,40 @@
+Create detailed implementation plan for new feature following Prozy architecture patterns.
+
+Feature to implement: {user will specify}
+
+**Phase 1: Analysis**
+1. Review existing codebase structure in @src/
+2. Identify affected components (HTTPCache, LoadBalancer, AccessControl, RateLimiter, ProxyStats)
+3. Review relevant tests in @tests/
+4. Check CLAUDE.md for style requirements
+
+**Phase 2: Design**
+Propose architecture following Prozy patterns:
+- Zero dynamic allocation after init (CRITICAL)
+- Async I/O with io.concurrent() and io.select()
+- Assertion density >= 2 per function
+- Functions <= 70 lines
+- Explicit-sized types (u32 not usize)
+- Proper defer for resource cleanup
+
+**Phase 3: Integration Points**
+Identify how feature integrates with:
+- HTTPCache (response caching)
+- LoadBalancer (backend selection)
+- AccessControl (IP filtering)
+- RateLimiter (connection throttling)
+- ProxyStats (metrics tracking)
+
+**Phase 4: Implementation Breakdown**
+1. List files to create/modify
+2. Break into subtasks (<= 70 lines each)
+3. Identify testing requirements (unit + integration)
+4. Estimate performance impact
+
+**Phase 5: Validation Plan**
+1. Test cases needed (positive + negative space)
+2. Performance benchmarks required
+3. Memory safety checks
+4. Style guide compliance verification
+
+Provide concrete, actionable plan with clear steps and file:line references.

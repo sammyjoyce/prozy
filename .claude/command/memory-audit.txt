@@ -1,0 +1,41 @@
+Perform rigorous memory safety audit of staged changes.
+
+Show what's staged:
+git diff --cached
+
+Audit for Prozy's strict memory safety requirements:
+
+1. **Memory Leaks**:
+   - All allocations have defer cleanup
+   - No allocations after init (CRITICAL POLICY)
+   - Arena allocators scoped correctly
+
+2. **Resource Leaks**:
+   - File descriptors closed
+   - Connections cleaned up
+   - Locks released in ALL paths (including errors)
+
+3. **Concurrent Safety**:
+   - Shared state protected (atomics, RwLock, Mutex)
+   - No data races
+   - Atomic operations for counters
+   - RwLock for read-heavy workloads
+
+4. **Buffer Safety**:
+   - Bounds checking on all accesses
+   - No overflows
+   - No buffer bleeds (padding zeroed)
+   - Correct index/count/size usage
+
+5. **Assertion Coverage**:
+   - >= 2 assertions per function
+   - Pre/postconditions checked
+   - Positive AND negative space
+
+For each issue found, provide:
+- Location (file:line)
+- Exact problem description
+- Potential impact (crash, leak, data race)
+- Concrete fix with code example
+
+Zero tolerance for violations of Prozy's memory policy.
