@@ -10,6 +10,52 @@
 //! - TCP socket listening and accepting with std.Io.net
 //! - Bidirectional data copying coordinated via io.concurrent/io.select
 //! - Structured concurrency via Io.Group and explicit cancellation
+//!
+//! ## Known Limitations and Assumptions
+//!
+//! ### Request Handling
+//! - **One HTTP request per TCP connection**: The proxy assumes each TCP connection
+//!   carries a single HTTP request. HTTP keep-alive and pipelining are NOT supported.
+//!   Subsequent requests in the same connection will bypass cache checking and request
+//!   inspection.
+//!
+//! ### Protocol Support
+//! - **HTTP-only**: Currently designed for HTTP traffic. No TLS/SSL termination,
+//!   WebSocket support, or HTTP/2.
+//! - **TCP-only**: No UDP support. Adding UDP would require significant changes.
+//!
+//! ### Connection Handling
+//! - **30-second timeout**: After one direction of a connection completes, the proxy
+//!   waits up to 30 seconds for the other direction before timing out and canceling.
+//! - **Full close only**: No TCP half-close support. Both directions are closed together.
+//!
+//! ### Cache Behavior
+//! - **GET requests only**: Only GET requests are cached. POST/PUT/DELETE bypass cache.
+//! - **Basic cacheability**: Cache does NOT respect Cache-Control, Vary, or other
+//!   HTTP caching headers. All GET responses are cached with a fixed TTL.
+//! - **No cache population from backend**: Currently, responses from backends are
+//!   streamed directly to clients but NOT buffered and stored in the cache for future
+//!   requests. This is planned for a future release.
+//! - **Fixed-size buffers**: Request headers are buffered in an 8KB buffer. Headers
+//!   larger than 8KB will cause cache checking to fail (request still forwarded).
+//!
+//! ### Load Balancing
+//! - **Reactive health checks**: Backend health is determined by connection success/
+//!   failure only. No proactive health checks, HTTP 5xx tracking, or timeout detection.
+//! - **Connection-level routing**: Load balancing decision is made per connection,
+//!   not per request (consistent with one-request-per-connection assumption).
+//!
+//! ### Security
+//! - **No X-Forwarded-For handling**: Client IP is extracted from TCP socket only.
+//!   If behind another proxy, all clients appear to come from the proxy's IP.
+//! - **Trusted backend assumption**: No validation of backend responses or protection
+//!   against malicious backends.
+//!
+//! ### Performance
+//! - **Fixed buffer sizes**: 4KB client buffers, 4KB backend buffers, 8KB request buffer
+//! - **Per-chunk byte counting**: Statistics are updated per 8KB chunk (atomic operations)
+//! - **Approximate LRU**: Cache get() does NOT update LRU order for performance
+//!   (uses lockShared instead of write lock)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -23,6 +69,74 @@ const Writer = Io.Writer;
 const Timeout = Io.Timeout;
 
 // ============= Core Proxy Features =============
+
+/// IP address key for rate limiting and access control
+/// Prevents IPv6 hash collisions by using full 128-bit address
+pub const IpKey = union(enum) {
+    ipv4: u32,
+    ipv6: u128,
+
+    pub fn fromAddress(address: net.IpAddress) IpKey {
+        return switch (address) {
+            .ip4 => |ip4| .{ .ipv4 = bytesToU32(ip4.bytes) },
+            .ip6 => |ip6| .{ .ipv6 = bytesToU128(ip6.bytes) },
+        };
+    }
+
+    pub fn hash(self: IpKey) u64 {
+        return switch (self) {
+            .ipv4 => |v4| @as(u64, v4),
+            .ipv6 => |v6| std.hash.Wyhash.hash(0, std.mem.asBytes(&v6)),
+        };
+    }
+
+    pub fn eql(self: IpKey, other: IpKey) bool {
+        if (@as(std.meta.Tag(IpKey), self) != @as(std.meta.Tag(IpKey), other)) {
+            return false;
+        }
+        return switch (self) {
+            .ipv4 => |v4| v4 == other.ipv4,
+            .ipv6 => |v6| v6 == other.ipv6,
+        };
+    }
+
+    fn bytesToU32(bytes: [4]u8) u32 {
+        return (@as(u32, bytes[0]) << 24) |
+            (@as(u32, bytes[1]) << 16) |
+            (@as(u32, bytes[2]) << 8) |
+            (@as(u32, bytes[3]));
+    }
+
+    fn bytesToU128(bytes: [16]u8) u128 {
+        var result: u128 = 0;
+        for (bytes, 0..) |byte, i| {
+            result |= @as(u128, byte) << @intCast((15 - i) * 8);
+        }
+        return result;
+    }
+
+    pub fn format(self: IpKey, comptime fmt: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+        _ = fmt;
+        _ = options;
+        switch (self) {
+            .ipv4 => |v4| try writer.print("IPv4:{}", .{v4}),
+            .ipv6 => |v6| try writer.print("IPv6:{x}", .{v6}),
+        }
+    }
+};
+
+// Context for IpKey HashMap
+pub const IpKeyContext = struct {
+    pub fn hash(_: IpKeyContext, key: IpKey) u64 {
+        return key.hash();
+    }
+
+    pub fn eql(_: IpKeyContext, a: IpKey, b: IpKey) bool {
+        return a.eql(b);
+    }
+};
+
+// ============= Core Proxy Features (continued) =============
 
 /// Connection statistics for monitoring and observability
 pub const ProxyStats = struct {
@@ -84,8 +198,9 @@ pub const ProxyStats = struct {
 };
 
 /// Access Control List for IP-based filtering
+/// FIXED: Now uses IpKey to prevent IPv6 hash collisions
 pub const AccessControl = struct {
-    const IpSet = std.AutoHashMap(u32, void);
+    const IpSet = std.HashMap(IpKey, void, IpKeyContext, std.hash_map.default_max_load_percentage);
 
     allocator: std.mem.Allocator,
     allow_list: ?IpSet = null,
@@ -111,21 +226,21 @@ pub const AccessControl = struct {
         if (self.deny_list) |*list| list.deinit();
     }
 
-    pub fn addToAllowList(self: *AccessControl, ip: u32) !void {
+    pub fn addToAllowList(self: *AccessControl, ip: IpKey) !void {
         if (self.allow_list == null) {
             self.allow_list = IpSet.init(self.allocator);
         }
         try self.allow_list.?.put(ip, {});
     }
 
-    pub fn addToDenyList(self: *AccessControl, ip: u32) !void {
+    pub fn addToDenyList(self: *AccessControl, ip: IpKey) !void {
         if (self.deny_list == null) {
             self.deny_list = IpSet.init(self.allocator);
         }
         try self.deny_list.?.put(ip, {});
     }
 
-    pub fn isAllowed(self: *const AccessControl, ip: u32) bool {
+    pub fn isAllowed(self: *const AccessControl, ip: IpKey) bool {
         // Check deny list first
         if (self.deny_list) |list| {
             if (list.contains(ip)) return false;
@@ -144,8 +259,9 @@ pub const AccessControl = struct {
 };
 
 /// Rate limiter for connection control
+/// FIXED: Now uses IpKey to prevent IPv6 hash collisions
 pub const RateLimiter = struct {
-    const IpConnectionCount = std.AutoHashMap(u32, u32);
+    const IpConnectionCount = std.HashMap(IpKey, u32, IpKeyContext, std.hash_map.default_max_load_percentage);
 
     connections_per_ip: IpConnectionCount,
     max_per_ip: u32,
@@ -165,7 +281,7 @@ pub const RateLimiter = struct {
         self.connections_per_ip.deinit();
     }
 
-    pub fn tryAcquire(self: *RateLimiter, ip: u32) bool {
+    pub fn tryAcquire(self: *RateLimiter, ip: IpKey) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -192,7 +308,7 @@ pub const RateLimiter = struct {
     ///
     /// Previous implementation: put() could fail during HashMap rehashing,
     /// causing global counter leak and eventual rate limit exhaustion.
-    pub fn release(self: *RateLimiter, ip: u32) void {
+    pub fn release(self: *RateLimiter, ip: IpKey) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -812,7 +928,7 @@ pub const LoadBalancer = struct {
         };
     }
 
-    pub fn selectBackend(self: *LoadBalancer, client_ip: u32) ?*Backend {
+    pub fn selectBackend(self: *LoadBalancer, client_ip: IpKey) ?*Backend {
         return switch (self.strategy) {
             .round_robin => self.roundRobin(),
             .weighted_round_robin => self.weightedRoundRobin(),
@@ -830,7 +946,7 @@ pub const LoadBalancer = struct {
     const SelectionContext = struct {
         load_balancer: *LoadBalancer,
         start_index: usize,
-        client_ip: u32,
+        client_ip: IpKey,
     };
 
     /// Backend selector function signature.
@@ -898,7 +1014,7 @@ pub const LoadBalancer = struct {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = start_index,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(roundRobinSelector, context);
     }
@@ -946,7 +1062,7 @@ pub const LoadBalancer = struct {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = start_index,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(weightedRoundRobinSelector, context);
     }
@@ -978,7 +1094,7 @@ pub const LoadBalancer = struct {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = 0,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(leastConnectionsSelector, context);
     }
@@ -1019,7 +1135,7 @@ pub const LoadBalancer = struct {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = 0,
-            .client_ip = 0,
+            .client_ip = .{ .ipv4 = 0 },
         };
         return selectBackendWithRetry(randomBackendSelector, context);
     }
@@ -1030,7 +1146,8 @@ pub const LoadBalancer = struct {
         is_eligible: BackendEligibilityFn,
         context: SelectionContext,
     ) ?*Backend {
-        const index = context.client_ip % @as(u32, @intCast(backends.len));
+        const ip_hash = context.client_ip.hash();
+        const index = @as(usize, @intCast(ip_hash % @as(u64, @intCast(backends.len))));
 
         for (0..backends.len) |i| {
             const backend_index = (index + i) % backends.len;
@@ -1043,7 +1160,7 @@ pub const LoadBalancer = struct {
         return null;
     }
 
-    fn ipHash(self: *LoadBalancer, client_ip: u32) ?*Backend {
+    fn ipHash(self: *LoadBalancer, client_ip: IpKey) ?*Backend {
         const context = SelectionContext{
             .load_balancer = self,
             .start_index = 0,
@@ -1295,21 +1412,11 @@ pub const Proxy = struct {
         }
     }
 
-    fn extractClientIp(address: net.IpAddress) u32 {
-        return switch (address) {
-            .ip4 => |ip4| {
-                // Convert bytes to u32 in network byte order (big-endian)
-                const bytes = ip4.bytes;
-                return (@as(u32, bytes[0]) << 24) |
-                    (@as(u32, bytes[1]) << 16) |
-                    (@as(u32, bytes[2]) << 8) |
-                    (@as(u32, bytes[3]));
-            },
-            .ip6 => |ip6| {
-                // Hash IPv6 addresses to avoid DoS from all IPv6 mapping to 0
-                return std.hash.Crc32.hash(&ip6.bytes);
-            },
-        };
+    /// Extract client IP address as IpKey for rate limiting and access control
+    /// FIXED: Now returns IpKey to prevent IPv6 hash collisions
+    /// Previous implementation hashed IPv6 to u32, causing potential collisions
+    fn extractClientIp(address: net.IpAddress) IpKey {
+        return IpKey.fromAddress(address);
     }
 
     fn printArchitectureSummary(self: Self) void {
@@ -1404,7 +1511,7 @@ pub const Proxy = struct {
         stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
-        client_ip: u32,
+        client_ip: IpKey,
         rate_limiter: ?*RateLimiter,
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
