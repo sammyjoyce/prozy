@@ -15,17 +15,17 @@ prozy/
 │   ├── demo_complete.zig     # Full capabilities demonstration
 │   └── full_features_demo.zig # Complete feature showcase
 ├── tests/                    # Test suites
-│   ├── e2e_test.zig         # Integration tests
-│   └── test-server.ts       # Bun test server (port 3003)
+│   ├── e2e_test.zig          # Integration tests
+│   └── test-server.ts        # Bun test server (port 3003)
 ├── docs/                     # Architecture documentation
 │   ├── ARCHITECTURE.md       # Comprehensive architecture guide
-│   ├── ARCHITECTURE_README.md # Quick reference
-│   ├── prozy-architecture.dot # GraphViz complete flow diagram
-│   ├── prozy-architecture.svg # Rendered flow diagram
-│   ├── prozy-components.dot  # GraphViz component diagram
-│   └── prozy-components.svg  # Rendered component diagram
+│   ├── ARCHITECTURE_README.md  # Quick reference
+│   ├── prozy-architecture.dot  # GraphViz complete flow diagram
+│   ├── prozy-architecture.svg  # Rendered flow diagram
+│   ├── prozy-components.dot   # GraphViz component diagram
+│   └── prozy-components.svg   # Rendered component diagram
 ├── tools/                    # Development utilities
-│   └── test_time.zig        # Time API exploration tool
+│   └── test_time.zig         # Time API exploration tool
 ├── build.zig                 # Build configuration
 ├── build.zig.zon            # Package metadata
 ├── CLAUDE.md                 # Coding style guide

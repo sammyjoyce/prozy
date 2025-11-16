@@ -162,7 +162,7 @@ Prozy is an enterprise-ready async TCP proxy built with Zig's async I/O system. 
 
 ## Component Details
 
-### 1. Proxy Main (src/root.zig:1046-1152)
+### 1. Proxy Main (src/root.zig:1046-1361)
 **Responsibilities:**
 - Initialize async I/O runtime (`std.Io.Threaded`)
 - Listen on configured port (default: 8080)
