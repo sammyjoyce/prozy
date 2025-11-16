@@ -539,17 +539,18 @@ pub const HTTPCache = struct {
         self.cache.deinit();
     }
 
-    /// Get cached response (read-only, uses shared lock for high concurrency)
+    /// Get cached response (returns owned copy that caller must free)
     ///
     /// IMPORTANT CHANGES:
     /// - Now includes Host header in cache key for multi-tenant isolation
     /// - Uses lockShared() for concurrent reads (high performance)
     /// - Does NOT update LRU order to avoid write lock contention
     /// - Expired entries are detected but not evicted (cleanup happens during put)
+    /// - Returns an OWNED COPY to prevent use-after-free (caller must free!)
     ///
-    /// This design prioritizes read performance over LRU accuracy, which is
-    /// acceptable for a high-throughput proxy where cache hits are common.
-    pub fn get(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8) ?[]const u8 {
+    /// This design prioritizes safety and read performance over zero-copy efficiency.
+    /// The copy overhead is acceptable for cached responses since we avoid network I/O.
+    pub fn get(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8) ?[]u8 {
         const key = hashKey(method, host, path);
 
         // Use shared (read) lock for concurrent reads
@@ -559,7 +560,10 @@ pub const HTTPCache = struct {
         if (self.cache.get(key)) |node| {
             // Check if expired (read-only check)
             const now = getTimestamp();
-            if (now - node.created_at > node.ttl) {
+            const elapsed = now - node.created_at;
+            // Cast ttl to i64 to avoid signed/unsigned comparison issues
+            // Also guard against negative elapsed time (clock adjustments)
+            if (elapsed >= 0 and elapsed > @as(i64, node.ttl)) {
                 // Don't evict here, just return null
                 // Eviction will happen on next put() or during periodic cleanup
                 _ = self.misses.fetchAdd(1, .monotonic);
@@ -569,7 +573,18 @@ pub const HTTPCache = struct {
             // Don't update LRU order (read-only path for concurrency)
             // Access count is not updated to avoid write contention
             _ = self.hits.fetchAdd(1, .monotonic);
-            return node.response;
+
+            // CRITICAL: Copy response to prevent use-after-free
+            // The caller holds no lock after we return, so another thread
+            // could evict this entry and free the buffer. Return an owned copy.
+            const response_copy = self.allocator.alloc(u8, node.response.len) catch {
+                // Allocation failed, treat as cache miss
+                _ = self.misses.fetchAdd(1, .monotonic);
+                _ = self.hits.fetchSub(1, .monotonic);
+                return null;
+            };
+            @memcpy(response_copy, node.response);
+            return response_copy;
         }
 
         _ = self.misses.fetchAdd(1, .monotonic);
@@ -599,32 +614,21 @@ pub const HTTPCache = struct {
         }
 
         // Allocate and copy data
+        // Each errdefer only frees the allocation immediately preceding it to avoid double-free
         const response_copy = try self.allocator.alloc(u8, response.len);
         errdefer self.allocator.free(response_copy);
         @memcpy(response_copy, response);
 
         const method_copy = try self.allocator.alloc(u8, method.len);
-        errdefer {
-            self.allocator.free(response_copy);
-            self.allocator.free(method_copy);
-        }
+        errdefer self.allocator.free(method_copy);
         @memcpy(method_copy, method);
 
         const host_copy = try self.allocator.alloc(u8, host.len);
-        errdefer {
-            self.allocator.free(response_copy);
-            self.allocator.free(method_copy);
-            self.allocator.free(host_copy);
-        }
+        errdefer self.allocator.free(host_copy);
         @memcpy(host_copy, host);
 
         const path_copy = try self.allocator.alloc(u8, path.len);
-        errdefer {
-            self.allocator.free(response_copy);
-            self.allocator.free(method_copy);
-            self.allocator.free(host_copy);
-            self.allocator.free(path_copy);
-        }
+        errdefer self.allocator.free(path_copy);
         @memcpy(path_copy, path);
 
         // Create new node
@@ -1563,6 +1567,9 @@ pub const Proxy = struct {
                     // Only cache GET requests
                     if (std.mem.eql(u8, request.method, "GET")) {
                         if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
+                            // IMPORTANT: get() returns an owned copy that we must free
+                            defer http_cache.?.allocator.free(cached_response);
+
                             // Cache hit! Send cached response directly
                             if (!builtin.is_test) {
                                 log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
@@ -1917,17 +1924,19 @@ pub const Proxy = struct {
             return;
         };
 
-        // Wait for second completion with timeout and error handling
+        // Wait for second completion with error handling
         //
         // CRITICAL FIXES:
-        // 1. Added 30s timeout to prevent infinite hangs (HTTP keep-alive, network partition)
-        // 2. Cancel opposite direction immediately when one side fails (resource cleanup)
-        // 3. Proper error propagation with stats recording
+        // 1. Cancel opposite direction immediately when one side fails (resource cleanup)
+        // 2. Proper error propagation with stats recording
         //
         // Previous issues:
-        // - No timeout: connections could hang forever waiting for EOF
         // - No cancellation: failed direction kept other side running indefinitely
         // - Resource leak: tasks continued consuming CPU/memory after connection died
+        //
+        // KNOWN LIMITATION:
+        // - No timeout implemented: connections can hang waiting for EOF (HTTP keep-alive, etc.)
+        //   TODO: Add timeout support when Zig std.Io API provides timeout functionality
         switch (first_completed) {
             .client_to_backend => |result| {
                 // Check if first direction succeeded or failed
@@ -2957,6 +2966,7 @@ test "HTTPCache: basic caching" {
 
     // Cache hit
     const result2 = cache.get("GET", "example.com", "/api/users");
+    defer if (result2) |data| allocator.free(data);
     try testing.expect(result2 != null);
     if (result2) |data| {
         try testing.expectEqualStrings(response, data);
@@ -2998,9 +3008,9 @@ test "HTTPCache: TTL expiration" {
     // Wait a bit (in real scenario, time would pass)
     // For testing, we rely on the timestamp check
     const result = cache.get("GET", "test.com", "/expire");
+    defer if (result) |data| allocator.free(data);
 
-    // May or may not be expired depending on timing
-    _ = result;
+    // May or may not be expired depending on timing (verified via defer)
 }
 
 test "Backend: initialization and health" {
@@ -3382,6 +3392,7 @@ test "HTTPCache Integration: cache only successful GET requests with 200 OK" {
 
         // Verify it was cached
         const cached = cache.get(request.method, test_host, request.path);
+        defer if (cached) |data| allocator.free(data);
         try testing.expect(cached != null);
         if (cached) |data| {
             try testing.expectEqualStrings(ok_response, data);
@@ -3448,6 +3459,7 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
 
         // Verify subsequent request gets cached response
         const cached_after = cache.get(request.method, host, request.path);
+        defer if (cached_after) |data| allocator.free(data);
         try testing.expect(cached_after != null);
         if (cached_after) |data| {
             try testing.expectEqualStrings(backend_response, data);
@@ -3479,6 +3491,7 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     // Immediate lookup might hit or miss depending on timing
     // The key is that the TTL mechanism is tested
     const cached1 = cache.get(method, host, path);
+    defer if (cached1) |data| allocator.free(data);
 
     // Regardless of first lookup, we verify TTL behavior:
     // Put a new entry with longer TTL
@@ -3486,6 +3499,7 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
 
     // This should definitely hit
     const cached2 = cache.get(method, host, path);
+    defer if (cached2) |data| allocator.free(data);
     try testing.expect(cached2 != null);
 
     // Verify cache is working
@@ -3495,9 +3509,10 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     // Test another path with 0 TTL to verify expiration logic
     try cache.put("GET", host, "/api/expired", "data", 0);
     // The entry may expire immediately, demonstrating TTL functionality
-    _ = cache.get("GET", host, "/api/expired");
+    const expired = cache.get("GET", host, "/api/expired");
+    defer if (expired) |data| allocator.free(data);
 
-    _ = cached1; // May or may not be null
+    // cached1 and expired may or may not be null (verified via defer)
 }
 
 test "HTTPCache Integration: concurrent access with new lock pattern" {
@@ -3529,6 +3544,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     for (0..10) |i| {
         const path = paths[i % paths.len];
         const cached = cache.get("GET", host, path);
+        defer if (cached) |data| allocator.free(data);
 
         if (cached) |_| {
             hits += 1;
@@ -3546,14 +3562,16 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     try testing.expectEqual(@as(u64, 10), stats.hits);
 
     // Test concurrent writes (LRU updates via get())
-    // The new write lock pattern in get() prevents race conditions
+    // Note: get() no longer updates LRU order due to shared lock optimization
     for (paths) |path| {
-        _ = cache.get("GET", host, path); // Update LRU order
+        const result = cache.get("GET", host, path);
+        defer if (result) |data| allocator.free(data);
     }
 
     // Verify all entries still accessible
     for (paths) |path| {
         const cached = cache.get("GET", host, path);
+        defer if (cached) |data| allocator.free(data);
         try testing.expect(cached != null);
     }
 }
@@ -3590,10 +3608,12 @@ test "HTTPCache Integration: cache size limits and LRU eviction behavior" {
 
     // Verify LRU eviction occurred
     const evicted = cache.get("GET", host, "/path0001");
+    defer if (evicted) |data| allocator.free(data);
     try testing.expect(evicted == null); // Should be evicted
 
     // Verify newest entry is present
     const newest = cache.get("GET", host, "/path0005");
+    defer if (newest) |data| allocator.free(data);
     try testing.expect(newest != null);
 
     // Verify cache size accounting is correct
@@ -3838,5 +3858,6 @@ test "HTTPCache Integration: verify correct size accounting in put operations" {
 
     // Verify entry is retrievable
     const cached = cache.get(method, host, path);
+    defer if (cached) |data| allocator.free(data);
     try testing.expect(cached != null);
 }
