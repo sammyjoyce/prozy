@@ -1,0 +1,248 @@
+digraph ProzyArchitecture {
+    rankdir=TB;
+    ranksep=1.0;
+    nodesep=0.8;
+    compound=true;
+    splines=ortho;
+
+    // Graph styling
+    graph [fontname="Helvetica,Arial,sans-serif" fontsize=12 bgcolor="#f8f9fa"];
+    node [fontname="Helvetica,Arial,sans-serif" fontsize=11 style=filled];
+    edge [fontname="Helvetica,Arial,sans-serif" fontsize=10];
+
+    // ============= LEGEND =============
+    subgraph cluster_legend {
+        label="Legend";
+        style=filled;
+        color="#e9ecef";
+        fontsize=10;
+
+        legend_component [label="Component" shape=box style="filled,rounded" fillcolor="#d4edda" color="#28a745"];
+        legend_decision [label="Decision\nPoint" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        legend_process [label="Process" shape=box fillcolor="#cce5ff" color="#004085"];
+        legend_storage [label="Storage" shape=cylinder fillcolor="#f8d7da" color="#dc3545"];
+        legend_external [label="External\nEntity" shape=box fillcolor="#e2e3e5" color="#6c757d"];
+
+        legend_component -> legend_decision [style=invis];
+        legend_decision -> legend_process [style=invis];
+        legend_process -> legend_storage [style=invis];
+        legend_storage -> legend_external [style=invis];
+    }
+
+    // ============= EXTERNAL ENTITIES =============
+    Client [label="Client\nTCP Connection" shape=box fillcolor="#e2e3e5" color="#6c757d"];
+    BackendServer1 [label="Backend\nServer 1\n(3003)" shape=box fillcolor="#e2e3e5" color="#6c757d"];
+    BackendServer2 [label="Backend\nServer 2\n(3004)" shape=box fillcolor="#e2e3e5" color="#6c757d"];
+    BackendServerN [label="Backend\nServer N\n(300X)" shape=box fillcolor="#e2e3e5" color="#6c757d"];
+
+    // ============= MAIN PROXY COMPONENT =============
+    subgraph cluster_proxy {
+        label="Proxy Main (Io.Threaded Runtime)";
+        style="filled,rounded";
+        color="#004085";
+        fillcolor="#d1ecf1";
+        fontsize=14;
+        fontcolor="#004085";
+
+        ListenSocket [label="Listen Socket\n127.0.0.1:8080" shape=box style="filled,rounded" fillcolor="#cce5ff" color="#004085"];
+        AcceptConnection [label="Accept\nConnection" shape=box fillcolor="#cce5ff" color="#004085"];
+        IoGroup [label="Io.Group\n(Connection Pool)" shape=box style="filled,rounded" fillcolor="#d4edda" color="#28a745"];
+    }
+
+    // ============= ACCESS CONTROL LAYER =============
+    subgraph cluster_access_control {
+        label="Access Control & Rate Limiting";
+        style="filled,rounded";
+        color="#856404";
+        fillcolor="#fff9e6";
+        fontsize=13;
+        fontcolor="#856404";
+
+        ExtractClientIP [label="Extract\nClient IP" shape=box fillcolor="#cce5ff" color="#004085"];
+        CheckAccessControl [label="IP in\nAllow/Deny\nList?" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        CheckRateLimit [label="Rate Limit\nExceeded?" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        RejectConnection [label="Reject\nConnection" shape=box fillcolor="#f8d7da" color="#dc3545"];
+
+        AccessControlDB [label="Access Control\n• Allow List\n• Deny List\n• Default Policy" shape=box style="filled,rounded" fillcolor="#d4edda" color="#28a745"];
+        RateLimiterDB [label="Rate Limiter\n• Per-IP Counters\n• Global Counter\n• Max Limits" shape=box style="filled,rounded" fillcolor="#d4edda" color="#28a745"];
+    }
+
+    // ============= REQUEST PROCESSING =============
+    subgraph cluster_request_processing {
+        label="Request Processing & Caching";
+        style="filled,rounded";
+        color="#004085";
+        fillcolor="#e7f3ff";
+        fontsize=13;
+        fontcolor="#004085";
+
+        BufferRequest [label="Buffer Initial\nRequest (8KB)" shape=box fillcolor="#cce5ff" color="#004085"];
+        ParseHTTPRequest [label="Parse HTTP\nRequest Line" shape=box fillcolor="#cce5ff" color="#004085"];
+        IsGETRequest [label="GET\nRequest?" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        CheckCache [label="Check\nHTTP Cache" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        ServeCachedResponse [label="Serve Cached\nResponse to Client" shape=box fillcolor="#d4edda" color="#28a745"];
+
+        HTTPCacheStore [label="HTTP Cache (LRU)\n• Method+Path → Response\n• TTL Expiration\n• O(1) Eviction\n• RwLock Concurrency" shape=cylinder fillcolor="#f8d7da" color="#dc3545"];
+    }
+
+    // ============= LOAD BALANCING =============
+    subgraph cluster_load_balancing {
+        label="Load Balancing & Backend Selection";
+        style="filled,rounded";
+        color="#155724";
+        fillcolor="#d4edda";
+        fontsize=13;
+        fontcolor="#155724";
+
+        SelectBackend [label="Select Backend\n(Strategy)" shape=box fillcolor="#cce5ff" color="#004085"];
+        LoadBalancerStrategies [label="Load Balancer\n• Round Robin\n• Weighted RR\n• Least Connections\n• Random\n• IP Hash" shape=box style="filled,rounded" fillcolor="#d4edda" color="#28a745"];
+
+        CheckBackendHealth [label="Backend\nHealthy?" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        CheckRetryEligible [label="Retry\nEligible?\n(Exp. Backoff)" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        NoHealthyBackend [label="No Healthy\nBackend" shape=box fillcolor="#f8d7da" color="#dc3545"];
+
+        BackendPool [label="Backend Pool\n• Health Status\n• Active Connections\n• Exponential Backoff\n  (5s → 300s)\n• Circuit Breaker" shape=box style="filled,rounded" fillcolor="#d4edda" color="#28a745"];
+    }
+
+    // ============= BACKEND CONNECTION =============
+    subgraph cluster_backend_connection {
+        label="Backend Connection & Data Transfer";
+        style="filled,rounded";
+        color="#004085";
+        fillcolor="#d1ecf1";
+        fontsize=13;
+        fontcolor="#004085";
+
+        ConnectToBackend [label="Connect to\nBackend\n(with timeout)" shape=box fillcolor="#cce5ff" color="#004085"];
+        ConnectionSuccess [label="Connection\nSuccess?" shape=diamond fillcolor="#fff3cd" color="#ffc107"];
+        MarkBackendUnhealthy [label="Mark Backend\nUnhealthy\n(Incr. Retry Count)" shape=box fillcolor="#f8d7da" color="#dc3545"];
+
+        ForwardBufferedRequest [label="Forward\nBuffered Request" shape=box fillcolor="#cce5ff" color="#004085"];
+
+        BidirectionalCopy [label="Bidirectional Copy\n(io.concurrent + io.select)" shape=box style="filled,rounded" fillcolor="#d4edda" color="#28a745"];
+        ClientToBackend [label="Client → Backend\n(Future C2B)" shape=box fillcolor="#cce5ff" color="#004085"];
+        BackendToClient [label="Backend → Client\n(Future B2C)" shape=box fillcolor="#cce5ff" color="#004085"];
+        WaitBoth [label="Wait for Both\nDirections\n(io.select)" shape=box fillcolor="#cce5ff" color="#004085"];
+    }
+
+    // ============= STATISTICS & MONITORING =============
+    subgraph cluster_stats {
+        label="Statistics & Monitoring";
+        style="filled,rounded";
+        color="#721c24";
+        fillcolor="#f8d7da";
+        fontsize=13;
+        fontcolor="#721c24";
+
+        ProxyStatsDB [label="Proxy Stats (Atomic)\n• Active Connections\n• Total Connections\n• Bytes Transferred (C→B, B→C)\n• Total Errors\n• Backend Failures" shape=cylinder fillcolor="#f8d7da" color="#dc3545"];
+
+        UpdateStatsConnect [label="Record\nConnection" shape=box fillcolor="#cce5ff" color="#004085"];
+        UpdateStatsBytes [label="Record\nBytes Transferred" shape=box fillcolor="#cce5ff" color="#004085"];
+        UpdateStatsEnd [label="Record\nConnection End" shape=box fillcolor="#cce5ff" color="#004085"];
+    }
+
+    // ============= CLEANUP =============
+    Cleanup [label="Cleanup\n• Close Connections\n• Release Rate Limit\n• Decrement Backend Counters" shape=box fillcolor="#cce5ff" color="#004085"];
+
+    // ============= MAIN FLOW =============
+    Client -> ListenSocket [label="TCP\nConnect" color="#0056b3" penwidth=2];
+    ListenSocket -> AcceptConnection [color="#0056b3" penwidth=2];
+    AcceptConnection -> IoGroup [label="Spawn Async\nTask" color="#0056b3" penwidth=2];
+    IoGroup -> ExtractClientIP [label="handleClientWithFeatures()" color="#0056b3" penwidth=2];
+
+    // Access Control Flow
+    ExtractClientIP -> CheckAccessControl [color="#0056b3"];
+    CheckAccessControl -> RejectConnection [label="Denied" color="#dc3545" penwidth=2];
+    CheckAccessControl -> CheckRateLimit [label="Allowed" color="#28a745" penwidth=2];
+    AccessControlDB -> CheckAccessControl [style=dashed color="#6c757d"];
+
+    CheckRateLimit -> RejectConnection [label="Yes" color="#dc3545" penwidth=2];
+    CheckRateLimit -> UpdateStatsConnect [label="No" color="#28a745" penwidth=2];
+    RateLimiterDB -> CheckRateLimit [style=dashed color="#6c757d"];
+
+    RejectConnection -> Cleanup [color="#dc3545"];
+
+    // Statistics Update
+    UpdateStatsConnect -> ProxyStatsDB [style=dashed color="#6c757d"];
+    UpdateStatsConnect -> BufferRequest [color="#0056b3" penwidth=2];
+
+    // Request Processing Flow
+    BufferRequest -> ParseHTTPRequest [color="#0056b3" penwidth=2];
+    ParseHTTPRequest -> IsGETRequest [color="#0056b3"];
+
+    IsGETRequest -> CheckCache [label="Yes" color="#28a745" penwidth=2];
+    IsGETRequest -> SelectBackend [label="No" color="#ffc107"];
+
+    CheckCache -> ServeCachedResponse [label="Hit" color="#28a745" penwidth=2];
+    CheckCache -> SelectBackend [label="Miss" color="#ffc107" penwidth=2];
+    HTTPCacheStore -> CheckCache [style=dashed color="#6c757d"];
+
+    ServeCachedResponse -> UpdateStatsEnd [color="#28a745"];
+    ServeCachedResponse -> Client [label="200 OK\n(from cache)" color="#28a745" penwidth=2 style=dashed];
+
+    // Load Balancing Flow
+    SelectBackend -> LoadBalancerStrategies [style=dashed color="#6c757d"];
+    LoadBalancerStrategies -> BackendPool [style=dashed color="#6c757d"];
+    SelectBackend -> CheckBackendHealth [color="#0056b3" penwidth=2];
+
+    CheckBackendHealth -> CheckRetryEligible [label="Unhealthy" color="#ffc107"];
+    CheckBackendHealth -> ConnectToBackend [label="Healthy" color="#28a745" penwidth=2];
+
+    CheckRetryEligible -> ConnectToBackend [label="Yes\n(Backoff Passed)" color="#28a745"];
+    CheckRetryEligible -> NoHealthyBackend [label="No\n(Too Soon)" color="#dc3545" penwidth=2];
+
+    NoHealthyBackend -> Cleanup [color="#dc3545"];
+
+    // Backend Connection Flow
+    ConnectToBackend -> ConnectionSuccess [color="#0056b3"];
+
+    ConnectionSuccess -> MarkBackendUnhealthy [label="Failed" color="#dc3545" penwidth=2];
+    MarkBackendUnhealthy -> BackendPool [label="Update\nHealth" style=dashed color="#dc3545"];
+    MarkBackendUnhealthy -> Cleanup [color="#dc3545"];
+
+    ConnectionSuccess -> ForwardBufferedRequest [label="Success" color="#28a745" penwidth=2];
+
+    ForwardBufferedRequest -> BackendServer1 [label="HTTP Request" color="#0056b3" style=dashed];
+    ForwardBufferedRequest -> BackendServer2 [label="HTTP Request" color="#0056b3" style=dashed];
+    ForwardBufferedRequest -> BackendServerN [label="HTTP Request" color="#0056b3" style=dashed];
+
+    ForwardBufferedRequest -> BidirectionalCopy [color="#0056b3" penwidth=2];
+
+    // Bidirectional Copy Flow
+    BidirectionalCopy -> ClientToBackend [label="io.concurrent()" color="#0056b3"];
+    BidirectionalCopy -> BackendToClient [label="io.concurrent()" color="#0056b3"];
+
+    ClientToBackend -> WaitBoth [color="#0056b3"];
+    BackendToClient -> WaitBoth [color="#0056b3"];
+
+    ClientToBackend -> UpdateStatsBytes [style=dashed color="#6c757d"];
+    BackendToClient -> UpdateStatsBytes [style=dashed color="#6c757d"];
+    UpdateStatsBytes -> ProxyStatsDB [style=dashed color="#6c757d"];
+
+    WaitBoth -> UpdateStatsEnd [color="#0056b3"];
+    UpdateStatsEnd -> ProxyStatsDB [style=dashed color="#6c757d"];
+    UpdateStatsEnd -> Cleanup [color="#0056b3"];
+
+    Cleanup -> RateLimiterDB [label="Release\nLimits" style=dashed color="#6c757d"];
+    Cleanup -> BackendPool [label="Decrement\nConnections" style=dashed color="#6c757d"];
+
+    // Backend responses
+    BackendServer1 -> BackendToClient [label="HTTP Response" color="#28a745" style=dashed];
+    BackendServer2 -> BackendToClient [label="HTTP Response" color="#28a745" style=dashed];
+    BackendServerN -> BackendToClient [label="HTTP Response" color="#28a745" style=dashed];
+
+    BackendToClient -> Client [label="TCP Stream" color="#28a745" penwidth=2 style=dashed];
+    ClientToBackend -> BackendServer1 [style=invis];
+    ClientToBackend -> BackendServer2 [style=invis];
+    ClientToBackend -> BackendServerN [style=invis];
+
+    // Annotations
+    note_async [label="Async I/O Runtime\n(std.Io.Threaded)\n• Thread Pool\n• io.concurrent()\n• io.select()" shape=note fillcolor="#ffffcc" color="#856404"];
+    note_async -> IoGroup [style=dashed color="#856404"];
+
+    note_exponential_backoff [label="Exponential Backoff\n5s → 10s → 20s → 40s\n→ 80s → 160s → 300s\nCircuit Breaker @ 5 retries" shape=note fillcolor="#ffffcc" color="#856404"];
+    note_exponential_backoff -> CheckRetryEligible [style=dashed color="#856404"];
+
+    note_lru_cache [label="O(1) LRU Eviction\nDoubly-Linked List\nHead = MRU, Tail = LRU" shape=note fillcolor="#ffffcc" color="#856404"];
+    note_lru_cache -> HTTPCacheStore [style=dashed color="#856404"];
+}

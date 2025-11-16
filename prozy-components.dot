@@ -1,0 +1,112 @@
+digraph ProzyComponents {
+    rankdir=LR;
+    ranksep=1.5;
+    nodesep=0.8;
+
+    // Graph styling
+    graph [fontname="Helvetica,Arial,sans-serif" fontsize=14 bgcolor="#f8f9fa"];
+    node [fontname="Helvetica,Arial,sans-serif" fontsize=12 style="filled,rounded" shape=box];
+    edge [fontname="Helvetica,Arial,sans-serif" fontsize=10];
+
+    // External entities
+    Client [label="Client\n(TCP)" fillcolor="#e2e3e5" color="#6c757d"];
+    Backend1 [label="Backend 1\n:3003" fillcolor="#e2e3e5" color="#6c757d"];
+    Backend2 [label="Backend 2\n:3004" fillcolor="#e2e3e5" color="#6c757d"];
+    BackendN [label="Backend N\n:300X" fillcolor="#e2e3e5" color="#6c757d"];
+
+    // Core proxy
+    subgraph cluster_proxy {
+        label="Proxy Core";
+        style="filled,rounded";
+        fillcolor="#d1ecf1";
+        color="#004085";
+
+        IoRuntime [label="std.Io.Threaded\n(Async Runtime)" fillcolor="#cce5ff" color="#004085"];
+        Listener [label="Listener\n:8080" fillcolor="#cce5ff" color="#004085"];
+        IoGroup [label="Io.Group\n(Connection Pool)" fillcolor="#cce5ff" color="#004085"];
+        Handler [label="handleClient\nWithFeatures()" fillcolor="#cce5ff" color="#004085"];
+    }
+
+    // Security & Control
+    subgraph cluster_security {
+        label="Security & Control";
+        style="filled,rounded";
+        fillcolor="#fff9e6";
+        color="#856404";
+
+        AccessControl [label="AccessControl\n• Allow/Deny Lists\n• Default Policy" fillcolor="#fff3cd" color="#856404"];
+        RateLimiter [label="RateLimiter\n• Per-IP Limits\n• Global Limits" fillcolor="#fff3cd" color="#856404"];
+    }
+
+    // Caching layer
+    HTTPCache [label="HTTP Cache (LRU)\n• O(1) Eviction\n• TTL Expiration\n• RwLock\n• Hit/Miss Stats" fillcolor="#f8d7da" color="#dc3545" shape=cylinder];
+
+    // Load balancing
+    subgraph cluster_lb {
+        label="Load Balancing";
+        style="filled,rounded";
+        fillcolor="#d4edda";
+        color="#155724";
+
+        LoadBalancer [label="Load Balancer\n• Round Robin\n• Weighted RR\n• Least Connections\n• Random\n• IP Hash" fillcolor="#c3e6cb" color="#155724"];
+        BackendPool [label="Backend Pool\n• Health Tracking\n• Exponential Backoff\n• Circuit Breaker\n• Connection Counts" fillcolor="#c3e6cb" color="#155724"];
+    }
+
+    // Statistics
+    ProxyStats [label="Proxy Stats\n(Atomic Counters)\n• Connections\n• Bytes Transferred\n• Errors\n• Backend Failures" fillcolor="#f8d7da" color="#dc3545" shape=cylinder];
+
+    // HTTP Inspection
+    HTTPInspector [label="HTTP Inspector\n• Request Parsing\n• Header Analysis" fillcolor="#e7e7ff" color="#5a5aff"];
+
+    // Data flow
+    Client -> Listener [label="TCP\nConnect" color="#0056b3" penwidth=2];
+    Listener -> IoGroup [label="Accept" color="#0056b3" penwidth=2];
+    IoGroup -> Handler [label="Spawn\nAsync Task" color="#0056b3" penwidth=2];
+
+    Handler -> AccessControl [label="1. Check IP" color="#856404"];
+    Handler -> RateLimiter [label="2. Check Limits" color="#856404"];
+    Handler -> HTTPInspector [label="3. Parse Request" color="#5a5aff"];
+    Handler -> HTTPCache [label="4. Check Cache\n(GET only)" color="#dc3545" style=dashed];
+    Handler -> LoadBalancer [label="5. Select Backend\n(cache miss)" color="#155724"];
+
+    LoadBalancer -> BackendPool [label="Query\nBackends" color="#155724"];
+    BackendPool -> Backend1 [label="Connect" color="#28a745" penwidth=2];
+    BackendPool -> Backend2 [label="Connect" color="#28a745" penwidth=2];
+    BackendPool -> BackendN [label="Connect" color="#28a745" penwidth=2];
+
+    Handler -> ProxyStats [label="Record\nMetrics" color="#dc3545" style=dashed];
+
+    // Bidirectional data flow
+    Handler -> Backend1 [label="Client→Backend\nio.concurrent()" color="#0056b3" style=dashed dir=both];
+    Handler -> Backend2 [label="Client→Backend\nio.concurrent()" color="#0056b3" style=dashed dir=both];
+    Handler -> BackendN [label="Client→Backend\nio.concurrent()" color="#0056b3" style=dashed dir=both];
+
+    Backend1 -> Client [label="Backend→Client\nio.select()" color="#28a745" penwidth=2 style=dashed];
+    Backend2 -> Client [label="Backend→Client\nio.select()" color="#28a745" penwidth=2 style=dashed];
+    BackendN -> Client [label="Backend→Client\nio.select()" color="#28a745" penwidth=2 style=dashed];
+
+    HTTPCache -> Client [label="Cached\nResponse" color="#28a745" penwidth=2 style=dashed];
+
+    // Runtime dependency
+    IoRuntime -> IoGroup [style=dashed color="#004085"];
+    IoRuntime -> Handler [label="Provides\nio" style=dashed color="#004085"];
+
+    // Annotations
+    note1 [label="8KB Request Buffer\nPrevents data loss on\ncache miss" shape=note fillcolor="#ffffcc"];
+    note1 -> Handler [style=dotted];
+
+    note2 [label="Exponential Backoff\n5s → 10s → 20s → 40s\n→ 80s → 160s → 300s" shape=note fillcolor="#ffffcc"];
+    note2 -> BackendPool [style=dotted];
+
+    note3 [label="Thread-Safe\nAtomic Operations" shape=note fillcolor="#ffffcc"];
+    note3 -> ProxyStats [style=dotted];
+
+    // Legend
+    {
+        rank=same;
+        legend_title [label="Component Types" shape=plaintext];
+        legend_process [label="Process" fillcolor="#cce5ff" color="#004085"];
+        legend_storage [label="Storage" fillcolor="#f8d7da" color="#dc3545" shape=cylinder];
+        legend_external [label="External" fillcolor="#e2e3e5" color="#6c757d"];
+    }
+}
