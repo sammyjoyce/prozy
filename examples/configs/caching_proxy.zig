@@ -28,5 +28,6 @@ pub fn main() !void {
     std.log.info("  Cache: {} MB (LRU with TTL)", .{cache_size_mb});
     std.log.info("  Use case: CDN, static content delivery", .{});
 
-    try proxy.runWithIo(io);
+    // Run proxy using the primary API (Io passed as first-class parameter)
+    try proxy.runWithIoOptions(io, .{});
 }

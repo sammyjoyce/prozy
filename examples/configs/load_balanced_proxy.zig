@@ -39,5 +39,6 @@ pub fn main() !void {
     std.log.info("    - backend3.internal:3003 (weight: 1)", .{});
     std.log.info("  Features: Health checks, auto-failover, cache", .{});
 
-    try proxy.runWithIo(io);
+    // Run proxy using the primary API (Io passed as first-class parameter)
+    try proxy.runWithIoOptions(io, .{});
 }

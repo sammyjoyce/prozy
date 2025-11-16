@@ -89,6 +89,46 @@ The proxy supports extensive configuration:
 
 ## Implementation Details
 
+### Io as a First-Class Parameter
+
+Prozy follows Andrew Kelley's recommended pattern for Zig 0.16.x async I/O:
+
+**Pattern**: Create `std.Io.Threaded` (or `io_uring`/`kqueue`) in `main()`, then pass the `Io` executor through your application like an allocator.
+
+**Benefits**:
+- Test different Io backends (Threaded, io_uring, kqueue) without changing proxy code
+- Better separation of concerns: main() controls the I/O strategy
+- Enables dependency injection and testing with mock Io implementations
+- Matches Zig's philosophy of explicit over implicit
+
+**API Hierarchy**:
+1. **`runWithIoOptions(io, options)`** - PRIMARY API: Pass Io executor and options explicitly
+2. **`runWithIo(io)`** - Convenience: Pass Io executor, use default options
+3. **`runWithOptions(options)`** - Convenience: Custom options, creates Io.Threaded internally
+4. **`run()`** - Convenience: Default options, creates Io.Threaded internally
+
+**Recommended Usage**:
+```zig
+pub fn main() !void {
+    const allocator = std.heap.page_allocator;
+
+    // Create Io executor once in main
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    // Pass io through like an allocator
+    var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+    defer proxy.deinit();
+
+    // Use the primary API
+    try proxy.runWithIoOptions(io, .{
+        .enable_caching = true,
+        .enable_load_balancing = true,
+    });
+}
+```
+
 ### Core Components
 
 1. **Proxy**: Main proxy struct with configuration and lifecycle management
@@ -123,10 +163,20 @@ var future_c2b = io.concurrent(copyPipeWithStats, .{job_c2b}) catch |err| switch
 };
 
 // Library entry point stays Io-agnostic; callers pass the executor in
+// Following Andrew Kelley's pattern: create Io.Threaded in main, pass io through like an allocator
 const prozy = @import("prozy");
 var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
 defer proxy.deinit();
-try proxy.runWithIoOptions(io, .{});
+// PRIMARY API: runWithIoOptions - pass Io executor and options explicitly
+try proxy.runWithIoOptions(io, .{
+    .enable_caching = true,
+    .enable_load_balancing = false,
+});
+
+// Alternative convenience wrappers (create Io.Threaded internally):
+// try proxy.run();              // Default options, creates own Io.Threaded
+// try proxy.runWithOptions(.{}); // Custom options, creates own Io.Threaded
+// try proxy.runWithIo(io);       // Provided Io, default options
 
 // Backend health recovery with exponential backoff
 const backend = Backend.init("127.0.0.1", 3003, 1);

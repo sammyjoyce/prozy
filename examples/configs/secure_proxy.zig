@@ -47,5 +47,6 @@ pub fn main() !void {
     std.log.info("  Rate limits: 50/IP, 5000 global", .{});
     std.log.info("  Use case: Internal API, restricted access", .{});
 
-    try proxy.runWithIo(io);
+    // Run proxy using the primary API (Io passed as first-class parameter)
+    try proxy.runWithIoOptions(io, .{});
 }
