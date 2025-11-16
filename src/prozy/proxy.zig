@@ -351,6 +351,7 @@ pub const Proxy = struct {
                         options,
                         if (self.rate_limiter) |*limiter| limiter else null,
                         @as(*ProxyStats, @constCast(&self.stats)),
+                        if (self.http_cache) |*cache| cache else null,
                     });
                 },
                 .tcp_tunnel => {
@@ -408,7 +409,7 @@ pub const Proxy = struct {
     /// Route an HTTP request to a backend
     /// Returns routing decision with backend selection and cache policy
     pub fn routeRequest(
-        self: *const Self,
+        self: *Self,
         request: *const HTTPInspector.HTTPRequest,
         host: ?[]const u8,
         client_ip: IpKey,
@@ -450,11 +451,12 @@ pub const Proxy = struct {
     fn serveHttpConnection(
         io: Io,
         client_stream: net.Stream,
-        proxy: *const Self,
+        proxy: *Self,
         client_ip: IpKey,
         options: RunOptions,
         rate_limiter: ?*RateLimiter,
         stats: *ProxyStats,
+        http_cache: ?*HTTPCache,
     ) void {
         defer client_stream.close(io);
         if (options.enable_stats) {
@@ -485,6 +487,7 @@ pub const Proxy = struct {
                 client_ip,
                 options,
                 rate_limiter,
+                http_cache,
             ) catch |err| {
                 // On error, log and close connection
                 if (!builtin.is_test) {
@@ -526,10 +529,11 @@ pub const Proxy = struct {
     fn serveHttpOnce(
         io: Io,
         client_stream: net.Stream,
-        proxy: *const Self,
+        proxy: *Self,
         client_ip: IpKey,
         options: RunOptions,
         rate_limiter: ?*RateLimiter,
+        http_cache: ?*HTTPCache,
     ) !bool {
         // Returns true if connection should be kept alive, false otherwise
 
@@ -603,9 +607,9 @@ pub const Proxy = struct {
         // Check cache for GET requests with Host header
         if (options.enable_caching and std.mem.eql(u8, request.method, "GET")) {
             if (maybe_host) |host| {
-                if (proxy.http_cache) |*cache| {
+                if (http_cache) |cache| {
                     if (cache.get(request.method, host, request.path)) |cached_response| {
-                        defer proxy.allocator.free(cached_response);
+                        defer cache.allocator.free(cached_response);
 
                         if (!builtin.is_test) {
                             log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
