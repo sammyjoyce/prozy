@@ -591,6 +591,13 @@ zig build -Doptimize=ReleaseFast
 
 # Run full features demo
 zig build full_features
+
+# Style checking (includes avoid-as rule)
+./.claude/plugin/style-check.sh src/prozy/proxy.zig
+
+# Run avoid-as rule specifically
+./.claude/hooks/avoid-as.sh src/prozy/proxy.zig
+./.claude/hooks/avoid-as-batch.sh  # Check entire codebase
 ```
 
 ## Performance Characteristics

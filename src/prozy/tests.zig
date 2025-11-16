@@ -210,11 +210,12 @@ test "Integration: Performance characteristics" {
 
     var proxies: [10]Proxy = undefined;
     for (proxies, 0..) |_, i| {
+        const port_offset: u16 = @intCast(i);
         proxies[i] = Proxy.init(
             allocator,
-            8000 + @as(u16, @intCast(i)),
+            8000 + port_offset,
             "127.0.0.1",
-            9000 + @as(u16, @intCast(i)),
+            9000 + port_offset,
         );
     }
     defer for (&proxies) |*proxy| proxy.deinit();

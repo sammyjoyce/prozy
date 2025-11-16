@@ -170,7 +170,9 @@ pub const LoadBalancer = struct {
     pub fn init(backends: []Backend, strategy: Strategy) LoadBalancer {
         const seed = blk: {
             const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch break :blk 0;
-            break :blk @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+            const seconds: u64 = @intCast(ts.sec);
+            const nanoseconds: u64 = @intCast(ts.nsec);
+            break :blk seconds * 1_000_000_000 + nanoseconds;
         };
         return .{
             .backends = backends,
@@ -291,8 +293,8 @@ pub const LoadBalancer = struct {
         // in selectBackendWithRetry two-pass selection. The counter is
         // incremented once per public call in weightedRoundRobin() method.
         const index = context.start_index;
-        const total_weight_usize = @as(usize, @intCast(total_weight));
-        var target = @as(u32, @intCast(index % total_weight_usize));
+        const total_weight_usize: usize = @intCast(total_weight);
+        var target: u32 = @intCast(index % total_weight_usize);
 
         for (backends) |*backend| {
             if (!is_eligible(backend)) continue;
@@ -398,7 +400,8 @@ pub const LoadBalancer = struct {
         context: SelectionContext,
     ) ?*Backend {
         const ip_hash = context.client_ip.hash();
-        const index = @as(usize, @intCast(ip_hash % @as(u64, @intCast(backends.len))));
+        const backends_len: u64 = @intCast(backends.len);
+        const index: usize = @intCast(ip_hash % backends_len);
 
         for (0..backends.len) |i| {
             const backend_index = (index + i) % backends.len;
