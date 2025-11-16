@@ -86,6 +86,7 @@ pub const ProxyStats = struct {
 pub const AccessControl = struct {
     const IpSet = std.AutoHashMap(u32, void);
 
+    allocator: std.mem.Allocator,
     allow_list: ?IpSet = null,
     deny_list: ?IpSet = null,
     default_policy: Policy = .allow,
@@ -96,8 +97,8 @@ pub const AccessControl = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, default_policy: Policy) !AccessControl {
-        _ = allocator; // Allocator will be used when adding entries
         return .{
+            .allocator = allocator,
             .allow_list = null,
             .deny_list = null,
             .default_policy = default_policy,
@@ -109,16 +110,16 @@ pub const AccessControl = struct {
         if (self.deny_list) |*list| list.deinit();
     }
 
-    pub fn addToAllowList(self: *AccessControl, allocator: std.mem.Allocator, ip: u32) !void {
+    pub fn addToAllowList(self: *AccessControl, ip: u32) !void {
         if (self.allow_list == null) {
-            self.allow_list = IpSet.init(allocator);
+            self.allow_list = IpSet.init(self.allocator);
         }
         try self.allow_list.?.put(ip, {});
     }
 
-    pub fn addToDenyList(self: *AccessControl, allocator: std.mem.Allocator, ip: u32) !void {
+    pub fn addToDenyList(self: *AccessControl, ip: u32) !void {
         if (self.deny_list == null) {
-            self.deny_list = IpSet.init(allocator);
+            self.deny_list = IpSet.init(self.allocator);
         }
         try self.deny_list.?.put(ip, {});
     }
@@ -164,12 +165,12 @@ pub const RateLimiter = struct {
     }
 
     pub fn tryAcquire(self: *RateLimiter, ip: u32) bool {
-        // Check global limit
-        const current = self.current_global.load(.monotonic);
-        if (current >= self.max_global) return false;
-
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        // Check global limit (inside mutex to prevent race condition)
+        const current = self.current_global.load(.monotonic);
+        if (current >= self.max_global) return false;
 
         // Check per-IP limit
         const count = self.connections_per_ip.get(ip) orelse 0;
@@ -187,7 +188,11 @@ pub const RateLimiter = struct {
 
         if (self.connections_per_ip.get(ip)) |count| {
             if (count > 0) {
-                self.connections_per_ip.put(ip, count - 1) catch {};
+                // Only decrement global count if put succeeds to maintain consistency
+                self.connections_per_ip.put(ip, count - 1) catch {
+                    // If put fails, we can't update the count, so don't decrement global
+                    return;
+                };
                 _ = self.current_global.fetchSub(1, .monotonic);
             }
         }
@@ -364,7 +369,6 @@ pub const Proxy = struct {
                 log.err("accept failed: {s}", .{@errorName(err)});
                 continue;
             };
-            accepted += 1;
 
             // Extract client IP for access control and rate limiting
             const client_ip = extractClientIp(client_stream.socket.address);
@@ -391,6 +395,8 @@ pub const Proxy = struct {
                 }
             }
 
+            // Only increment accepted counter after all validation passes
+            accepted += 1;
             log.info("accepted connection #{} from {any}", .{ accepted, client_stream.socket.address });
 
             if (options.enable_stats) {
@@ -407,7 +413,7 @@ pub const Proxy = struct {
                 &self.http_inspector,
                 options,
                 client_ip,
-                if (self.rate_limiter != null) @intFromPtr(&self.rate_limiter.?) else 0,
+                if (self.rate_limiter) |*limiter| limiter else null,
             });
         }
 
@@ -419,8 +425,18 @@ pub const Proxy = struct {
 
     fn extractClientIp(address: net.IpAddress) u32 {
         return switch (address) {
-            .ip4 => |ip4| @bitCast(ip4.bytes),
-            .ip6 => 0, // Simplified: convert IPv6 to 0 for now
+            .ip4 => |ip4| {
+                // Convert bytes to u32 in network byte order (big-endian)
+                const bytes = ip4.bytes;
+                return (@as(u32, bytes[0]) << 24) |
+                       (@as(u32, bytes[1]) << 16) |
+                       (@as(u32, bytes[2]) << 8) |
+                       (@as(u32, bytes[3]));
+            },
+            .ip6 => |ip6| {
+                // Hash IPv6 addresses to avoid DoS from all IPv6 mapping to 0
+                return std.hash.Crc32.hash(&ip6.bytes);
+            },
         };
     }
 
@@ -517,7 +533,7 @@ pub const Proxy = struct {
         http_inspector: *const HTTPInspector,
         options: RunOptions,
         client_ip: u32,
-        rate_limiter_ptr: usize,
+        rate_limiter: ?*RateLimiter,
     ) void {
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
         defer {
@@ -525,9 +541,10 @@ pub const Proxy = struct {
             if (options.enable_stats) {
                 stats.recordConnectionEnd();
             }
-            if (options.enable_rate_limiting and rate_limiter_ptr != 0) {
-                const limiter: *RateLimiter = @ptrFromInt(rate_limiter_ptr);
-                limiter.release(client_ip);
+            if (options.enable_rate_limiting) {
+                if (rate_limiter) |limiter| {
+                    limiter.release(client_ip);
+                }
             }
         }
 
@@ -1250,7 +1267,7 @@ test "AccessControl: allow list" {
     defer acl.deinit();
 
     // Add specific IPs to allow list
-    try acl.addToAllowList(allocator, 0x7F000001); // 127.0.0.1
+    try acl.addToAllowList(0x7F000001); // 127.0.0.1
 
     try testing.expect(acl.isAllowed(0x7F000001));
     try testing.expect(!acl.isAllowed(0xC0A80001));
@@ -1263,7 +1280,7 @@ test "AccessControl: deny list" {
     defer acl.deinit();
 
     // Add specific IPs to deny list
-    try acl.addToDenyList(allocator, 0xC0A80001); // 192.168.0.1
+    try acl.addToDenyList(0xC0A80001); // 192.168.0.1
 
     try testing.expect(acl.isAllowed(0x7F000001)); // Not in deny list
     try testing.expect(!acl.isAllowed(0xC0A80001)); // In deny list
@@ -1340,11 +1357,11 @@ test "HTTPInspector: parse POST request" {
 }
 
 test "HTTPInspector: invalid request" {
-    const invalid = "Invalid HTTP Request";
+    const invalid = "GET /incomplete";
     const parsed = HTTPInspector.parseRequestLine(invalid);
 
-    // Should handle gracefully (might return null or partial data)
-    _ = parsed;
+    // Should return null for incomplete request (missing HTTP version)
+    try testing.expect(parsed == null);
 }
 
 test "Proxy: with statistics enabled" {
@@ -1377,7 +1394,7 @@ test "Proxy: enable access control" {
 
     if (proxy.access_control) |*acl| {
         // Add to allow list
-        try acl.addToAllowList(allocator, 0x7F000001);
+        try acl.addToAllowList(0x7F000001);
     }
 }
 
