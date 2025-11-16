@@ -368,7 +368,10 @@ pub const HTTPCache = struct {
 
     /// Get current Unix timestamp in seconds
     fn getTimestamp() i64 {
-        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch return 0;
+        const ts = std.posix.clock_gettime(std.posix.CLOCK.REALTIME) catch |err| {
+            log.warn("clock_gettime() failed: {s}, backend health recovery may be disabled", .{@errorName(err)});
+            return 0;
+        };
         return ts.sec;
     }
 
@@ -639,8 +642,16 @@ pub const Backend = struct {
     pub fn markHealthy(self: *Backend, healthy: bool) void {
         self.healthy.store(healthy, .monotonic);
         if (!healthy) {
-            // Record when backend became unhealthy
+            // Record when backend became unhealthy.
+            // This timestamp is used by shouldRetry() for exponential backoff.
             const now = HTTPCache.getTimestamp();
+
+            // Warn if timestamp failed (0 means clock_gettime failed).
+            // Without a valid timestamp, shouldRetry() will return false permanently.
+            if (now == 0) {
+                log.warn("failed to record unhealthy_since for backend {s}:{}: clock_gettime returned 0, health recovery will be disabled", .{ self.host, self.port });
+            }
+
             self.unhealthy_since.store(now, .monotonic);
             // Increment retry count for exponential backoff
             self.incrementRetryCount();
@@ -666,6 +677,12 @@ pub const Backend = struct {
 
         // Check if recovery interval has passed
         const unhealthy_timestamp = self.unhealthy_since.load(.monotonic);
+
+        // If unhealthy_timestamp is 0, it means either:
+        // (1) Backend never marked as unhealthy (initial state), or
+        // (2) clock_gettime() failed and we couldn't record the timestamp.
+        // In either case, we conservatively return false to prevent
+        // thundering herd. See markHealthy() for logging on clock failures.
         if (unhealthy_timestamp == 0) return false;
 
         const now = HTTPCache.getTimestamp();
@@ -862,7 +879,10 @@ pub const LoadBalancer = struct {
         if (total_weight == 0) return null;
 
         // Select backend based on weighted distribution.
-        const index = context.load_balancer.current_index.fetchAdd(1, .monotonic);
+        // Note: Counter is NOT incremented here to prevent double-increment
+        // in selectBackendWithRetry two-pass selection. The counter is
+        // incremented once per public call in weightedRoundRobin() method.
+        const index = context.start_index;
         const total_weight_usize = @as(usize, @intCast(total_weight));
         var target = @as(u32, @intCast(index % total_weight_usize));
 
@@ -881,9 +901,14 @@ pub const LoadBalancer = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        // Increment counter ONCE per public call, BEFORE the two-pass selection.
+        // This ensures weighted distribution is correct even when falling back
+        // to retry candidates in selectBackendWithRetry().
+        const start_index = self.current_index.fetchAdd(1, .monotonic);
+
         const context = SelectionContext{
             .load_balancer = self,
-            .start_index = 0,
+            .start_index = start_index,
             .client_ip = 0,
         };
         return selectBackendWithRetry(weightedRoundRobinSelector, context);
