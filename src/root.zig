@@ -357,7 +357,8 @@ pub const HTTPCache = struct {
         }
 
         // Check if we need to evict to make space
-        while (self.current_size.load(.monotonic) + response.len > self.max_size and self.cache.count() > 0) {
+        const total_new_size = response.len + method.len + path.len;
+        while (self.current_size.load(.monotonic) + total_new_size > self.max_size and self.cache.count() > 0) {
             self.evictLRU();
         }
 
@@ -397,7 +398,7 @@ pub const HTTPCache = struct {
             .path = path_copy,
             .created_at = getTimestamp(),
             .ttl = ttl,
-            .size = response.len,
+            .size = response.len + method.len + path.len,
             .access_count = 0,
             .prev = null,
             .next = null,
@@ -414,7 +415,7 @@ pub const HTTPCache = struct {
 
         // Add to front of LRU list
         self.addToFront(node);
-        _ = self.current_size.fetchAdd(response.len, .monotonic);
+        _ = self.current_size.fetchAdd(node.size, .monotonic);
     }
 
     fn hashKey(method: []const u8, path: []const u8) u64 {
@@ -985,7 +986,7 @@ pub const Proxy = struct {
             if (options.enable_access_control) {
                 if (self.access_control) |acl| {
                     if (!acl.isAllowed(client_ip)) {
-                        log.warn("connection from {any} denied by access control", .{client_stream.socket.address});
+                        log.warn("connection from {} denied by access control", .{client_ip});
                         client_stream.close(io);
                         continue;
                     }
@@ -996,7 +997,7 @@ pub const Proxy = struct {
             if (options.enable_rate_limiting) {
                 if (self.rate_limiter) |*limiter| {
                     if (!limiter.tryAcquire(client_ip)) {
-                        log.warn("connection from {any} denied by rate limiter", .{client_stream.socket.address});
+                        log.warn("connection from {} denied by rate limiter", .{client_ip});
                         client_stream.close(io);
                         continue;
                     }
@@ -1005,7 +1006,7 @@ pub const Proxy = struct {
 
             // Only increment accepted counter after all validation passes
             accepted += 1;
-            log.info("accepted connection #{} from {any}", .{ accepted, client_stream.socket.address });
+            log.info("accepted connection #{} from {}", .{ accepted, client_ip });
 
             if (options.enable_stats) {
                 self.stats.recordConnection();
@@ -1267,7 +1268,7 @@ pub const Proxy = struct {
         }
 
         if (options.enable_connection_logging and !builtin.is_test) {
-            log.info("[{}] connected to backend {s}:{}", .{ start_time, actual_backend_host, actual_backend_port });
+            log.info("[{any}] connected to backend {s}:{}", .{ start_time, actual_backend_host, actual_backend_port });
         }
 
         // Set up buffered readers and writers
@@ -1565,7 +1566,7 @@ pub const Proxy = struct {
             if (first_packet and job.direction == .client_to_backend and job.enable_http_inspection) {
                 if (HTTPInspector.parseRequestLine(buffer[0..n])) |request| {
                     if (!builtin.is_test) {
-                        log.info("HTTP {} {}", .{ request.method, request.path });
+                        log.info("HTTP {s} {s}", .{ request.method, request.path });
                     }
                 }
                 first_packet = false;
@@ -2161,7 +2162,7 @@ test "HTTPCache: basic caching" {
 test "HTTPCache: LRU eviction" {
     const allocator = testing.allocator;
 
-    var cache = HTTPCache.init(allocator, 100); // Small cache
+    var cache = HTTPCache.init(allocator, 80); // Small cache - 2 entries=64, 3rd entry would be 96 > 80
     defer cache.deinit();
 
     // Fill cache
