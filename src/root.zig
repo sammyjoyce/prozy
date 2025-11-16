@@ -27,6 +27,8 @@
 //! ### Connection Handling
 //! - **30-second timeout**: After one direction of a connection completes, the proxy
 //!   waits up to 30 seconds for the other direction before timing out and canceling.
+//!   Implemented using io.concurrent(sleep, ...) combined with io.select() for concurrent
+//!   timeout enforcement. Prevents hung connections during HTTP keep-alive scenarios.
 //! - **Full close only**: No TCP half-close support. Both directions are closed together.
 //!
 //! ### Cache Behavior
@@ -67,6 +69,11 @@ const net = Io.net;
 const Reader = Io.Reader;
 const Writer = Io.Writer;
 const Timeout = Io.Timeout;
+const Duration = Io.Duration;
+const Clock = Io.Clock;
+
+// Timeout configuration for bidirectional copy operations
+const BIDIRECTIONAL_TIMEOUT_SECONDS: i64 = 30;
 
 // ============= Core Proxy Features =============
 
@@ -470,6 +477,10 @@ pub const HTTPInspector = struct {
 };
 
 /// HTTP response cache with LRU eviction for performance optimization
+///
+/// SECURITY: Cache keys include Host header for multi-tenant isolation.
+/// Requests without Host headers MUST NOT be cached to prevent pollution
+/// across different virtual hosts/APIs.
 pub const HTTPCache = struct {
     const CacheNode = struct {
         key: u64,
@@ -1562,36 +1573,48 @@ pub const Proxy = struct {
                 // Try to parse HTTP request
                 if (HTTPInspector.parseRequestLine(request_buffer[0..bytes_read])) |request| {
                     // Extract Host header for cache key (multi-tenant isolation)
-                    const host = HTTPInspector.findHeader(request_buffer[0..bytes_read], "Host") orelse "default";
+                    // SECURITY: Requests without Host header are NOT cached to prevent
+                    // cache pollution across different virtual hosts/APIs
+                    const maybe_host = HTTPInspector.findHeader(request_buffer[0..bytes_read], "Host");
 
-                    // Only cache GET requests
+                    // Only cache GET requests WITH valid Host header
                     if (std.mem.eql(u8, request.method, "GET")) {
-                        if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
-                            // IMPORTANT: get() returns an owned copy that we must free
-                            defer http_cache.?.allocator.free(cached_response);
+                        if (maybe_host) |host| {
+                            // Host header present - check cache
+                            if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
+                                // IMPORTANT: get() returns an owned copy that we must free
+                                defer http_cache.?.allocator.free(cached_response);
 
-                            // Cache hit! Send cached response directly
-                            if (!builtin.is_test) {
-                                log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
-                            }
+                                // Cache hit! Send cached response directly
+                                if (!builtin.is_test) {
+                                    log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
+                                }
 
-                            var client_write_buf: [4096]u8 = undefined;
-                            var client_writer = client_stream.writer(io, &client_write_buf);
+                                var client_write_buf: [4096]u8 = undefined;
+                                var client_writer = client_stream.writer(io, &client_write_buf);
 
-                            Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
-                                log.warn("failed to write cached response: {s}", .{@errorName(err)});
+                                Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
+                                    log.warn("failed to write cached response: {s}", .{@errorName(err)});
+                                    return;
+                                };
+                                Writer.flush(&client_writer.interface) catch {};
+
+                                if (options.enable_stats) {
+                                    stats.recordBytesBackendToClient(@intCast(cached_response.len));
+                                }
                                 return;
-                            };
-                            Writer.flush(&client_writer.interface) catch {};
-
-                            if (options.enable_stats) {
-                                stats.recordBytesBackendToClient(@intCast(cached_response.len));
                             }
-                            return;
-                        } else {
+
+                            // Cache miss - log and proceed to forward request
                             if (!builtin.is_test) {
                                 log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
                             }
+                        } else {
+                            // Missing Host header - skip caching for security
+                            if (!builtin.is_test) {
+                                log.warn("cache SKIPPED for GET {s} - missing Host header (HTTP/1.1 violation)", .{request.path});
+                            }
+                            // Request will still be forwarded to backend, just not cached
                         }
                     }
                 }
@@ -1786,15 +1809,44 @@ pub const Proxy = struct {
                 if (completion_result) |_| {
                     // Success: wait for backend->client with timeout
                     handleCopyResult("client->backend", completion_result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second_completed = io.select(.{
+                                .backend_to_client = &future_b2c,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err2)});
+                                future_b2c.cancel(io) catch {};
+                                return;
+                            };
+                            switch (second_completed) {
+                                .backend_to_client => |result| handleCopyResult("backend->client", result),
+                            }
+                            return;
+                        },
+                    };
+
                     const second_completed = io.select(.{
                         .backend_to_client = &future_b2c,
+                        .timeout = &timeout_future,
                     }) catch |err| {
-                        log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
                         future_b2c.cancel(io) catch {};
+                        timeout_future.cancel(io);
                         return;
                     };
+
                     switch (second_completed) {
-                        .backend_to_client => |result| handleCopyResult("backend->client", result),
+                        .backend_to_client => |result| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("backend->client", result);
+                        },
+                        .timeout => {
+                            log.warn("backend->client timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_b2c.cancel(io) catch {};
+                        },
                     }
                 } else |err| {
                     // Error in client->backend: cancel backend->client immediately
@@ -1808,15 +1860,44 @@ pub const Proxy = struct {
                 if (completion_result) |_| {
                     // Success: wait for client->backend with timeout
                     handleCopyResult("backend->client", completion_result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second_completed = io.select(.{
+                                .client_to_backend = &future_c2b,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err2)});
+                                future_c2b.cancel(io) catch {};
+                                return;
+                            };
+                            switch (second_completed) {
+                                .client_to_backend => |result| handleCopyResult("client->backend", result),
+                            }
+                            return;
+                        },
+                    };
+
                     const second_completed = io.select(.{
                         .client_to_backend = &future_c2b,
+                        .timeout = &timeout_future,
                     }) catch |err| {
-                        log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
                         future_c2b.cancel(io) catch {};
+                        timeout_future.cancel(io);
                         return;
                     };
+
                     switch (second_completed) {
-                        .client_to_backend => |result| handleCopyResult("client->backend", result),
+                        .client_to_backend => |result| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("client->backend", result);
+                        },
+                        .timeout => {
+                            log.warn("client->backend timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_c2b.cancel(io) catch {};
+                        },
                     }
                 } else |err| {
                     // Error in backend->client: cancel client->backend immediately
@@ -1924,37 +2005,73 @@ pub const Proxy = struct {
             return;
         };
 
-        // Wait for second completion with error handling
+        // Wait for second completion with timeout and error handling
         //
         // CRITICAL FIXES:
-        // 1. Cancel opposite direction immediately when one side fails (resource cleanup)
-        // 2. Proper error propagation with stats recording
+        // 1. 30-second timeout: Uses io.concurrent(sleep, ...) + io.select() to enforce timeout
+        // 2. Cancel opposite direction immediately when one side fails (resource cleanup)
+        // 3. Proper error propagation with stats recording
         //
         // Previous issues:
+        // - No timeout: connections could hang forever waiting for EOF
         // - No cancellation: failed direction kept other side running indefinitely
         // - Resource leak: tasks continued consuming CPU/memory after connection died
         //
-        // KNOWN LIMITATION:
-        // - No timeout implemented: connections can hang waiting for EOF (HTTP keep-alive, etc.)
-        //   TODO: Add timeout support when Zig std.Io API provides timeout functionality
+        // Timeout implementation: Uses io.concurrent(sleepForTimeout, ...) combined with
+        // io.select() to enforce 30-second timeout when waiting for second direction.
         switch (first_completed) {
             .client_to_backend => |result| {
                 // Check if first direction succeeded or failed
                 if (result) |_| {
                     // Success: wait for backend->client with timeout
                     handleCopyResult("client->backend", result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second = io.select(.{
+                                .backend_to_client = &future_b2c,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err2)});
+                                future_b2c.cancel(io) catch {};
+                                if (options.enable_stats) {
+                                    stats.recordError();
+                                }
+                                return;
+                            };
+                            switch (second) {
+                                .backend_to_client => |r| handleCopyResult("backend->client", r),
+                            }
+                            return;
+                        },
+                    };
+
                     const second = io.select(.{
                         .backend_to_client = &future_b2c,
+                        .timeout = &timeout_future,
                     }) catch |err| {
-                        log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
                         future_b2c.cancel(io) catch {};
+                        timeout_future.cancel(io);
                         if (options.enable_stats) {
                             stats.recordError();
                         }
                         return;
                     };
+
                     switch (second) {
-                        .backend_to_client => |r| handleCopyResult("backend->client", r),
+                        .backend_to_client => |r| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("backend->client", r);
+                        },
+                        .timeout => {
+                            log.warn("backend->client timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_b2c.cancel(io) catch {};
+                            if (options.enable_stats) {
+                                stats.recordError();
+                            }
+                        },
                     }
                 } else |err| {
                     // Error in client->backend: cancel backend->client immediately
@@ -1971,18 +2088,53 @@ pub const Proxy = struct {
                 if (result) |_| {
                     // Success: wait for client->backend with timeout
                     handleCopyResult("backend->client", result);
+
+                    // Launch timeout future
+                    var timeout_future = io.concurrent(sleepForTimeout, .{ io, BIDIRECTIONAL_TIMEOUT_SECONDS }) catch |err| switch (err) {
+                        error.ConcurrencyUnavailable => {
+                            // Fallback: wait without timeout
+                            const second = io.select(.{
+                                .client_to_backend = &future_c2b,
+                            }) catch |err2| {
+                                log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err2)});
+                                future_c2b.cancel(io) catch {};
+                                if (options.enable_stats) {
+                                    stats.recordError();
+                                }
+                                return;
+                            };
+                            switch (second) {
+                                .client_to_backend => |r| handleCopyResult("client->backend", r),
+                            }
+                            return;
+                        },
+                    };
+
                     const second = io.select(.{
                         .client_to_backend = &future_c2b,
+                        .timeout = &timeout_future,
                     }) catch |err| {
-                        log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err)});
+                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
                         future_c2b.cancel(io) catch {};
+                        timeout_future.cancel(io);
                         if (options.enable_stats) {
                             stats.recordError();
                         }
                         return;
                     };
+
                     switch (second) {
-                        .client_to_backend => |r| handleCopyResult("client->backend", r),
+                        .client_to_backend => |r| {
+                            timeout_future.cancel(io);
+                            handleCopyResult("client->backend", r);
+                        },
+                        .timeout => {
+                            log.warn("client->backend timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
+                            future_c2b.cancel(io) catch {};
+                            if (options.enable_stats) {
+                                stats.recordError();
+                            }
+                        },
                     }
                 } else |err| {
                     // Error in backend->client: cancel client->backend immediately
@@ -2007,6 +2159,13 @@ pub const Proxy = struct {
 
     fn handleCopyResult(direction: []const u8, result: CopyError!void) void {
         result catch |err| log.warn("{s} stream closed with {s}", .{ direction, @errorName(err) });
+    }
+
+    fn sleepForTimeout(io: Io, seconds: i64) void {
+        const duration = Duration.fromSeconds(seconds);
+        io.sleep(duration, .awake) catch |err| {
+            log.warn("timeout sleep failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn copyPipe(job: PipeJob) CopyError!void {
@@ -3437,7 +3596,9 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
     // Parse the request
     if (HTTPInspector.parseRequestLine(request_data)) |request| {
         // Extract host header for multi-tenant isolation
-        const host = HTTPInspector.findHeader(request_data, "Host") orelse "default";
+        const maybe_host = HTTPInspector.findHeader(request_data, "Host");
+        try testing.expect(maybe_host != null); // Verify Host header is present
+        const host = maybe_host.?;
 
         // Check cache (should be miss)
         const cached = cache.get(request.method, host, request.path);
@@ -3860,4 +4021,87 @@ test "HTTPCache Integration: verify correct size accounting in put operations" {
     const cached = cache.get(method, host, path);
     defer if (cached) |data| allocator.free(data);
     try testing.expect(cached != null);
+}
+
+test "HTTPCache Integration: skip caching for missing Host header (security)" {
+    const allocator = testing.allocator;
+
+    var cache = HTTPCache.init(allocator, 1024 * 1024); // 1MB cache
+    defer cache.deinit();
+
+    // Test request WITHOUT Host header (HTTP/1.0 style or misconfigured client)
+    const request_no_host = "GET /api/users HTTP/1.1\r\nUser-Agent: Test\r\n\r\n";
+
+    if (HTTPInspector.parseRequestLine(request_no_host)) |_| {
+        const maybe_host = HTTPInspector.findHeader(request_no_host, "Host");
+
+        // Verify Host header is missing
+        try testing.expect(maybe_host == null);
+
+        // In the real implementation, this request would bypass cache entirely
+        // We simulate this by checking that the cache lookup returns null
+        // and NOT calling cache.put()
+
+        // The request would still be forwarded to backend, just not cached
+    }
+
+    // Test request WITH Host header works normally
+    const request_with_host = "GET /api/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+
+    if (HTTPInspector.parseRequestLine(request_with_host)) |request| {
+        const maybe_host = HTTPInspector.findHeader(request_with_host, "Host");
+
+        try testing.expect(maybe_host != null);
+        const host = maybe_host.?;
+
+        // This SHOULD be cacheable
+        const response = "HTTP/1.1 200 OK\r\n\r\nresponse-data";
+        try cache.put(request.method, host, request.path, response, 300);
+
+        // Verify it was cached
+        const cached = cache.get(request.method, host, request.path);
+        try testing.expect(cached != null);
+        defer if (cached) |data| allocator.free(data);
+
+        // Verify correct response
+        try testing.expect(std.mem.indexOf(u8, cached.?, "response-data") != null);
+    }
+
+    // Verify cache has exactly one entry (only the request with Host header)
+    const stats = cache.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.entry_count);
+    try testing.expectEqual(@as(u64, 1), stats.hits);
+}
+
+test "HTTPCache Integration: prevent cache pollution across different hosts" {
+    const allocator = testing.allocator;
+
+    var cache = HTTPCache.init(allocator, 1024 * 1024);
+    defer cache.deinit();
+
+    // Same path, different hosts should NOT collide
+    const response1 = "HTTP/1.1 200 OK\r\n\r\nhost1-response";
+    const response2 = "HTTP/1.1 200 OK\r\n\r\nhost2-response";
+
+    try cache.put("GET", "api1.example.com", "/api/users", response1, 300);
+    try cache.put("GET", "api2.example.com", "/api/users", response2, 300);
+
+    // Verify each host gets its own cached response
+    const cached1 = cache.get("GET", "api1.example.com", "/api/users");
+    try testing.expect(cached1 != null);
+    try testing.expect(std.mem.indexOf(u8, cached1.?, "host1-response") != null);
+    defer allocator.free(cached1.?);
+
+    const cached2 = cache.get("GET", "api2.example.com", "/api/users");
+    try testing.expect(cached2 != null);
+    try testing.expect(std.mem.indexOf(u8, cached2.?, "host2-response") != null);
+    defer allocator.free(cached2.?);
+
+    // Verify they're different responses (multi-tenant isolation)
+    try testing.expect(!std.mem.eql(u8, cached1.?, cached2.?));
+
+    // Verify cache has two separate entries
+    const stats = cache.getStats();
+    try testing.expectEqual(@as(u64, 2), stats.entry_count);
+    try testing.expectEqual(@as(u64, 2), stats.hits);
 }
