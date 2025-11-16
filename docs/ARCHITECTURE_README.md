@@ -99,7 +99,7 @@ Client → Proxy (8080) → Load Balancer → Backend Pool (3003, 3004, ...)
 
 | Component | Purpose | Key Features |
 |-----------|---------|--------------|
-| **Proxy Core** | Main proxy logic | std.Io.Threaded, Io.Group, async tasks |
+| **Proxy Core** | Main proxy logic | Io as first-class parameter, std.Io.Threaded, Io.Group, async tasks |
 | **Access Control** | IP filtering | Allow/deny lists, IPv4/IPv6 support |
 | **Rate Limiter** | Connection throttling | Per-IP + global limits, thread-safe |
 | **HTTP Cache** | Response caching | O(1) LRU, TTL, RwLock concurrency |
@@ -182,6 +182,13 @@ Tests:            Lines 1732+      (40+ unit tests)
 - Lock-free counters with monotonic ordering
 - Thread-safe concurrent updates
 - Real-time metrics
+
+### 7. Io as First-Class Parameter
+- `Io` executor passed explicitly to enable flexible backend selection
+- Four-level API hierarchy: `runWithIoOptions()` → `runWithIo()` → `run()` → `runWithDefaults()`
+- Dependency injection for testing with mock Io implementations
+- Follows Zig 0.16.x recommended async I/O patterns
+- Decouples I/O strategy from application logic
 
 ## References
 

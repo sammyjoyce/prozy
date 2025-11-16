@@ -693,6 +693,73 @@ Record Stats (Bytes, Duration)
 Cleanup (Close, Release Limits, Decrement Counters)
 ```
 
+## Io as a First-Class Parameter
+
+### Architecture Pattern
+
+Prozy follows Zig 0.16.x's recommended async I/O pattern by treating the `Io` executor as a first-class parameter. This design enables:
+
+- **Flexible I/O backend selection**: Threaded, io_uring, kqueue, etc.
+- **Dependency injection**: Easy testing with mock Io implementations  
+- **Explicit control flow**: Callers control the I/O strategy
+- **Better separation of concerns**: I/O strategy decoupled from business logic
+
+### API Hierarchy
+
+The proxy provides a four-level API hierarchy:
+
+1. **`runWithIoOptions(io, options)`** - Primary API
+   - Explicit `Io` executor and configuration options
+   - Recommended for all production code
+   - Enables full control over I/O backend and behavior
+
+2. **`runWithIo(io)`** - Convenience wrapper
+   - Uses default configuration options
+   - Delegates to `runWithIoOptions(io, .{})`
+
+3. **`run()`** - Convenience wrapper  
+   - Creates `std.Io.Threaded` internally
+   - Uses default configuration
+   - Suitable for simple applications
+
+4. **`runWithDefaults()`** - Legacy compatibility
+   - Maintains backward compatibility
+   - Delegates through the hierarchy to primary API
+
+### Implementation Pattern
+
+```zig
+// Library entry point - Io-agnostic
+const prozy = @import("prozy");
+
+// Application creates and controls Io executor
+var threaded_io = std.Io.Threaded.init(allocator);
+defer threaded_io.deinit();
+const io = threaded_io.io();
+
+// Primary API - explicit Io and options
+var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+defer proxy.deinit();
+try proxy.runWithIoOptions(io, .{
+    .connect_timeout = 5000,
+    .max_connections = 1000,
+});
+```
+
+### Benefits
+
+1. **Testing**: Inject mock `Io` implementations for unit tests
+2. **Performance**: Choose optimal I/O backend for platform/workload
+3. **Flexibility**: Runtime configuration of I/O behavior
+4. **Maintainability**: Clear separation between I/O and application logic
+5. **Future-proofing**: Easy to add new I/O backends without API changes
+
+### Location in Code
+
+- Primary implementation: `src/proxy.zig:222-241` (`runWithIoOptions`)
+- Convenience wrappers: `src/proxy.zig:243-255` (`runWithIo`, `run`, `runWithDefaults`)
+- Usage examples: `src/main.zig:38`, `examples/configs/*.zig`
+
 ## Visualization
 
 To generate visual diagrams from `prozy-architecture.dot`:

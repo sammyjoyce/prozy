@@ -98,7 +98,7 @@ const io = threaded_io.io();
 var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
 defer proxy.deinit();
 
-try proxy.runWithIo(io);
+try proxy.runWithIoOptions(io, .{});
 ```
 
 ### Run Examples
