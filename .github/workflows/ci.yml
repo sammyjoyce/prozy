@@ -1,0 +1,207 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        zig-version: ['0.16.0']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ matrix.zig-version }}
+
+      - name: Verify Zig installation
+        run: zig version
+
+      - name: Build Prozy
+        run: zig build
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: prozy-${{ matrix.os }}
+          path: zig-out/bin/prozy*
+          retention-days: 7
+
+  integration-test:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Setup Bun (for test server)
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Verify Bun installation
+        run: bun --version
+
+      - name: Build Prozy
+        run: zig build
+
+      - name: Run end-to-end tests
+        run: zig build test_e2e
+        timeout-minutes: 5
+
+  format-check:
+    name: Format Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Check formatting
+        run: |
+          zig fmt --check src/
+          zig fmt --check examples/
+          zig fmt --check tests/
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build-examples:
+    name: Build Example Configurations
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Build examples
+        run: |
+          zig build
+          for example in examples/*.zig; do
+            echo "Building $example"
+            zig build-exe "$example" --dep prozy --mod prozy::src/root.zig
+          done
+
+  release-build:
+    name: Release Build for ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, integration-test, format-check]
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            name: linux-x86_64
+          - target: aarch64-linux
+            name: linux-arm64
+          - target: x86_64-macos
+            name: macos-x86_64
+          - target: aarch64-macos
+            name: macos-arm64
+          - target: x86_64-windows
+            name: windows-x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: '0.16.0'
+
+      - name: Build for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseFast
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prozy-${{ matrix.name }}
+          path: zig-out/bin/prozy*
+          retention-days: 30
+
+  documentation:
+    name: Check Documentation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check required documentation files
+        run: |
+          files=(
+            "README.md"
+            "LICENSE"
+            "CHANGELOG.md"
+            "CONTRIBUTING.md"
+            "DEPLOYMENT.md"
+            "SECURITY.md"
+            "CLAUDE.md"
+          )
+          for file in "${files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "ERROR: Missing required file: $file"
+              exit 1
+            fi
+            echo "✓ Found: $file"
+          done
+
+      - name: Validate links in documentation
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          config-file: '.github/markdown-link-check-config.json'
+        continue-on-error: true
