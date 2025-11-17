@@ -216,17 +216,17 @@ pub const HTTPInspector = struct {
         const request_line = lines.next() orelse return error.InvalidRequest;
 
         // Build new request in a buffer
-        var modified_request = std.ArrayList(u8).init(allocator);
-        errdefer modified_request.deinit();
+        var modified_request: std.ArrayList(u8) = .{};
+        errdefer modified_request.deinit(allocator);
 
         // 1. Write request line
-        try modified_request.appendSlice(request_line);
-        try modified_request.appendSlice("\r\n");
+        try modified_request.appendSlice(allocator, request_line);
+        try modified_request.appendSlice(allocator, "\r\n");
 
         // 2. Add/modify headers
         // First, copy existing headers (excluding hop-by-hop headers and Connection-listed headers)
-        var connection_header_tokens = std.ArrayList([]const u8).init(allocator);
-        defer connection_header_tokens.deinit();
+        var connection_header_tokens: std.ArrayList([]const u8) = .{};
+        defer connection_header_tokens.deinit(allocator);
 
         // First pass: find Connection header to identify additional hop-by-hop headers
         var temp_it = std.mem.splitSequence(u8, original_request[0..headers_end], "\r\n");
@@ -255,7 +255,7 @@ pub const HTTPInspector = struct {
                         token = token[0 .. token.len - 1];
                     }
                     if (token.len > 0) {
-                        try connection_header_tokens.append(try allocator.dupe(u8, token));
+                        try connection_header_tokens.append(allocator, try allocator.dupe(u8, token));
                     }
                 }
             }
@@ -303,46 +303,46 @@ pub const HTTPInspector = struct {
             }
 
             // Copy header as-is
-            try modified_request.appendSlice(line);
-            try modified_request.appendSlice("\r\n");
+            try modified_request.appendSlice(allocator, line);
+            try modified_request.appendSlice(allocator, "\r\n");
         }
 
         // 3. Add X-Forwarded-* headers if enabled and not already present
         if (self.add_forwarded_headers) {
             if (!saw_x_forwarded_for) {
-                try modified_request.appendSlice("X-Forwarded-For: ");
-                try modified_request.appendSlice(client_ip);
-                try modified_request.appendSlice("\r\n");
+                try modified_request.appendSlice(allocator, "X-Forwarded-For: ");
+                try modified_request.appendSlice(allocator, client_ip);
+                try modified_request.appendSlice(allocator, "\r\n");
             }
 
             if (!saw_x_forwarded_proto) {
-                try modified_request.appendSlice("X-Forwarded-Proto: ");
-                try modified_request.appendSlice(client_proto);
-                try modified_request.appendSlice("\r\n");
+                try modified_request.appendSlice(allocator, "X-Forwarded-Proto: ");
+                try modified_request.appendSlice(allocator, client_proto);
+                try modified_request.appendSlice(allocator, "\r\n");
             }
 
             if (!saw_x_forwarded_host and host_header != null) {
-                try modified_request.appendSlice("X-Forwarded-Host: ");
-                try modified_request.appendSlice(host_header.?);
-                try modified_request.appendSlice("\r\n");
+                try modified_request.appendSlice(allocator, "X-Forwarded-Host: ");
+                try modified_request.appendSlice(allocator, host_header.?);
+                try modified_request.appendSlice(allocator, "\r\n");
             }
         }
 
         // 4. Add Via header if enabled
         if (self.add_via_header and !saw_via) {
             // Via: 1.1 prozy-name
-            try modified_request.appendSlice("Via: 1.1 ");
-            try modified_request.appendSlice(self.proxy_name);
-            try modified_request.appendSlice("\r\n");
+            try modified_request.appendSlice(allocator, "Via: 1.1 ");
+            try modified_request.appendSlice(allocator, self.proxy_name);
+            try modified_request.appendSlice(allocator, "\r\n");
         }
 
         // 5. End headers section
-        try modified_request.appendSlice("\r\n");
+        try modified_request.appendSlice(allocator, "\r\n");
 
         // 6. Append body (if any)
         if (headers_end < original_request.len) {
             const body = original_request[headers_end..];
-            try modified_request.appendSlice(body);
+            try modified_request.appendSlice(allocator, body);
         }
 
         // Free Connection header tokens
@@ -350,7 +350,7 @@ pub const HTTPInspector = struct {
             allocator.free(token);
         }
 
-        return try modified_request.toOwnedSlice();
+        return try modified_request.toOwnedSlice(allocator);
     }
 
     /// Manipulate HTTP response headers: add Via header, remove hop-by-hop headers
@@ -372,12 +372,12 @@ pub const HTTPInspector = struct {
         const status_line = lines.next() orelse return error.InvalidResponse;
 
         // Build new response in a buffer
-        var modified_response = std.ArrayList(u8).init(allocator);
-        errdefer modified_response.deinit();
+        var modified_response: std.ArrayList(u8) = .{};
+        errdefer modified_response.deinit(allocator);
 
         // 1. Write status line
-        try modified_response.appendSlice(status_line);
-        try modified_response.appendSlice("\r\n");
+        try modified_response.appendSlice(allocator, status_line);
+        try modified_response.appendSlice(allocator, "\r\n");
 
         // 2. Copy headers (excluding hop-by-hop headers)
         var header_it = std.mem.splitSequence(u8, original_response[0..headers_end], "\r\n");
@@ -402,28 +402,28 @@ pub const HTTPInspector = struct {
             }
 
             // Copy header as-is
-            try modified_response.appendSlice(line);
-            try modified_response.appendSlice("\r\n");
+            try modified_response.appendSlice(allocator, line);
+            try modified_response.appendSlice(allocator, "\r\n");
         }
 
         // 3. Add Via header if enabled and not present
         if (self.add_via_header and !saw_via) {
             // Via: 1.1 prozy-name
-            try modified_response.appendSlice("Via: 1.1 ");
-            try modified_response.appendSlice(self.proxy_name);
-            try modified_response.appendSlice("\r\n");
+            try modified_response.appendSlice(allocator, "Via: 1.1 ");
+            try modified_response.appendSlice(allocator, self.proxy_name);
+            try modified_response.appendSlice(allocator, "\r\n");
         }
 
         // 4. End headers section
-        try modified_response.appendSlice("\r\n");
+        try modified_response.appendSlice(allocator, "\r\n");
 
         // 5. Append body (if any)
         if (headers_end < original_response.len) {
             const body = original_response[headers_end..];
-            try modified_response.appendSlice(body);
+            try modified_response.appendSlice(allocator, body);
         }
 
-        return try modified_response.toOwnedSlice();
+        return try modified_response.toOwnedSlice(allocator);
     }
 };
 

@@ -58,8 +58,9 @@ pub fn main() !void {
     }
 
     // Start Zig proxy directly (not through zig build run)
+    // Use simple.json config which points to localhost:3003
     std.debug.print("🔧 Starting Zig proxy on port {}...\n", .{ProxyPort});
-    var proxy_process = std.process.Child.init(&.{"zig-out/bin/prozy"}, gpa);
+    var proxy_process = std.process.Child.init(&.{ "zig-out/bin/prozy", "config/simple.json" }, gpa);
     try proxy_process.spawn();
 
     // Wait for services to be ready

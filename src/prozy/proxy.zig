@@ -1427,7 +1427,7 @@ pub const Proxy = struct {
 
         // Response buffer for caching (only for backend->client direction)
         var response_buffer: ?std.ArrayList(u8) = null;
-        defer if (response_buffer) |*buf| buf.deinit();
+        defer if (response_buffer) |*buf| buf.deinit(job.allocator);
 
         // HTTP response state tracking
         var is_cacheable = false;
@@ -1436,7 +1436,7 @@ pub const Proxy = struct {
 
         // Only allocate buffer for backend->client with GET requests
         if (job.direction == .backend_to_client and std.mem.eql(u8, job.request_method, "GET")) {
-            response_buffer = std.ArrayList(u8).init(job.allocator);
+            response_buffer = .{};
             is_cacheable = true;
         }
 
@@ -1495,7 +1495,7 @@ pub const Proxy = struct {
             // Buffer response data if cacheable and under size limit
             if (is_cacheable and is_http_200 and response_buffer != null) {
                 if (total_bytes <= PipeJobWithCaching.max_cacheable_size) {
-                    response_buffer.?.appendSlice(buffer[0..n]) catch |err| {
+                    response_buffer.?.appendSlice(job.allocator, buffer[0..n]) catch |err| {
                         if (!builtin.is_test) {
                             log.warn("failed to buffer response for caching: {s}", .{@errorName(err)});
                         }
