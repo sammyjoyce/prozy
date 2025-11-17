@@ -85,6 +85,31 @@ const backend = @import("prozy/backend.zig");
 pub const Backend = backend.Backend;
 pub const LoadBalancer = backend.LoadBalancer;
 
+// Routing layer (Phase 3)
+const routing = @import("prozy/routing.zig");
+pub const HttpMode = routing.HttpMode;
+pub const Route = routing.Route;
+pub const RouteMatch = routing.RouteMatch;
+pub const Cluster = routing.Cluster;
+pub const CachePolicy = routing.CachePolicy;
+pub const TimeoutPolicy = routing.TimeoutPolicy;
+pub const TransformPolicy = routing.TransformPolicy;
+pub const ConcurrencyPolicy = routing.ConcurrencyPolicy;
+pub const RoutingDecision = routing.RoutingDecision;
+pub const URI = routing.URI;
+pub const Semaphore = routing.Semaphore;
+
+const router = @import("prozy/router.zig");
+pub const Router = router.Router;
+pub const RouterError = router.RouterError;
+
+// Admin and management
+const admin = @import("prozy/admin.zig");
+pub const AdminServer = admin.AdminServer;
+
+const health = @import("prozy/health.zig");
+pub const HealthChecker = health.HealthChecker;
+
 // Proxy core
 const proxy = @import("prozy/proxy.zig");
 pub const RunOptions = proxy.RunOptions;

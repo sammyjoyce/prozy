@@ -75,7 +75,7 @@ const Clock = Io.Clock;
 // Timeout configuration for bidirectional copy operations
 const BIDIRECTIONAL_TIMEOUT_SECONDS: i64 = 30;
 
-// Re-export types from other modules (will be created in later steps)
+// Re-export types from other modules
 const IpKey = @import("transport.zig").IpKey;
 const ProxyStats = @import("stats.zig").ProxyStats;
 const AccessControl = @import("access.zig").AccessControl;
@@ -87,6 +87,11 @@ const LoadBalancer = @import("backend.zig").LoadBalancer;
 const resolveListenAddress = @import("transport.zig").resolveListenAddress;
 const connectToBackend = @import("transport.zig").connectToBackend;
 const extractClientIp = @import("transport.zig").extractClientIp;
+
+// Phase 3: Routing infrastructure
+const Router = @import("router.zig").Router;
+const HttpMode = @import("routing.zig").HttpMode;
+const RoutingDecision = @import("routing.zig").RoutingDecision;
 
 pub const RunOptions = struct {
     /// Host/interface to bind the proxy listener to. Default is loopback.
@@ -128,6 +133,11 @@ pub const Proxy = struct {
     http_inspector: HTTPInspector,
     http_cache: ?HTTPCache = null,
     load_balancer: ?LoadBalancer = null,
+
+    // Phase 3: Routing and lifecycle
+    router: ?*Router = null,
+    mode: HttpMode = .reverse_proxy,
+    shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(allocator: std.mem.Allocator, proxy_port: u16, backend_host: []const u8, backend_port: u16) Self {
         return Self{
@@ -205,6 +215,18 @@ pub const Proxy = struct {
             log.info("Cache size: {} / {} bytes", .{ cache_stats.current_size, cache_stats.max_size });
             log.info("Cache entries: {}", .{cache_stats.entry_count});
         }
+    }
+
+    /// Request graceful shutdown (Phase 3)
+    /// This will cause the accept loop to terminate after the current iteration
+    pub fn shutdown(self: *Self) void {
+        self.shutdown_requested.store(true, .monotonic);
+        log.info("graceful shutdown requested", .{});
+    }
+
+    /// Check if shutdown has been requested
+    pub fn isShutdownRequested(self: *const Self) bool {
+        return self.shutdown_requested.load(.monotonic);
     }
 
     /// Convenience wrapper: Creates a std.Io.Threaded runtime and runs the proxy.
@@ -289,12 +311,15 @@ pub const Proxy = struct {
                 log.info("load balancing: ENABLED ({} backends, strategy: {})", .{ lb.backends.len, lb.strategy });
             }
         }
+        if (self.router) |router| {
+            log.info("routing mode: {} ({} routes, {} clusters)", .{ router.mode, router.routes.len, router.clusters.len });
+        }
 
         var connection_group: std.Io.Group = .init;
         defer connection_group.wait(io);
 
         var accepted: usize = 0;
-        while (accepted < configured_limit) {
+        while (!self.isShutdownRequested() and accepted < configured_limit) {
             log.info("calling server.accept() [accepted={}/{}]", .{ accepted, configured_limit });
             const client_stream = server.accept(io) catch |err| {
                 log.err("accept failed: {s}", .{@errorName(err)});
@@ -347,7 +372,7 @@ pub const Proxy = struct {
                 if (self.rate_limiter) |*limiter| limiter else null,
                 if (self.load_balancer) |*lb| lb else null,
                 if (self.http_cache) |*cache| cache else null,
-                self.allocator,
+                self.router, // Phase 3: Pass router for advanced routing
             });
         }
 
@@ -378,6 +403,99 @@ pub const Proxy = struct {
         std.debug.print("- Reader/Writer interfaces with buffering\n", .{});
     }
 
+    /// Handle CONNECT tunnel (Phase 3)
+    /// This implements HTTPS proxying by establishing a raw TCP tunnel
+    ///
+    /// Flow:
+    /// 1. Respond with "HTTP/1.1 200 Connection Established\r\n\r\n"
+    /// 2. Connect to the backend
+    /// 3. Hand off to bidirectional copy for raw TCP forwarding
+    ///
+    /// This is used for HTTPS proxying where the client sends:
+    /// CONNECT example.com:443 HTTP/1.1
+    fn handleConnectTunnel(
+        client_stream: net.Stream,
+        io: Io,
+        backend_host: []const u8,
+        backend_port: u16,
+        connect_timeout: Timeout,
+        stats: *ProxyStats,
+        http_inspector: *const HTTPInspector,
+        options: RunOptions,
+    ) void {
+        // Note: client_stream will be closed by caller's defer, not here
+
+        if (!builtin.is_test) {
+            log.info("CONNECT tunnel to {s}:{}", .{ backend_host, backend_port });
+        }
+
+        // Send 200 Connection Established response
+        const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        var client_write_buf: [4096]u8 = undefined;
+        var client_writer = client_stream.writer(io, &client_write_buf);
+
+        Writer.writeAll(&client_writer.interface, response) catch |err| {
+            log.err("failed to send CONNECT response: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                stats.recordError();
+            }
+            return;
+        };
+        Writer.flush(&client_writer.interface) catch |err| {
+            log.err("failed to flush CONNECT response: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                stats.recordError();
+            }
+            return;
+        };
+
+        if (!builtin.is_test) {
+            log.info("sent 200 Connection Established, establishing tunnel", .{});
+        }
+
+        // Connect to backend
+        const backend_stream = connectToBackend(io, backend_host, backend_port, connect_timeout) catch |err| {
+            log.err("CONNECT tunnel backend connect failed: {s}", .{@errorName(err)});
+            if (options.enable_stats) {
+                stats.recordBackendFailure();
+                stats.recordError();
+            }
+            return;
+        };
+        defer backend_stream.close(io);
+
+        if (!builtin.is_test) {
+            log.info("CONNECT tunnel established, starting bidirectional copy", .{});
+        }
+
+        // Set up buffered readers and writers for bidirectional copy
+        var client_read_buf: [4096]u8 = undefined;
+        var backend_read_buf: [4096]u8 = undefined;
+        var backend_write_buf: [4096]u8 = undefined;
+
+        var client_reader = client_stream.reader(io, &client_read_buf);
+        var backend_reader = backend_stream.reader(io, &backend_read_buf);
+        var backend_writer = backend_stream.writer(io, &backend_write_buf);
+
+        // Reuse client_writer from above (already initialized)
+
+        // Start bidirectional copy (raw TCP tunnel)
+        copyBidirectionalWithStats(
+            io,
+            &client_reader.interface,
+            &backend_writer.interface,
+            &backend_reader.interface,
+            &client_writer.interface,
+            stats,
+            http_inspector,
+            options,
+        );
+
+        if (!builtin.is_test) {
+            log.info("CONNECT tunnel closed", .{});
+        }
+    }
+
     fn handleClientWithFeatures(
         client_stream: net.Stream,
         io: Io,
@@ -391,10 +509,11 @@ pub const Proxy = struct {
         rate_limiter: ?*RateLimiter,
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
-        _: std.mem.Allocator,
+        router: ?*Router, // Phase 3: Optional router for advanced routing
     ) void {
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
         var selected_backend: ?*Backend = null;
+        var routing_decision: ?RoutingDecision = null; // Phase 3: Track routing decision for cleanup
 
         // Track buffered request data that must be forwarded after cache miss
         var request_buffer: [8192]u8 = undefined;
@@ -413,15 +532,23 @@ pub const Proxy = struct {
             if (selected_backend) |backend| {
                 backend.decrementConnections();
             }
+            // Phase 3: Release cluster semaphore if using router
+            if (routing_decision) |decision| {
+                decision.cluster.release();
+            }
         }
 
         if (options.enable_connection_logging and !builtin.is_test) {
             log.info("new connection from client", .{});
         }
 
-        // Try to use HTTP cache if enabled
-        if (options.enable_caching and http_cache != null) {
-            // Buffer initial request to check cache
+        // Phase 3: Router-based request handling
+        // Read and parse initial request for routing decision
+        var parsed_request: ?HTTPInspector.HTTPRequest = null;
+        var request_headers: []const u8 = &[_]u8{};
+
+        if (router != null or options.enable_caching or options.enable_http_inspection) {
+            // Buffer initial request for inspection/routing
             var client_read_buf: [4096]u8 = undefined;
             var client_reader = client_stream.reader(io, &client_read_buf);
 
@@ -431,62 +558,186 @@ pub const Proxy = struct {
             buffered_request_size = bytes_read;
 
             if (bytes_read > 0) {
-                // Try to parse HTTP request
-                if (HTTPInspector.parseRequestLine(request_buffer[0..bytes_read])) |request| {
-                    // Extract Host header for cache key (multi-tenant isolation)
-                    // SECURITY: Requests without Host header are NOT cached to prevent
-                    // cache pollution across different virtual hosts/APIs
-                    const maybe_host = HTTPInspector.findHeader(request_buffer[0..bytes_read], "Host");
+                // Parse HTTP request line
+                parsed_request = HTTPInspector.parseRequestLine(request_buffer[0..bytes_read]);
+                request_headers = request_buffer[0..bytes_read];
+            }
+        }
 
-                    // Only cache GET requests WITH valid Host header
-                    if (std.mem.eql(u8, request.method, "GET")) {
-                        if (maybe_host) |host| {
-                            // Host header present - check cache
-                            if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
-                                // IMPORTANT: get() returns an owned copy that we must free
-                                defer http_cache.?.allocator.free(cached_response);
+        // Phase 3: If router is configured, use it for routing decision
+        if (router) |rtr| {
+            if (parsed_request) |req| {
+                // Check for CONNECT method - delegate to tunnel handler
+                if (std.mem.eql(u8, req.method, "CONNECT")) {
+                    // Parse target from path (format: "host:port")
+                    var host_port_iter = std.mem.splitScalar(u8, req.path, ':');
+                    const connect_host = host_port_iter.next() orelse {
+                        log.err("invalid CONNECT request path: {s}", .{req.path});
+                        const error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid CONNECT request";
+                        var error_write_buf: [4096]u8 = undefined;
+                        var error_writer = client_stream.writer(io, &error_write_buf);
+                        _ = Writer.writeAll(&error_writer.interface, error_response) catch {};
+                        _ = Writer.flush(&error_writer.interface) catch {};
+                        return;
+                    };
+                    const connect_port_str = host_port_iter.next() orelse "443";
+                    const connect_port = std.fmt.parseInt(u16, connect_port_str, 10) catch {
+                        log.err("invalid port in CONNECT request: {s}", .{connect_port_str});
+                        const error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid CONNECT request";
+                        var error_write_buf: [4096]u8 = undefined;
+                        var error_writer = client_stream.writer(io, &error_write_buf);
+                        _ = Writer.writeAll(&error_writer.interface, error_response) catch {};
+                        _ = Writer.flush(&error_writer.interface) catch {};
+                        return;
+                    };
 
-                                // Cache hit! Send cached response directly
-                                if (!builtin.is_test) {
-                                    log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
-                                }
+                    if (!builtin.is_test) {
+                        log.info("CONNECT request detected for {s}:{}, delegating to tunnel handler", .{ connect_host, connect_port });
+                    }
+                    handleConnectTunnel(
+                        client_stream,
+                        io,
+                        connect_host,
+                        connect_port,
+                        connect_timeout,
+                        stats,
+                        http_inspector,
+                        options,
+                    );
+                    return;
+                }
 
-                                var client_write_buf: [4096]u8 = undefined;
-                                var client_writer = client_stream.writer(io, &client_write_buf);
+                // Route the request using the router
+                const decision = rtr.routeRequest(&req, request_headers, client_ip) catch |err| {
+                    log.err("routing failed: {s}", .{@errorName(err)});
+                    if (options.enable_stats) {
+                        stats.recordError();
+                    }
 
-                                Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
-                                    log.warn("failed to write cached response: {s}", .{@errorName(err)});
-                                    return;
-                                };
-                                Writer.flush(&client_writer.interface) catch {};
+                    // Send error response
+                    const error_response = switch (err) {
+                        error.NoRoute => "HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\n\r\nNo route found",
+                        error.NoHealthyBackend => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nNo healthy backends",
+                        error.ClusterAtCapacity => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nCluster at capacity",
+                        else => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\nRouting error",
+                    };
 
-                                if (options.enable_stats) {
-                                    stats.recordBytesBackendToClient(@intCast(cached_response.len));
-                                }
+                    var error_write_buf: [4096]u8 = undefined;
+                    var error_writer = client_stream.writer(io, &error_write_buf);
+                    Writer.writeAll(&error_writer.interface, error_response) catch {};
+                    Writer.flush(&error_writer.interface) catch {};
+                    return;
+                };
+
+                // Store routing decision for cleanup
+                routing_decision = decision;
+
+                // Use backend from routing decision
+                selected_backend = decision.backend;
+                decision.backend.incrementConnections();
+
+                if (!builtin.is_test) {
+                    log.info("router selected backend: {s}:{} (cluster: {s})", .{
+                        decision.backend.host,
+                        decision.backend.port,
+                        decision.cluster.name,
+                    });
+                }
+
+                // Continue with backend connection using router's decision
+                // (skip load balancer logic below)
+            } else {
+                log.warn("router configured but failed to parse request", .{});
+                if (options.enable_stats) {
+                    stats.recordError();
+                }
+                return;
+            }
+        }
+
+        // Try to use HTTP cache if enabled (and not using router, or router allows caching)
+        const cache_enabled = if (routing_decision) |decision|
+            options.enable_caching and decision.cache_allowed and http_cache != null
+        else
+            options.enable_caching and http_cache != null;
+
+        if (cache_enabled and http_cache != null and buffered_request_size > 0) {
+            // Use already buffered request data to check cache
+            // (buffered from router/inspection earlier)
+            if (parsed_request) |request| {
+                // Extract Host header for cache key (multi-tenant isolation)
+                // SECURITY: Requests without Host header are NOT cached to prevent
+                // cache pollution across different virtual hosts/APIs
+                const maybe_host = HTTPInspector.findHeader(request_headers, "Host");
+
+                // Only cache GET requests WITH valid Host header
+                if (std.mem.eql(u8, request.method, "GET")) {
+                    if (maybe_host) |host| {
+                        // Host header present - check cache
+                        if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
+                            // IMPORTANT: get() returns an owned copy that we must free
+                            defer http_cache.?.allocator.free(cached_response);
+
+                            // Cache hit! Send cached response directly
+                            if (!builtin.is_test) {
+                                log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
+                            }
+
+                            var client_write_buf: [4096]u8 = undefined;
+                            var client_writer = client_stream.writer(io, &client_write_buf);
+
+                            Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
+                                log.warn("failed to write cached response: {s}", .{@errorName(err)});
                                 return;
-                            }
+                            };
+                            Writer.flush(&client_writer.interface) catch {};
 
-                            // Cache miss - log and proceed to forward request
-                            if (!builtin.is_test) {
-                                log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
+                            if (options.enable_stats) {
+                                stats.recordBytesBackendToClient(@intCast(cached_response.len));
                             }
-                        } else {
-                            // Missing Host header - skip caching for security
-                            if (!builtin.is_test) {
-                                log.warn("cache SKIPPED for GET {s} - missing Host header (HTTP/1.1 violation)", .{request.path});
-                            }
-                            // Request will still be forwarded to backend, just not cached
+                            return;
                         }
+
+                        // Cache miss - log and proceed to forward request
+                        if (!builtin.is_test) {
+                            log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
+                        }
+                    } else {
+                        // Missing Host header - skip caching for security
+                        if (!builtin.is_test) {
+                            log.warn("cache SKIPPED for GET {s} - missing Host header (HTTP/1.1 violation)", .{request.path});
+                        }
+                        // Request will still be forwarded to backend, just not cached
                     }
                 }
             }
         }
 
-        // Select backend (use load balancer if enabled)
+        // Select backend (use router if configured, otherwise fall back to load balancer)
         var actual_backend_host = backend_host;
         var actual_backend_port = backend_port;
+        var actual_connect_timeout = connect_timeout;
 
-        if (options.enable_load_balancing) {
+        // Phase 3: If router selected a backend, use it
+        if (routing_decision) |decision| {
+            actual_backend_host = decision.backend.host;
+            actual_backend_port = decision.backend.port;
+
+            // Apply router's timeout policy
+            const timeout_ms = decision.timeouts.connect_timeout_ms;
+            actual_connect_timeout = if (timeout_ms > 0)
+                Timeout{ .duration = .{
+                    .raw = Duration.fromMilliseconds(@intCast(timeout_ms)),
+                    .clock = .awake,
+                } }
+            else
+                .none;
+
+            if (!builtin.is_test) {
+                log.info("using router-selected backend with timeout {}ms", .{timeout_ms});
+            }
+        } else if (options.enable_load_balancing) {
+            // Fall back to load balancer if no router
             if (load_balancer) |lb| {
                 if (lb.selectBackend(client_ip)) |backend| {
                     selected_backend = backend;
@@ -508,7 +759,7 @@ pub const Proxy = struct {
         }
 
         // Connect to backend
-        const backend_stream = connectToBackend(io, actual_backend_host, actual_backend_port, connect_timeout) catch |err| {
+        const backend_stream = connectToBackend(io, actual_backend_host, actual_backend_port, actual_connect_timeout) catch |err| {
             log.err("backend connect failed: {s}", .{@errorName(err)});
             if (options.enable_stats) {
                 stats.recordBackendFailure();
