@@ -114,6 +114,7 @@ pub const HealthChecker = health.HealthChecker;
 const config = @import("prozy/config.zig");
 pub const Config = config.Config;
 pub const ConfigManager = config.ConfigManager;
+pub const ConfigLease = config.ConfigManager.ConfigLease;
 pub const ProxyConfig = config.ProxyConfig;
 pub const BackendConfig = config.BackendConfig;
 pub const ClusterConfig = config.ClusterConfig;

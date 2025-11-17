@@ -264,8 +264,35 @@ pub const ConfigManager = struct {
     config_path: []const u8,
     current_config: std.atomic.Value(*Config),
     arena: std.heap.ArenaAllocator,
-    last_mtime: i128 = 0,
+    last_mtime: std.Io.Timestamp = .{ .nanoseconds = 0 },
     watch_interval_ms: u64 = 1000, // Check for changes every 1 second
+    active_readers: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    retired_head: ?*RetiredArena = null,
+    retired_tail: ?*RetiredArena = null,
+    retired_lock: std.Thread.Mutex = .{},
+
+    const RetiredArena = struct {
+        arena: std.heap.ArenaAllocator,
+        next: ?*RetiredArena = null,
+    };
+
+    pub const ConfigLease = struct {
+        manager: *ConfigManager,
+        config: *const Config,
+        released: bool = false,
+
+        /// Borrow the underlying config pointer.
+        pub fn get(self: *const ConfigLease) *const Config {
+            return self.config;
+        }
+
+        /// Release the lease so the manager can reclaim retired arenas.
+        pub fn release(self: *ConfigLease) void {
+            if (self.released) return;
+            self.released = true;
+            self.manager.releaseReader();
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator, config_path: []const u8) !*ConfigManager {
         const manager = try allocator.create(ConfigManager);
@@ -291,6 +318,10 @@ pub const ConfigManager = struct {
             .current_config = std.atomic.Value(*Config).init(initial_config),
             .arena = arena,
             .last_mtime = stat.mtime,
+            .active_readers = std.atomic.Value(usize).init(0),
+            .retired_head = null,
+            .retired_tail = null,
+            .retired_lock = .{},
         };
 
         log.info("config manager initialized with file: {s}", .{config_path});
@@ -300,12 +331,20 @@ pub const ConfigManager = struct {
     pub fn deinit(self: *ConfigManager) void {
         self.allocator.free(self.config_path);
         self.arena.deinit();
+        self.drainRetiredArenas();
+        std.debug.assert(self.active_readers.load(.acquire) == 0);
         self.allocator.destroy(self);
     }
 
     /// Get current configuration (lock-free read)
-    pub fn getConfig(self: *const ConfigManager) *const Config {
-        return self.current_config.load(.acquire);
+    pub fn getConfig(self: *const ConfigManager) ConfigLease {
+        const manager = @constCast(self);
+        _ = manager.active_readers.fetchAdd(1, .acq_rel);
+        const ptr = manager.current_config.load(.acquire);
+        return .{
+            .manager = manager,
+            .config = ptr,
+        };
     }
 
     /// Check if config file has changed and reload if necessary
@@ -316,7 +355,7 @@ pub const ConfigManager = struct {
         };
 
         // Check if file has been modified
-        if (stat.mtime <= self.last_mtime) {
+        if (stat.mtime.nanoseconds <= self.last_mtime.nanoseconds) {
             return false; // No changes
         }
 
@@ -347,17 +386,19 @@ pub const ConfigManager = struct {
         // Get file mtime
         const stat = try std.fs.cwd().statFile(self.config_path);
 
+        var retired_node = try self.createRetiredArenaNode();
+
         // Atomic swap: old connections continue with old config
         const old_config = self.current_config.swap(new_config, .acq_rel);
         _ = old_config;
 
         // Replace arena (old config memory will be freed)
-        const old_arena = self.arena;
+        retired_node.arena = self.arena;
         self.arena = new_arena;
         self.last_mtime = stat.mtime;
 
-        // Clean up old arena (safe because we've already swapped)
-        old_arena.deinit();
+        self.enqueueRetiredArena(retired_node);
+        self.tryCleanupRetiredArenas();
 
         log.info("config reloaded successfully", .{});
         logConfigSummary(new_config);
@@ -371,6 +412,56 @@ pub const ConfigManager = struct {
         _ = self;
         // TODO: Implement background watcher using io.concurrent
         // This would periodically call checkAndReload()
+    }
+
+    fn createRetiredArenaNode(self: *ConfigManager) !*RetiredArena {
+        const node = try self.allocator.create(RetiredArena);
+        node.* = .{ .arena = undefined, .next = null };
+        return node;
+    }
+
+    fn enqueueRetiredArena(self: *ConfigManager, node: *RetiredArena) void {
+        self.retired_lock.lock();
+        defer self.retired_lock.unlock();
+
+        if (self.retired_tail) |tail| {
+            tail.next = node;
+        } else {
+            self.retired_head = node;
+        }
+        self.retired_tail = node;
+    }
+
+    fn releaseReader(self: *ConfigManager) void {
+        const prev = self.active_readers.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        if (prev == 1) {
+            self.tryCleanupRetiredArenas();
+        }
+    }
+
+    fn tryCleanupRetiredArenas(self: *ConfigManager) void {
+        if (self.active_readers.load(.acquire) != 0) {
+            return;
+        }
+        self.drainRetiredArenas();
+    }
+
+    fn drainRetiredArenas(self: *ConfigManager) void {
+        self.retired_lock.lock();
+        const head = self.retired_head;
+        self.retired_head = null;
+        self.retired_tail = null;
+        self.retired_lock.unlock();
+
+        var cursor = head;
+        while (cursor) |node| {
+            var arena = node.arena;
+            arena.deinit();
+            const next = node.next;
+            self.allocator.destroy(node);
+            cursor = next;
+        }
     }
 };
 
@@ -403,7 +494,11 @@ fn loadConfigFromFile(allocator: std.mem.Allocator, path: []const u8) !*Config {
 /// Load configuration from JSON file
 fn loadConfigFromJson(allocator: std.mem.Allocator, path: []const u8) !*Config {
     // Read file contents
-    const file_contents = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+    const file_contents = std.fs.cwd().readFileAlloc(
+        path,
+        allocator,
+        std.Io.Limit.limited(10 * 1024 * 1024),
+    ) catch |err| {
         log.err("failed to read config file '{s}': {s}", .{ path, @errorName(err) });
         return ConfigError.ReadFailed;
     };
@@ -454,7 +549,11 @@ fn parseJsonConfig(allocator: std.mem.Allocator, source: []const u8) !*Config {
 /// Load configuration from ZON file
 fn loadConfigFromZon(allocator: std.mem.Allocator, path: []const u8) !*Config {
     // Read file contents
-    const file_contents = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+    const file_contents = std.fs.cwd().readFileAlloc(
+        path,
+        allocator,
+        std.Io.Limit.limited(10 * 1024 * 1024),
+    ) catch |err| {
         log.err("failed to read config file '{s}': {s}", .{ path, @errorName(err) });
         return ConfigError.ReadFailed;
     };

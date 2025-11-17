@@ -39,12 +39,16 @@ pub fn main() !void {
     std.log.info("", .{});
 
     // Get initial config
-    const initial_config = config_manager.getConfig();
-    std.log.info("Initial configuration:", .{});
-    std.log.info("  Listen: {s}:{}", .{ initial_config.proxy.listen_host, initial_config.proxy.listen_port });
-    std.log.info("  Mode: {}", .{initial_config.mode});
-    std.log.info("  Clusters: {}", .{initial_config.clusters.len});
-    std.log.info("  Routes: {}", .{initial_config.routes.len});
+    {
+        var initial_config = config_manager.getConfig();
+        defer initial_config.release();
+        const initial = initial_config.get();
+        std.log.info("Initial configuration:", .{});
+        std.log.info("  Listen: {s}:{}", .{ initial.proxy.listen_host, initial.proxy.listen_port });
+        std.log.info("  Mode: {}", .{initial.mode});
+        std.log.info("  Clusters: {}", .{initial.clusters.len});
+        std.log.info("  Routes: {}", .{initial.routes.len});
+    }
     std.log.info("", .{});
 
     // Simulate config reload monitoring
@@ -66,7 +70,9 @@ pub fn main() !void {
         if (reloaded) {
             std.log.info("", .{});
             std.log.info("✓ Config reloaded successfully!", .{});
-            const new_config = config_manager.getConfig();
+            var new_config_guard = config_manager.getConfig();
+            defer new_config_guard.release();
+            const new_config = new_config_guard.get();
             std.log.info("New configuration:", .{});
             std.log.info("  Listen: {s}:{}", .{ new_config.proxy.listen_host, new_config.proxy.listen_port });
             std.log.info("  Mode: {}", .{new_config.mode});
