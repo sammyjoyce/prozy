@@ -423,7 +423,7 @@ pub const Proxy = struct {
         http_inspector: *const HTTPInspector,
         options: RunOptions,
     ) void {
-        defer client_stream.close(io);
+        // Note: client_stream will be closed by caller's defer, not here
 
         if (!builtin.is_test) {
             log.info("CONNECT tunnel to {s}:{}", .{ backend_host, backend_port });
@@ -570,16 +570,35 @@ pub const Proxy = struct {
                 // Check for CONNECT method - delegate to tunnel handler
                 if (std.mem.eql(u8, req.method, "CONNECT")) {
                     // Parse target from path (format: "host:port")
-                    // For now, use the default backend
-                    // TODO: Parse host:port from req.path
+                    var host_port_iter = std.mem.splitScalar(u8, req.path, ':');
+                    const connect_host = host_port_iter.next() orelse {
+                        log.err("invalid CONNECT request path: {s}", .{req.path});
+                        const error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid CONNECT request";
+                        var error_write_buf: [4096]u8 = undefined;
+                        var error_writer = client_stream.writer(io, &error_write_buf);
+                        _ = Writer.writeAll(&error_writer.interface, error_response) catch {};
+                        _ = Writer.flush(&error_writer.interface) catch {};
+                        return;
+                    };
+                    const connect_port_str = host_port_iter.next() orelse "443";
+                    const connect_port = std.fmt.parseInt(u16, connect_port_str, 10) catch {
+                        log.err("invalid port in CONNECT request: {s}", .{connect_port_str});
+                        const error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid CONNECT request";
+                        var error_write_buf: [4096]u8 = undefined;
+                        var error_writer = client_stream.writer(io, &error_write_buf);
+                        _ = Writer.writeAll(&error_writer.interface, error_response) catch {};
+                        _ = Writer.flush(&error_writer.interface) catch {};
+                        return;
+                    };
+
                     if (!builtin.is_test) {
-                        log.info("CONNECT request detected, delegating to tunnel handler", .{});
+                        log.info("CONNECT request detected for {s}:{}, delegating to tunnel handler", .{ connect_host, connect_port });
                     }
                     handleConnectTunnel(
                         client_stream,
                         io,
-                        backend_host,
-                        backend_port,
+                        connect_host,
+                        connect_port,
                         connect_timeout,
                         stats,
                         http_inspector,
@@ -642,63 +661,53 @@ pub const Proxy = struct {
         else
             options.enable_caching and http_cache != null;
 
-        if (cache_enabled and http_cache != null and buffered_request_size == 0) {
-            // Buffer initial request to check cache
-            var client_read_buf: [4096]u8 = undefined;
-            var client_reader = client_stream.reader(io, &client_read_buf);
+        if (cache_enabled and http_cache != null and buffered_request_size > 0) {
+            // Use already buffered request data to check cache
+            // (buffered from router/inspection earlier)
+            if (parsed_request) |request| {
+                // Extract Host header for cache key (multi-tenant isolation)
+                // SECURITY: Requests without Host header are NOT cached to prevent
+                // cache pollution across different virtual hosts/APIs
+                const maybe_host = HTTPInspector.findHeader(request_headers, "Host");
 
-            // Read first chunk of request
-            var slices = [_][]u8{request_buffer[0..]};
-            const bytes_read = client_reader.interface.readVec(&slices) catch 0;
-            buffered_request_size = bytes_read;
+                // Only cache GET requests WITH valid Host header
+                if (std.mem.eql(u8, request.method, "GET")) {
+                    if (maybe_host) |host| {
+                        // Host header present - check cache
+                        if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
+                            // IMPORTANT: get() returns an owned copy that we must free
+                            defer http_cache.?.allocator.free(cached_response);
 
-            if (bytes_read > 0) {
-                // Try to parse HTTP request
-                if (HTTPInspector.parseRequestLine(request_buffer[0..bytes_read])) |request| {
-                    // Extract Host header for cache key (multi-tenant isolation)
-                    // SECURITY: Requests without Host header are NOT cached to prevent
-                    // cache pollution across different virtual hosts/APIs
-                    const maybe_host = HTTPInspector.findHeader(request_buffer[0..bytes_read], "Host");
+                            // Cache hit! Send cached response directly
+                            if (!builtin.is_test) {
+                                log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
+                            }
 
-                    // Only cache GET requests WITH valid Host header
-                    if (std.mem.eql(u8, request.method, "GET")) {
-                        if (maybe_host) |host| {
-                            // Host header present - check cache
-                            if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
-                                // IMPORTANT: get() returns an owned copy that we must free
-                                defer http_cache.?.allocator.free(cached_response);
+                            var client_write_buf: [4096]u8 = undefined;
+                            var client_writer = client_stream.writer(io, &client_write_buf);
 
-                                // Cache hit! Send cached response directly
-                                if (!builtin.is_test) {
-                                    log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
-                                }
-
-                                var client_write_buf: [4096]u8 = undefined;
-                                var client_writer = client_stream.writer(io, &client_write_buf);
-
-                                Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
-                                    log.warn("failed to write cached response: {s}", .{@errorName(err)});
-                                    return;
-                                };
-                                Writer.flush(&client_writer.interface) catch {};
-
-                                if (options.enable_stats) {
-                                    stats.recordBytesBackendToClient(@intCast(cached_response.len));
-                                }
+                            Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
+                                log.warn("failed to write cached response: {s}", .{@errorName(err)});
                                 return;
-                            }
+                            };
+                            Writer.flush(&client_writer.interface) catch {};
 
-                            // Cache miss - log and proceed to forward request
-                            if (!builtin.is_test) {
-                                log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
+                            if (options.enable_stats) {
+                                stats.recordBytesBackendToClient(@intCast(cached_response.len));
                             }
-                        } else {
-                            // Missing Host header - skip caching for security
-                            if (!builtin.is_test) {
-                                log.warn("cache SKIPPED for GET {s} - missing Host header (HTTP/1.1 violation)", .{request.path});
-                            }
-                            // Request will still be forwarded to backend, just not cached
+                            return;
                         }
+
+                        // Cache miss - log and proceed to forward request
+                        if (!builtin.is_test) {
+                            log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
+                        }
+                    } else {
+                        // Missing Host header - skip caching for security
+                        if (!builtin.is_test) {
+                            log.warn("cache SKIPPED for GET {s} - missing Host header (HTTP/1.1 violation)", .{request.path});
+                        }
+                        // Request will still be forwarded to backend, just not cached
                     }
                 }
             }

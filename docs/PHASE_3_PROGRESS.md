@@ -231,7 +231,7 @@ Create `src/prozy/admin.zig`:
   - `GET /routes` - Current routing table
 - Same Io runtime, different listener
 
-### 3. Health Check Loop
+### 2. Health Check Loop
 **Status**: Pending
 **Effort**: 2-3 hours
 
@@ -241,7 +241,7 @@ Implement proactive health checks:
 - Respects exponential backoff
 - Cancellable on shutdown
 
-### 4. Config Reload
+### 3. Config Reload
 **Status**: Pending
 **Effort**: 2-3 hours
 
@@ -252,7 +252,7 @@ Add hot reload support:
 - Atomic swap for zero-downtime
 - Graceful resource cleanup
 
-### 5. Integration Tests
+### 4. Integration Tests
 **Status**: Pending
 **Effort**: 4-5 hours
 
@@ -264,7 +264,7 @@ Test all routing modes:
 - Concurrency limits: 503 when at capacity
 - Graceful shutdown: in-flight requests complete
 
-### 6. Example Applications
+### 5. Example Applications
 **Status**: Pending
 **Effort**: 2-3 hours
 
