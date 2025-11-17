@@ -139,6 +139,113 @@ try acl.addDeniedIp(malicious_ip);
 
 ---
 
+### 6. Authentication Proxy (`auth_proxy.zig`)
+
+**Use case**: Corporate proxy, API gateway, secured services, user authentication
+
+**Features**:
+- ✅ RFC 7235/7617 proxy authentication (Basic scheme)
+- ✅ bcrypt password hashing (configurable cost)
+- ✅ Constant-time credential comparison (timing attack prevention)
+- ✅ Rate limiting for failed attempts (default: 5 max)
+- ✅ Exponential backoff for brute force protection (1min → 64min)
+- ✅ Per-IP and per-username tracking
+- ✅ Authentication statistics
+- ✅ Integration with access control and rate limiting
+
+**Configuration**:
+```zig
+// Enable authentication with custom realm
+try proxy.enableProxyAuthentication("Corporate Proxy", .{
+    .basic_enabled = true,
+    .digest_enabled = false,
+    .max_failed_attempts = 5,
+    .auth_timeout_ms = 30000,
+    .bcrypt_cost = 12,  // 12 rounds = ~250ms per hash
+});
+
+// Add users (passwords automatically hashed with bcrypt)
+try proxy.addAuthUser("admin", "admin123");
+try proxy.addAuthUser("alice", "alicepass");
+try proxy.addAuthUser("bob", "bobpass");
+try proxy.addAuthUser("charlie", "charliepass");
+
+// Optional: Combine with IP-based access control
+try proxy.enableAccessControl(.allow);
+try acl.addAllowedIp(trusted_network_ip);
+
+// Optional: Add rate limiting
+proxy.enableRateLimiting(100, 1000);
+```
+
+**Build & Run**:
+```bash
+# Build the auth proxy example
+zig build auth_proxy
+
+# Run the proxy
+./zig-out/bin/auth_proxy
+```
+
+**Testing**:
+```bash
+# Test without credentials (expect 407)
+curl -v --proxy http://127.0.0.1:8080 http://example.com
+
+# Test with valid credentials (expect success)
+curl -v --proxy http://127.0.0.1:8080 -U admin:admin123 http://example.com
+
+# Test with invalid credentials (expect 407 + rate limiting)
+curl -v --proxy http://127.0.0.1:8080 -U admin:wrong http://example.com
+
+# Test multiple failures to trigger exponential backoff
+for i in {1..6}; do
+  curl --proxy http://127.0.0.1:8080 -U admin:wrong http://example.com
+  sleep 1
+done
+```
+
+**Security Features**:
+- **Password Hashing**: bcrypt with configurable cost (default: 12 rounds)
+  - 4 rounds = ~1ms per hash (fast, but weaker)
+  - 12 rounds = ~250ms per hash (recommended, good balance)
+  - 15 rounds = ~2s per hash (very secure, but slow)
+- **Timing Attack Prevention**: Constant-time comparison prevents timing side-channels
+- **Brute Force Protection**: Exponential backoff after failed attempts
+  - Attempt 1: No delay
+  - Attempt 2-5: 1min, 2min, 4min, 8min delay
+  - Attempt 6+: 16min, 32min, 64min delay (progressive slowdown)
+- **Rate Limiting**: Maximum failed attempts before blocking (default: 5)
+- **Per-IP Tracking**: Each IP address tracked separately
+- **Per-Username Tracking**: Each username tracked separately
+
+**Use Cases**:
+- Corporate proxy server with user authentication
+- API gateway requiring credentials
+- Development proxy with access control
+- Secured internal services
+- Multi-tenant proxy with user isolation
+
+**Statistics Monitoring**:
+```zig
+if (proxy.getAuthStats()) |stats| {
+    std.debug.print("Total auth requests: {d}\n", .{stats.total_auth_requests});
+    std.debug.print("Successful auths: {d}\n", .{stats.successful_auths});
+    std.debug.print("Failed auths: {d}\n", .{stats.failed_auths});
+    std.debug.print("Blocked IPs: {d}\n", .{stats.blocked_ips});
+    std.debug.print("Active sessions: {d}\n", .{stats.active_sessions});
+    std.debug.print("Success rate: {d:.2}%\n", .{stats.success_rate * 100});
+}
+```
+
+**RFC Compliance**:
+- ✅ RFC 7235 (HTTP Authentication Framework for proxies)
+- ✅ RFC 7617 (Basic HTTP Authentication Scheme)
+- ⏳ RFC 7616 (Digest Access Authentication) - Planned for Phase 2
+- ⏳ RFC 6750 (Bearer Token Usage) - Planned for Phase 2
+
+---
+
 ## Building Custom Configurations
 
 ### Step 1: Copy a Template

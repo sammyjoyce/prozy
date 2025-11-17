@@ -1,0 +1,223 @@
+//! Authentication-enabled ZON configuration for Prozy
+//!
+//! This file demonstrates Prozy configuration with RFC 7235/7617 proxy authentication.
+//! ZON provides a native, type-safe configuration format for Zig applications.
+//!
+//! Key Features:
+//! - Basic HTTP proxy authentication (RFC 7617)
+//! - bcrypt password hashing with configurable cost
+//! - Rate limiting for brute force protection
+//! - Exponential backoff for failed authentication attempts
+//! - Per-IP and per-username tracking
+//!
+//! To generate password hashes:
+//!   $ zig build
+//!   $ ./zig-out/bin/hash_password "your_password" 12
+//!
+//! Note: The password hashes below are examples only. Generate new hashes for production use.
+
+.{
+    .proxy = .{
+        .listen_host = "127.0.0.1",
+        .listen_port = 8080,
+        .max_connections = null,
+        .reuse_address = true,
+    },
+
+    .mode = .reverse_proxy,
+
+    .cache = .{
+        .enabled = true,
+        .max_size = 10 * 1024 * 1024, // 10MB
+    },
+
+    .rate_limit = .{
+        .enabled = true,
+        .max_per_ip = 100,
+        .max_global = 10000,
+    },
+
+    .access_control = .{
+        .enabled = false,
+        .default_policy = .allow,
+        .allow_list = &[_][]const u8{},
+        .deny_list = &[_][]const u8{},
+    },
+
+    .health_check = .{
+        .enabled = true,
+        .interval_seconds = 10,
+        .timeout_ms = 5000,
+        .unhealthy_threshold = 3,
+        .healthy_threshold = 2,
+    },
+
+    .admin = .{
+        .enabled = true,
+        .listen_host = "127.0.0.1",
+        .listen_port = 9090,
+    },
+
+    .logging = .{
+        .level = .info,
+        .enable_connection_logging = true,
+        .enable_stats = true,
+    },
+
+    // ========================================================================
+    // Authentication Configuration
+    // ========================================================================
+    //
+    // Implements RFC 7235 (HTTP Authentication Framework for Proxies)
+    // and RFC 7617 (Basic HTTP Authentication Scheme)
+    //
+    // Security Features:
+    // - bcrypt password hashing (cost: 12 rounds = ~250ms per hash)
+    // - Constant-time credential comparison (timing attack prevention)
+    // - Rate limiting (max 5 failed attempts per user/IP)
+    // - Exponential backoff (1min → 2min → 4min → 8min → 16min → 32min → 64min)
+    // - Per-IP and per-username attempt tracking
+    //
+    // Password Hash Format: $2b$<cost>$<salt>$<hash>
+    //
+    // Generate new password hashes using:
+    //   $ zig build
+    //   $ ./zig-out/bin/hash_password "your_password" 12
+    //
+    .authentication = .{
+        .enabled = true,
+        .realm = "Corporate Proxy",
+        .basic_enabled = true,
+        .digest_enabled = false,
+        .max_failed_attempts = 5,
+        .auth_timeout_ms = 30000,
+        .bcrypt_cost = 12,
+        .users = &[_]AuthUserConfig{
+            // Example users (REPLACE with your own hashed passwords in production)
+            //
+            // NOTE: These are example hashes for demonstration only!
+            // Generate your own hashes using: ./zig-out/bin/hash_password "password"
+            .{
+                .username = "admin",
+                // Example hash for password: "admin123"
+                // Generated with: ./zig-out/bin/hash_password "admin123" 12
+                .password_hash = "$2b$12$abcdefghijklmnopqrstuv$0123456789abcdefghijklmnopqrstuvwxyz",
+            },
+            .{
+                .username = "alice",
+                // Example hash for password: "alicepass"
+                .password_hash = "$2b$12$bcdefghijklmnopqrstuvw$1234567890abcdefghijklmnopqrstuvwxyza",
+            },
+            .{
+                .username = "bob",
+                // Example hash for password: "bobpass"
+                .password_hash = "$2b$12$cdefghijklmnopqrstuvwx$234567890abcdefghijklmnopqrstuvwxyzab",
+            },
+            .{
+                .username = "charlie",
+                // Example hash for password: "charliepass"
+                .password_hash = "$2b$12$defghijklmnopqrstuvwxy$34567890abcdefghijklmnopqrstuvwxyzabc",
+            },
+        },
+    },
+
+    .clusters = &[_]ClusterConfig{
+        .{
+            .name = "default_backend",
+            .backends = &[_]BackendConfig{
+                .{
+                    .host = "127.0.0.1",
+                    .port = 3003,
+                    .weight = 1,
+                },
+            },
+            .strategy = .round_robin,
+            .max_concurrent = 1000,
+        },
+    },
+
+    .routes = &[_]RouteConfig{
+        .{
+            .name = "default_route",
+            .match = .{
+                .host = null,
+                .path_prefix = null,
+                .methods = &[_][]const u8{},
+            },
+            .cluster = "default_backend",
+            .cache_policy = .{
+                .allow = true,
+                .ttl_seconds = 300,
+                .max_size = 1024 * 1024,
+            },
+            .timeout_policy = .{
+                .connect_timeout_ms = 5000,
+                .request_timeout_ms = 30000,
+                .response_timeout_ms = 60000,
+                .idle_timeout_seconds = 30,
+            },
+            .concurrency_policy = .{
+                .max_concurrent = 1000,
+                .max_queue_depth = 100,
+                .reject_when_full = false,
+            },
+        },
+    },
+}
+
+// ============================================================================
+// Usage Instructions
+// ============================================================================
+//
+// 1. Generate password hashes:
+//      $ zig build
+//      $ ./zig-out/bin/hash_password "your_password" 12
+//
+// 2. Replace the example password hashes above with your generated hashes
+//
+// 3. Run the proxy with this configuration:
+//      $ ./zig-out/bin/prozy config/auth.zon
+//
+// 4. Test authentication:
+//      # Without credentials (expect 407)
+//      $ curl -v --proxy http://127.0.0.1:8080 http://example.com
+//
+//      # With valid credentials (expect success)
+//      $ curl -v --proxy http://127.0.0.1:8080 -U admin:admin123 http://example.com
+//
+// 5. Monitor authentication statistics:
+//      $ curl http://localhost:9090/auth/stats
+//
+// 6. View authentication metrics:
+//      $ curl http://localhost:9090/metrics
+//
+// ============================================================================
+// Security Best Practices
+// ============================================================================
+//
+// 1. **Never commit real password hashes to version control**
+//    - Use environment-specific configuration files
+//    - Load from secure secrets management systems
+//
+// 2. **Choose appropriate bcrypt cost**
+//    - Cost 12 (~250ms) is recommended for most use cases
+//    - Cost 15 (~2s) for high-security environments
+//    - Cost 10 (~65ms) for high-throughput, lower-security needs
+//
+// 3. **Combine with IP-based access control**
+//    - Enable access_control.enabled = true
+//    - Whitelist trusted networks in access_control.allow_list
+//
+// 4. **Monitor authentication failures**
+//    - Check /auth/stats endpoint regularly
+//    - Alert on high failure rates or blocked IPs
+//
+// 5. **Rotate passwords regularly**
+//    - Generate new hashes with hash_password tool
+//    - Update configuration and reload (hot reload supported)
+//
+// 6. **Use HTTPS/TLS for production**
+//    - Basic auth sends base64-encoded credentials (not encrypted)
+//    - Always use TLS termination in front of Prozy
+//    - Consider using Digest auth (RFC 7616) when available
+//

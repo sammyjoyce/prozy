@@ -415,19 +415,79 @@ const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
 ### 8. Authentication and Authorization
 
 #### RFC 7235/7616/7617 – HTTP Authentication
-**Status**: ❌ **NOT Implemented**
+**Status**: ✅ **IMPLEMENTED** (Basic auth - RFC 7617), ⚠️ Digest/Bearer not yet implemented
 
-- ❌ No `Proxy-Authenticate` header generation
-- ❌ No `Proxy-Authorization` header validation
-- ❌ No authentication schemes (Basic, Digest, Bearer)
-- ❌ No credential validation
+**What's Implemented** (RFC 7235 - Proxy Authentication Framework, RFC 7617 - Basic Scheme):
+- ✅ **`Proxy-Authenticate` header generation** - `src/prozy/auth.zig:380-390`
+  - Generates `407 Proxy Authentication Required` responses
+  - Includes `Proxy-Authenticate: Basic realm="..."` challenge
+  - Proper realm configuration
+- ✅ **`Proxy-Authorization` header validation** - `src/prozy/proxy.zig:644-676`
+  - Case-insensitive header search via `findProxyAuthorizationHeader()`
+  - Base64 credential decoding
+  - Username:password parsing
+- ✅ **Basic Authentication Scheme (RFC 7617)** - `src/prozy/auth.zig:200-285`
+  - Full Basic auth implementation
+  - bcrypt-style password hashing with configurable cost (default: 12 rounds)
+  - Constant-time credential comparison (timing attack prevention)
+- ✅ **Security Features** - `src/prozy/auth.zig`
+  - Rate limiting for failed authentication attempts (default: 5 max)
+  - Exponential backoff for brute force protection (1min → 64min)
+  - Per-IP and per-username attempt tracking
+  - Thread-safe credential storage with RwLock
+- ✅ **Authentication Statistics** - `src/prozy/auth.zig:75-86`
+  - Total auth requests counter
+  - Successful/failed authentication tracking
+  - Blocked IPs counter
+  - Active sessions tracking
+  - Success rate calculation
+- ✅ **Integration with Proxy Flow** - `src/prozy/proxy.zig:644-676`
+  - Authentication check before backend forwarding
+  - Request buffering for auth inspection
+  - Automatic 407 response generation on auth failure
+  - Connection rejection for unauthenticated requests
+- ✅ **Hop-by-hop Header Removal** - `src/prozy/http.zig:144-165`
+  - `Proxy-Authenticate` and `Proxy-Authorization` properly removed
+  - RFC 9110 Section 7.6.1 compliance
 
-**What's Implemented Instead**:
+**What's NOT Implemented**:
+- ❌ **Digest Authentication (RFC 7616)** - Placeholder exists (`authenticateDigest()`), stub returns `unsupported_scheme`
+- ❌ **Bearer Token Scheme (RFC 6750)** - No OAuth/JWT validation
+- ❌ **Multi-factor Authentication** - No 2FA support
+- ❌ **Credential rotation/expiration** - No automatic password aging
+- ❌ **Authentication logging to file** - Only console logging
+
+**Code References**:
+- `src/prozy/auth.zig` - ProxyAuth module with full Basic auth implementation
+- `src/prozy/proxy.zig:644-676` - Authentication flow integration in `handleClientWithFeatures()`
+- `src/prozy/http.zig:144-165, 382-407` - Header manipulation and hop-by-hop removal
+- `examples/configs/auth_proxy.zig` - Working example with 4 users
+
+**Configuration Example**:
+```zig
+try proxy.enableProxyAuthentication("Corporate Proxy", .{
+    .basic_enabled = true,
+    .digest_enabled = false,
+    .max_failed_attempts = 5,
+    .auth_timeout_ms = 30000,
+    .bcrypt_cost = 12,
+});
+try proxy.addAuthUser("admin", "password123");
+```
+
+**Testing**:
+```bash
+# Without credentials (expect 407)
+curl -v --proxy http://127.0.0.1:8080 http://example.com
+
+# With valid credentials (expect success)
+curl -v --proxy http://127.0.0.1:8080 -U admin:password123 http://example.com
+```
+
+**IP-Based Access Control** (Complementary Feature):
 - IP-based access control in `src/prozy/access.zig`
-- Allow/deny lists by client IP
-- No authentication, only IP-level authorization
-
-**Code Reference**: `src/prozy/access.zig` (IP-based access control, not HTTP authentication)
+- Allow/deny lists by client IP (works alongside HTTP authentication)
+- Combined security: IP filtering + HTTP authentication
 
 ---
 

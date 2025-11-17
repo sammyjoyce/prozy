@@ -137,6 +137,7 @@ pub fn main() !void {
         &proxy.stats,
         null, // Load balancer managed by router
         &router,
+        null, // No authentication in this demo
     );
 
     // ====================================================================

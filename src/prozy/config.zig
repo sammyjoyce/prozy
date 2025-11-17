@@ -36,6 +36,17 @@
 //!     "enabled": true,
 //!     "max_size": 10485760
 //!   },
+//!   "authentication": {
+//!     "enabled": true,
+//!     "realm": "Corporate Proxy",
+//!     "basic_enabled": true,
+//!     "max_failed_attempts": 5,
+//!     "bcrypt_cost": 12,
+//!     "users": [
+//!       { "username": "admin", "password_hash": "$2b$12$..." },
+//!       { "username": "alice", "password_hash": "$2b$12$..." }
+//!     ]
+//!   },
 //!   "clusters": [
 //!     {
 //!       "name": "api_backend",
@@ -159,6 +170,24 @@ pub const LogConfig = struct {
     enable_stats: bool = true,
 };
 
+/// Authentication user configuration
+pub const AuthUserConfig = struct {
+    username: []const u8,
+    password_hash: []const u8, // Pre-hashed bcrypt password
+};
+
+/// Authentication configuration
+pub const AuthenticationConfig = struct {
+    enabled: bool = false,
+    realm: []const u8 = "Prozy Proxy",
+    basic_enabled: bool = true,
+    digest_enabled: bool = false,
+    max_failed_attempts: u32 = 5,
+    auth_timeout_ms: u32 = 30000,
+    bcrypt_cost: u12 = 12,
+    users: []const AuthUserConfig = &[_]AuthUserConfig{},
+};
+
 /// Backend configuration (for ZON parsing)
 pub const BackendConfig = struct {
     host: []const u8,
@@ -204,6 +233,7 @@ pub const Config = struct {
     health_check: HealthCheckConfig = .{},
     admin: AdminConfig = .{},
     logging: LogConfig = .{},
+    authentication: AuthenticationConfig = .{},
 
     // Routing configuration
     clusters: []const ClusterConfig = &[_]ClusterConfig{},

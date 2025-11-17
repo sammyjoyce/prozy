@@ -49,6 +49,7 @@ pub fn main() !void {
         &proxy.stats,
         if (proxy.load_balancer != null) &proxy.load_balancer.? else null,
         null, // No router in this demo
+        null, // No authentication in this demo
     );
     _ = admin_server; // Used in production with threading
 

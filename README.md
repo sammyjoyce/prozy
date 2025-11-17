@@ -151,7 +151,7 @@ Comprehensive architecture documentation with visual diagrams is available in th
 
 **Key Architecture Features:**
 - **Async I/O Runtime**: `std.Io.Threaded` with concurrent operations and structured concurrency
-- **7 Enterprise Features**: Access control, rate limiting, HTTP cache, load balancing, backend health, statistics, protocol inspection
+- **8 Enterprise Features**: Access control, rate limiting, HTTP cache, load balancing, backend health, statistics, protocol inspection, proxy authentication
 - **O(1) LRU Cache**: Doubly-linked list with RwLock for concurrent reads
 - **Exponential Backoff**: Smart backend recovery (5s → 10s → 20s → ... → 300s)
 - **Two-Pass Load Balancing**: Healthy backends first, retry candidates second
@@ -347,6 +347,77 @@ All strategies implement two-pass selection:
 - First pass: Select from healthy backends
 - Second pass: If no healthy backends, try retry candidates (using exponential backoff)
 
+### Proxy Authentication (RFC 7235)
+
+Standards-compliant HTTP proxy authentication with enterprise-grade security:
+
+**Authentication Schemes:**
+- ✅ **Basic Authentication (RFC 7617)**: Username/password with bcrypt hashing
+- ⏳ **Digest Authentication (RFC 7616)**: Planned for Phase 2
+- ⏳ **Bearer Tokens (RFC 6750)**: Planned for Phase 2
+
+**Security Features:**
+- **bcrypt password hashing** with configurable cost (default: 12 rounds)
+- **Constant-time credential comparison** prevents timing attacks
+- **Rate limiting**: Maximum failed attempts per user/IP (default: 5 attempts)
+- **Exponential backoff**: Brute force protection (1min → 2min → 4min → 8min → 16min → 32min → 64min)
+- **Per-IP and per-username tracking**: Separate attempt counters
+- **Comprehensive audit logging**: All auth events logged with timestamps
+- **Thread-safe credential storage**: RwLock for concurrent access
+
+**Request Flow:**
+1. Client sends request without `Proxy-Authorization` header
+2. Proxy responds with `407 Proxy Authentication Required` and `Proxy-Authenticate` challenge
+3. Client resends request with `Proxy-Authorization: Basic <credentials>`
+4. Proxy validates credentials and enforces rate limits
+5. On success: Request forwarded to backend
+6. On failure: 407 response, increment failure counter, apply backoff
+
+**Configuration Example:**
+```zig
+// Enable authentication with custom realm
+try proxy.enableProxyAuthentication("Corporate Proxy", .{
+    .basic_enabled = true,
+    .digest_enabled = false,
+    .max_failed_attempts = 5,
+    .auth_timeout_ms = 30000,
+    .bcrypt_cost = 12,
+});
+
+// Add users (passwords are automatically hashed)
+try proxy.addAuthUser("admin", "secure_password_123");
+try proxy.addAuthUser("alice", "alice_password");
+try proxy.addAuthUser("bob", "bob_password");
+
+// Get authentication statistics
+if (proxy.getAuthStats()) |stats| {
+    std.debug.print("Success rate: {d:.2}%\n", .{stats.success_rate * 100});
+    std.debug.print("Total requests: {d}\n", .{stats.total_auth_requests});
+    std.debug.print("Active sessions: {d}\n", .{stats.active_sessions});
+}
+```
+
+**Testing with curl:**
+```bash
+# Without credentials (expect 407)
+curl -v --proxy http://127.0.0.1:8080 http://example.com
+
+# With valid credentials (expect success)
+curl -v --proxy http://127.0.0.1:8080 -U admin:secure_password_123 http://example.com
+
+# With invalid credentials (expect 407 + rate limiting)
+curl -v --proxy http://127.0.0.1:8080 -U admin:wrong_password http://example.com
+```
+
+**Integration with Other Features:**
+- Works seamlessly with access control (IP filtering)
+- Combines with rate limiting (per-IP connection limits)
+- Compatible with HTTP caching (cache keys include auth context)
+- Statistics tracked alongside other proxy metrics
+
+**Example Configuration:**
+See `examples/configs/auth_proxy.zig` for a complete working example with authentication, access control, and rate limiting.
+
 ## 🔧 Recent Improvements
 
 ### Critical Bug Fixes
@@ -409,7 +480,7 @@ Prozy implements various HTTP standards and specifications to different degrees.
 | Content Adaptation | RFC 3507 (ICAP) | Virus scanning, DLP, content transformation | **30%** - Basic transformation hooks, no ICAP protocol or external services |
 | Observability | OpenTelemetry (OTLP) | Distributed tracing, metrics, logs | **20%** - Basic metrics and HTTP endpoints, no OpenTelemetry |
 | Declarative Config | Kubernetes Gateway API, Envoy xDS | Portable L4/L7 routing, dynamic service discovery | **30%** - Hot reload with JSON/ZON, no K8s/xDS integration |
-| Authentication | RFC 7235 (Proxy-Authenticate) | Proxy-level access control | **0%** - IP-based ACL only, no HTTP authentication |
+| Authentication | RFC 7235 (Proxy-Authenticate) | Proxy-level access control | **75%** - Full Basic auth (RFC 7617), bcrypt hashing, rate limiting, exponential backoff. Missing: Digest auth, Bearer tokens |
 | Caching | RFC 9111 (Cache-Control, Vary, ETag) | Freshness, validation, revalidation | **10%** - Basic LRU cache, only `no-store` directive, missing Vary/ETag |
 
 ### Implementation Analysis
@@ -424,12 +495,11 @@ Prozy implements various HTTP standards and specifications to different degrees.
 - **Declarative Config (30%)**: Excellent hot reload with atomic pointer swapping, memory-safe lease-based access, JSON/ZON support, and rich configuration schema. Missing Kubernetes Gateway API and Envoy xDS protocol integration.
 - **Observability (20%)**: Basic atomic metrics collection, HTTP admin endpoints (/metrics, /health, /backends), and structured logging. Missing OpenTelemetry SDK, distributed tracing, OTLP export, and standard metrics formats.
 - **Caching (10%)**: O(1) LRU cache with doubly-linked list, RwLock concurrency, TTL expiration, and Host header isolation. Missing most RFC 9111 features: Cache-Control directives, Vary header, ETag validation, freshness calculation, and revalidation.
+- **Authentication (75%)**: Complete RFC 7235/7617 Basic authentication with bcrypt password hashing, constant-time comparison, rate limiting (5 failed attempts), exponential backoff (1min → 64min), per-IP and per-username tracking, comprehensive statistics. Missing Digest auth (RFC 7616) and Bearer tokens (RFC 6750).
 
 #### ❌ **Not Implemented (0%)**
 - **HTTP Versions**: HTTP/1.1 only, no HTTP/2 binary framing or HTTP/3 QUIC transport. Architecture would need significant changes for multiplexing.
 - **TLS/Handshake**: No TLS termination, SNI, or ALPN support. Plain-text TCP proxy requiring external TLS terminators for HTTPS.
-- **Content Adaptation**: No ICAP protocol implementation. Only basic transformation hooks, no external service integration for virus scanning or DLP.
-- **Authentication**: No RFC 7235 HTTP authentication. Only IP-based access control, no Proxy-Authenticate challenges or credential validation.
 
 ### Standards Compliance Notes
 
