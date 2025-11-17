@@ -142,19 +142,21 @@ pub const HTTPInspector = struct {
     }
 
     /// List of hop-by-hop headers that must be removed before forwarding (RFC 9110 Section 7.6.1)
+    /// NOTE: Transfer-Encoding is NOT included because we don't decode/re-encode chunked bodies.
+    /// As a simple forwarding proxy, we preserve Transfer-Encoding to maintain message integrity.
     const hop_by_hop_headers = [_][]const u8{
         "Connection",
         "Keep-Alive",
         "Proxy-Connection",
         "TE",
         "Trailer",
-        "Transfer-Encoding",
         "Upgrade",
         "Proxy-Authenticate",
         "Proxy-Authorization",
     };
 
     /// Check if a header is hop-by-hop and should be removed
+    /// NOTE: Transfer-Encoding is preserved to maintain body framing for chunked messages
     fn isHopByHopHeader(header_name: []const u8) bool {
         for (hop_by_hop_headers) |hop_by_hop| {
             if (std.ascii.eqlIgnoreCase(header_name, hop_by_hop)) {
@@ -173,14 +175,8 @@ pub const HTTPInspector = struct {
         // Cache-Control can have multiple directives separated by commas
         var it = std.mem.splitSequence(u8, cache_control, ",");
         while (it.next()) |directive_raw| {
-            // Trim whitespace
-            var directive = directive_raw;
-            while (directive.len > 0 and (directive[0] == ' ' or directive[0] == '\t')) {
-                directive = directive[1..];
-            }
-            while (directive.len > 0 and (directive[directive.len - 1] == ' ' or directive[directive.len - 1] == '\t')) {
-                directive = directive[0 .. directive.len - 1];
-            }
+            // Trim whitespace using std.mem.trim
+            const directive = std.mem.trim(u8, directive_raw, " \t");
 
             // Check if this directive is "no-store" (ignore any =value part)
             const equals_idx = std.mem.indexOf(u8, directive, "=");
@@ -246,14 +242,8 @@ pub const HTTPInspector = struct {
                 // Parse comma-separated tokens
                 var token_it = std.mem.splitSequence(u8, value, ",");
                 while (token_it.next()) |token_raw| {
-                    var token = token_raw;
-                    // Trim whitespace
-                    while (token.len > 0 and (token[0] == ' ' or token[0] == '\t')) {
-                        token = token[1..];
-                    }
-                    while (token.len > 0 and (token[token.len - 1] == ' ' or token[token.len - 1] == '\t')) {
-                        token = token[0 .. token.len - 1];
-                    }
+                    // Trim whitespace using std.mem.trim
+                    const token = std.mem.trim(u8, token_raw, " \t");
                     if (token.len > 0) {
                         try connection_header_tokens.append(allocator, try allocator.dupe(u8, token));
                     }
@@ -379,7 +369,38 @@ pub const HTTPInspector = struct {
         try modified_response.appendSlice(allocator, status_line);
         try modified_response.appendSlice(allocator, "\r\n");
 
-        // 2. Copy headers (excluding hop-by-hop headers)
+        // 2. First pass: find Connection header to identify additional hop-by-hop headers (RFC 9110 Section 7.6.1)
+        var connection_header_tokens: std.ArrayList([]const u8) = .{};
+        defer {
+            for (connection_header_tokens.items) |token| {
+                allocator.free(token);
+            }
+            connection_header_tokens.deinit(allocator);
+        }
+
+        var temp_it = std.mem.splitSequence(u8, original_response[0..headers_end], "\r\n");
+        _ = temp_it.next(); // Skip status line
+        while (temp_it.next()) |line| {
+            if (line.len == 0) break;
+
+            const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
+            const header_name = line[0..colon_idx];
+
+            if (std.ascii.eqlIgnoreCase(header_name, "Connection")) {
+                const value = line[colon_idx + 1 ..];
+
+                // Parse comma-separated tokens
+                var token_it = std.mem.splitSequence(u8, value, ",");
+                while (token_it.next()) |token_raw| {
+                    const token = std.mem.trim(u8, token_raw, " \t");
+                    if (token.len > 0) {
+                        try connection_header_tokens.append(allocator, try allocator.dupe(u8, token));
+                    }
+                }
+            }
+        }
+
+        // 3. Second pass: copy headers (excluding hop-by-hop headers and Connection-nominated headers)
         var header_it = std.mem.splitSequence(u8, original_response[0..headers_end], "\r\n");
         _ = header_it.next(); // Skip status line
 
@@ -395,6 +416,16 @@ pub const HTTPInspector = struct {
             if (isHopByHopHeader(header_name)) {
                 continue;
             }
+
+            // Skip headers listed in Connection header
+            var skip = false;
+            for (connection_header_tokens.items) |token| {
+                if (std.ascii.eqlIgnoreCase(header_name, token)) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) continue;
 
             // Track if Via header exists
             if (std.ascii.eqlIgnoreCase(header_name, "Via")) {

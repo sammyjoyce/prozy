@@ -804,7 +804,7 @@ pub const Proxy = struct {
 
         // Forward any buffered request data from cache check before bidirectional copy
         if (buffered_request_size > 0) {
-            forwardBufferedData(
+            const bytes_sent = forwardBufferedData(
                 &backend_writer.interface,
                 request_buffer[0..buffered_request_size],
                 http_inspector,
@@ -819,9 +819,8 @@ pub const Proxy = struct {
                 return;
             };
             if (options.enable_stats) {
-                // Note: We record the ORIGINAL buffer size, not modified size
-                // The modification (adding headers) is an implementation detail
-                stats.recordBytesClientToBackend(@intCast(buffered_request_size));
+                // Record actual bytes sent to backend (including any added headers)
+                stats.recordBytesClientToBackend(@intCast(bytes_sent));
             }
         }
 
@@ -848,6 +847,8 @@ pub const Proxy = struct {
         }
     }
 
+    /// Forward buffered request data to backend, with optional header manipulation
+    /// Returns the number of bytes actually sent to the backend
     fn forwardBufferedData(
         writer: *Writer,
         buffered_data: []const u8,
@@ -855,9 +856,9 @@ pub const Proxy = struct {
         client_ip: IpKey,
         allocator: std.mem.Allocator,
         enable_header_manipulation: bool,
-    ) !void {
+    ) !usize {
         // Precondition: buffered_data must be non-empty and within bounds
-        if (buffered_data.len == 0) return;
+        if (buffered_data.len == 0) return 0;
         if (buffered_data.len > 8192) return error.BufferTooLarge;
 
         // If header manipulation is disabled or inspector disabled, forward as-is
@@ -870,15 +871,23 @@ pub const Proxy = struct {
                 log.warn("failed to flush buffered request data: {s}", .{@errorName(err)});
                 return err;
             };
-            return;
+            return buffered_data.len;
         }
 
         // Manipulate headers: add X-Forwarded-*, Via, remove hop-by-hop headers
         const client_ip_str = client_ip.toStringAlloc(allocator) catch |err| {
             log.warn("failed to convert client IP to string: {s}, forwarding without header manipulation", .{@errorName(err)});
-            Writer.writeAll(writer, buffered_data) catch {};
-            Writer.flush(writer) catch {};
-            return err;
+            // Fallback: forward original request without header manipulation
+            // This is not a failure - we successfully forward the data, just without manipulation
+            Writer.writeAll(writer, buffered_data) catch |write_err| {
+                log.warn("failed to forward buffered request data: {s}", .{@errorName(write_err)});
+                return write_err;
+            };
+            Writer.flush(writer) catch |flush_err| {
+                log.warn("failed to flush buffered request data: {s}", .{@errorName(flush_err)});
+                return flush_err;
+            };
+            return buffered_data.len; // Success - data forwarded successfully
         };
         defer allocator.free(client_ip_str);
 
@@ -898,9 +907,17 @@ pub const Proxy = struct {
             host_header,
         ) catch |err| {
             log.warn("failed to manipulate request headers: {s}, forwarding original request", .{@errorName(err)});
-            Writer.writeAll(writer, buffered_data) catch {};
-            Writer.flush(writer) catch {};
-            return err;
+            // Fallback: forward original request without header manipulation
+            // This is not a failure - we successfully forward the data, just without manipulation
+            Writer.writeAll(writer, buffered_data) catch |write_err| {
+                log.warn("failed to forward buffered request data: {s}", .{@errorName(write_err)});
+                return write_err;
+            };
+            Writer.flush(writer) catch |flush_err| {
+                log.warn("failed to flush buffered request data: {s}", .{@errorName(flush_err)});
+                return flush_err;
+            };
+            return buffered_data.len; // Success - data forwarded successfully
         };
         defer allocator.free(modified_request);
 
@@ -919,6 +936,9 @@ pub const Proxy = struct {
             log.warn("failed to flush modified request data: {s}", .{@errorName(err)});
             return err;
         };
+
+        // Return actual bytes sent (may be larger than original if headers were added)
+        return modified_request.len;
     }
 
     const PipeJob = struct {
