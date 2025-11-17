@@ -28,6 +28,8 @@ const Backend = root.Backend;
 const LoadBalancer = root.LoadBalancer;
 const HTTPInspector = root.HTTPInspector;
 const HTTPCache = root.HTTPCache;
+const ProxyAuth = root.ProxyAuth;
+const AuthResult = root.AuthResult;
 
 // ============= Unit Tests =============
 
@@ -2102,4 +2104,99 @@ test "HTTPInspector: X-Forwarded-Proto with trailing whitespace trimmed" {
     try testing.expect(std.mem.indexOf(u8, modified, "proto=https") != null);
     // Should NOT contain trailing spaces
     try testing.expect(std.mem.indexOf(u8, modified, "proto=https  ") == null);
+}
+
+// ============= Proxy Authentication Tests =============
+
+test "Proxy authentication enable and configuration" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Enable proxy authentication
+    try proxy.enableProxyAuthentication("Test Realm", .{
+        .basic_enabled = true,
+        .digest_enabled = false,
+        .max_failed_attempts = 5,
+        .auth_timeout_ms = 30000,
+    });
+
+    try testing.expect(proxy.proxy_auth != null);
+    try testing.expectEqualStrings("Test Realm", proxy.proxy_auth.?.realm);
+}
+
+test "Proxy authentication user management" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Enable proxy authentication
+    try proxy.enableProxyAuthentication("Company Proxy", .{
+        .basic_enabled = true,
+        .digest_enabled = false,
+    });
+
+    // Add users
+    try proxy.addAuthUser("alice", "alicepass");
+    try proxy.addAuthUser("bob", "bobpass");
+
+    // Test authentication statistics
+    const stats = proxy.getAuthStats();
+    try testing.expect(stats != null);
+    try testing.expectEqual(@as(u64, 0), stats.?.total_auth_requests);
+}
+
+test "Proxy authentication with RunOptions" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    const options = RunOptions{
+        .enable_proxy_authentication = true,
+        .auth_realm = "Options Test",
+        .auth_basic_enabled = true,
+        .auth_digest_enabled = false,
+        .auth_max_failed_attempts = 3,
+        .auth_timeout_ms = 60000,
+    };
+
+    try testing.expect(options.enable_proxy_authentication);
+    try testing.expectEqualStrings("Options Test", options.auth_realm);
+    try testing.expect(options.auth_basic_enabled);
+    try testing.expect(!options.auth_digest_enabled);
+    try testing.expectEqual(@as(u32, 3), options.auth_max_failed_attempts);
+    try testing.expectEqual(@as(u32, 60000), options.auth_timeout_ms);
+}
+
+test "Proxy authentication integration with other features" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Enable multiple features including authentication
+    try proxy.enableAccessControl(.allow);
+    proxy.enableRateLimiting(10, 100);
+    try proxy.enableProxyAuthentication("Multi Feature", .{
+        .basic_enabled = true,
+        .digest_enabled = false,
+    });
+    proxy.enableCaching(1024 * 1024);
+
+    // All features should be enabled
+    try testing.expect(proxy.access_control != null);
+    try testing.expect(proxy.rate_limiter != null);
+    try testing.expect(proxy.proxy_auth != null);
+    try testing.expect(proxy.http_cache != null);
+
+    // Add authentication user
+    try proxy.addAuthUser("testuser", "testpass");
+
+    // Test that we can get stats from all features
+    const auth_stats = proxy.getAuthStats();
+    try testing.expect(auth_stats != null);
+    try testing.expectEqual(@as(u64, 0), auth_stats.?.total_auth_requests);
 }
