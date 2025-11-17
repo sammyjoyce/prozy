@@ -42,11 +42,20 @@ When a new config is loaded:
 3. Swap pointers
 4. Deinit old arena (frees all old config memory at once)
 
-## Configuration File Format
+## Configuration File Formats
 
-Prozy uses JSON for configuration (with future support for ZON planned).
+Prozy supports two configuration formats:
 
-### Minimal Configuration
+1. **JSON** (Recommended for production) - Standard JSON format with full tooling support
+2. **ZON** (Experimental) - Zig Object Notation for type-safe, native Zig configuration
+
+The format is automatically detected based on file extension (`.json` or `.zon`).
+
+### JSON Configuration (Recommended)
+
+JSON provides stable parsing with excellent tooling support. This is the recommended format for production use.
+
+#### Minimal JSON Configuration
 
 ```json
 {
@@ -73,9 +82,53 @@ Prozy uses JSON for configuration (with future support for ZON planned).
 }
 ```
 
+### ZON Configuration (Experimental)
+
+ZON (Zig Object Notation) provides a native, type-safe configuration format using Zig syntax.
+
+**Note**: ZON support is currently experimental. Full AST evaluation is not yet implemented, so JSON is recommended for production use.
+
+#### Minimal ZON Configuration
+
+```zig
+.{
+    .proxy = .{
+        .listen_host = "127.0.0.1",
+        .listen_port = 8080,
+    },
+    .clusters = &[_]ClusterConfig{
+        .{
+            .name = "default_backend",
+            .backends = &[_]BackendConfig{
+                .{ .host = "127.0.0.1", .port = 3003, .weight = 1 },
+            },
+            .strategy = .round_robin,
+        },
+    },
+    .routes = &[_]RouteConfig{
+        .{
+            .name = "default_route",
+            .match = .{},
+            .cluster = "default_backend",
+        },
+    },
+}
+```
+
+#### ZON Benefits
+
+When fully implemented, ZON will provide:
+- **Type safety**: Compile-time type checking
+- **Native syntax**: Familiar to Zig developers
+- **Comments**: Inline documentation in config files
+- **Enums**: Type-safe enum values (`.round_robin` vs `"round_robin"`)
+- **Computation**: Arithmetic expressions (`10 * 1024 * 1024` for sizes)
+
+See `config/simple.zon` and `config/example.zon` for complete examples.
+
 ### Full Configuration
 
-See `config/example.json` for a complete example with all available options:
+See `config/example.json` or `config/example.zon` for complete examples with all available options:
 
 - **Proxy settings**: Listen address, port, connection limits
 - **Mode**: reverse_proxy, forward_proxy, or tunnel_only

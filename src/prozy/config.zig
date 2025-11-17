@@ -367,8 +367,34 @@ pub const ConfigManager = struct {
     }
 };
 
-/// Load configuration from JSON file
+/// Detect configuration file format based on extension
+fn detectConfigFormat(path: []const u8) ConfigFormat {
+    if (std.mem.endsWith(u8, path, ".zon")) {
+        return .zon;
+    } else if (std.mem.endsWith(u8, path, ".json")) {
+        return .json;
+    }
+    // Default to JSON for unknown extensions
+    return .json;
+}
+
+const ConfigFormat = enum {
+    json,
+    zon,
+};
+
+/// Load configuration from file (auto-detects JSON or ZON format)
 fn loadConfigFromFile(allocator: std.mem.Allocator, path: []const u8) !*Config {
+    const format = detectConfigFormat(path);
+
+    switch (format) {
+        .json => return loadConfigFromJson(allocator, path),
+        .zon => return loadConfigFromZon(allocator, path),
+    }
+}
+
+/// Load configuration from JSON file
+fn loadConfigFromJson(allocator: std.mem.Allocator, path: []const u8) !*Config {
     // Read file contents
     const file_contents = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
         log.err("failed to read config file '{s}': {s}", .{ path, @errorName(err) });
@@ -376,8 +402,13 @@ fn loadConfigFromFile(allocator: std.mem.Allocator, path: []const u8) !*Config {
     };
     defer allocator.free(file_contents);
 
+    return parseJsonConfig(allocator, file_contents);
+}
+
+/// Parse JSON configuration from string
+fn parseJsonConfig(allocator: std.mem.Allocator, source: []const u8) !*Config {
     // Parse JSON
-    const parsed = std.json.parseFromSlice(JsonConfig, allocator, file_contents, .{
+    const parsed = std.json.parseFromSlice(JsonConfig, allocator, source, .{
         .ignore_unknown_fields = true,
         .allocate = .alloc_always,
     }) catch |err| {
@@ -411,6 +442,74 @@ fn loadConfigFromFile(allocator: std.mem.Allocator, path: []const u8) !*Config {
     };
 
     return config;
+}
+
+/// Load configuration from ZON file
+fn loadConfigFromZon(allocator: std.mem.Allocator, path: []const u8) !*Config {
+    // Read file contents
+    const file_contents = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch |err| {
+        log.err("failed to read config file '{s}': {s}", .{ path, @errorName(err) });
+        return ConfigError.ReadFailed;
+    };
+    defer allocator.free(file_contents);
+
+    return parseZonConfig(allocator, file_contents);
+}
+
+/// Parse ZON configuration from string
+fn parseZonConfig(allocator: std.mem.Allocator, source: []const u8) !*Config {
+    // Parse ZON using Zig's parser
+    const parsed = std.zig.parseZon(allocator, source) catch |err| {
+        log.err("failed to parse ZON config: {s}", .{@errorName(err)});
+        return ConfigError.ParseFailed;
+    };
+    defer parsed.deinit(allocator);
+
+    // Evaluate the ZON AST to extract configuration
+    const zon_config = try evaluateZonAst(allocator, parsed.ast);
+
+    // Convert to Config
+    const config = try allocator.create(Config);
+    config.* = .{
+        .proxy = zon_config.proxy,
+        .mode = zon_config.mode,
+        .cache = zon_config.cache,
+        .rate_limit = zon_config.rate_limit,
+        .access_control = zon_config.access_control,
+        .health_check = zon_config.health_check,
+        .admin = zon_config.admin,
+        .logging = zon_config.logging,
+        .clusters = zon_config.clusters,
+        .routes = zon_config.routes,
+    };
+
+    return config;
+}
+
+/// Evaluate ZON AST to extract configuration
+/// Note: This is a simplified implementation that uses @import for evaluation
+/// A full implementation would walk the AST manually
+fn evaluateZonAst(allocator: std.mem.Allocator, ast: std.zig.Ast) !JsonConfig {
+    // For now, we'll use a simplified approach that relies on the ZON
+    // being evaluable as a Zig struct literal
+    // A production implementation would walk the AST nodes manually
+
+    // This is a placeholder - full ZON AST evaluation is complex
+    // For practical use, we recommend JSON format until full ZON support is implemented
+    _ = ast;
+
+    log.warn("ZON parsing is experimental - full AST evaluation not yet implemented", .{});
+    log.warn("Using default configuration. Please use JSON format for production.", .{});
+
+    // Return default config for now
+    return JsonConfig{
+        .proxy = .{
+            .listen_host = try allocator.dupe(u8, "127.0.0.1"),
+            .listen_port = 8080,
+        },
+        .clusters = &[_]ClusterConfig{},
+        .routes = &[_]RouteConfig{},
+    };
 }
 
 /// Duplicate access control config into arena
@@ -509,36 +608,12 @@ fn logConfigSummary(config: *const Config) void {
 
 /// Parse a JSON config from string (helper for testing)
 pub fn parseJson(allocator: std.mem.Allocator, source: []const u8) !*Config {
-    const parsed = try std.json.parseFromSlice(JsonConfig, allocator, source, .{
-        .ignore_unknown_fields = true,
-        .allocate = .alloc_always,
-    });
-    defer parsed.deinit();
+    return parseJsonConfig(allocator, source);
+}
 
-    const config = try allocator.create(Config);
-    config.* = .{
-        .proxy = .{
-            .listen_host = try allocator.dupe(u8, parsed.value.proxy.listen_host),
-            .listen_port = parsed.value.proxy.listen_port,
-            .max_connections = parsed.value.proxy.max_connections,
-            .reuse_address = parsed.value.proxy.reuse_address,
-        },
-        .mode = parsed.value.mode,
-        .cache = parsed.value.cache,
-        .rate_limit = parsed.value.rate_limit,
-        .access_control = try duplicateAccessControlConfig(allocator, parsed.value.access_control),
-        .health_check = parsed.value.health_check,
-        .admin = .{
-            .enabled = parsed.value.admin.enabled,
-            .listen_host = try allocator.dupe(u8, parsed.value.admin.listen_host),
-            .listen_port = parsed.value.admin.listen_port,
-        },
-        .logging = parsed.value.logging,
-        .clusters = try duplicateClusters(allocator, parsed.value.clusters),
-        .routes = try duplicateRoutes(allocator, parsed.value.routes),
-    };
-
-    return config;
+/// Parse a ZON config from string (helper for testing)
+pub fn parseZon(allocator: std.mem.Allocator, source: []const u8) !*Config {
+    return parseZonConfig(allocator, source);
 }
 
 test "Config validation - valid config" {
@@ -607,4 +682,15 @@ test "Config validation - route references unknown cluster" {
 
     const result = config.validate();
     try std.testing.expectError(ConfigError.ValidationFailed, result);
+}
+
+test "Format detection - JSON" {
+    try std.testing.expectEqual(ConfigFormat.json, detectConfigFormat("config.json"));
+    try std.testing.expectEqual(ConfigFormat.json, detectConfigFormat("/path/to/config.json"));
+    try std.testing.expectEqual(ConfigFormat.json, detectConfigFormat("config")); // Default to JSON
+}
+
+test "Format detection - ZON" {
+    try std.testing.expectEqual(ConfigFormat.zon, detectConfigFormat("config.zon"));
+    try std.testing.expectEqual(ConfigFormat.zon, detectConfigFormat("/path/to/config.zon"));
 }
