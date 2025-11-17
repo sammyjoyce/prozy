@@ -616,10 +616,10 @@ pub const Proxy = struct {
 
                     // Send error response
                     const error_response = switch (err) {
-                        error.NoRoute => "HTTP/1.1 404 Not Found\r\nContent-Length: 13\r\n\r\nNo route found",
-                        error.NoHealthyBackend => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 21\r\n\r\nNo healthy backends",
-                        error.ClusterAtCapacity => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\n\r\nCluster at capacity",
-                        else => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 14\r\n\r\nRouting error",
+                        error.NoRoute => "HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\n\r\nNo route found",
+                        error.NoHealthyBackend => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nNo healthy backends",
+                        error.ClusterAtCapacity => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nCluster at capacity",
+                        else => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\nRouting error",
                     };
 
                     var error_write_buf: [4096]u8 = undefined;

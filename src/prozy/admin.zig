@@ -137,7 +137,7 @@ pub const AdminServer = struct {
         const response =
             \\HTTP/1.1 200 OK
             \\Content-Type: application/json
-            \\Content-Length: 17
+            \\Content-Length: 15
             \\
             \\{"status":"ok"}
             \\
@@ -247,7 +247,7 @@ pub const AdminServer = struct {
             const response =
                 \\HTTP/1.1 200 OK
                 \\Content-Type: application/json
-                \\Content-Length: 20
+                \\Content-Length: 17
                 \\
                 \\{"backends":null}
                 \\
@@ -299,7 +299,7 @@ pub const AdminServer = struct {
             const response =
                 \\HTTP/1.1 200 OK
                 \\Content-Type: application/json
-                \\Content-Length: 17
+                \\Content-Length: 15
                 \\
                 \\{"routes":null}
                 \\
