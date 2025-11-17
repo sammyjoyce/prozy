@@ -1743,3 +1743,188 @@ test "Proxy API hierarchy demonstration" {
     // 3. Convenience wrapper - creates Io internally, default options
     try proxy.run();
 }
+
+// ==================== Header Manipulation Tests ====================
+
+test "HTTPInspector: manipulate headers - add RFC 7239 Forwarded header" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request =
+        \\GET /api/users HTTP/1.1
+        \\Host: example.com
+        \\User-Agent: TestClient/1.0
+        \\
+        \\
+    ;
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http";
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should contain RFC 7239 Forwarded header
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=192.168.1.100;host=example.com;proto=http") != null);
+
+    // Should contain X-Forwarded-* headers for compatibility
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-For: 192.168.1.100") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Proto: http") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Host: example.com") != null);
+
+    // Should contain Via header
+    try testing.expect(std.mem.indexOf(u8, modified, "Via: 1.1 Prozy/1.0") != null);
+
+    // Should contain Connection: close
+    try testing.expect(std.mem.indexOf(u8, modified, "Connection: close") != null);
+}
+
+test "HTTPInspector: manipulate headers - detect upstream X-Forwarded-Proto" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request =
+        \\GET /api/secure HTTP/1.1
+        \\Host: example.com
+        \\X-Forwarded-Proto: https
+        \\User-Agent: TestClient/1.0
+        \\
+        \\
+    ;
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http"; // Direct connection is HTTP
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should preserve the upstream X-Forwarded-Proto: https (TLS terminator upstream)
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Proto: https") != null);
+
+    // RFC 7239 Forwarded header should use "https" from upstream
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=192.168.1.100;host=example.com;proto=https") != null);
+}
+
+test "HTTPInspector: manipulate headers - Connection: close always added" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request =
+        \\GET /api/users HTTP/1.1
+        \\Host: example.com
+        \\Connection: keep-alive
+        \\
+        \\
+    ;
+
+    const client_ip = "10.0.0.50";
+    const client_proto = "http";
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should replace Connection: keep-alive with Connection: close
+    try testing.expect(std.mem.indexOf(u8, modified, "Connection: close") != null);
+
+    // Should NOT contain keep-alive (hop-by-hop header removed)
+    try testing.expect(std.mem.indexOf(u8, modified, "keep-alive") == null);
+}
+
+test "HTTPInspector: manipulate headers - preserve existing Forwarded header" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request =
+        \\GET /api/users HTTP/1.1
+        \\Host: example.com
+        \\Forwarded: for=10.1.1.1;proto=https
+        \\
+        \\
+    ;
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http";
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should preserve the existing Forwarded header from upstream
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=10.1.1.1;proto=https") != null);
+
+    // Count occurrences - should only be one Forwarded header
+    var count: usize = 0;
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, modified, search_start, "Forwarded:")) |pos| {
+        count += 1;
+        search_start = pos + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "HTTPInspector: manipulate headers - without host header" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request =
+        \\GET /api/users HTTP/1.1
+        \\User-Agent: TestClient/1.0
+        \\
+        \\
+    ;
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http";
+    const host_header: ?[]const u8 = null;
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Forwarded header should not include host parameter
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=192.168.1.100;proto=http") != null);
+
+    // Should NOT contain X-Forwarded-Host when host_header is null
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Host:") == null);
+
+    // Should still contain other headers
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-For: 192.168.1.100") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "Connection: close") != null);
+}
