@@ -164,6 +164,16 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(test_time);
 
+    const hash_password = b.addExecutable(.{
+        .name = "hash_password",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/hash_password.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    b.installArtifact(hash_password);
+
     const full_features_demo = b.addExecutable(.{
         .name = "full_features_demo",
         .root_module = b.createModule(.{
@@ -355,6 +365,23 @@ pub fn build(b: *std.Build) void {
     // these invocations when one fails (or you pass a flag to increase
     // verbosity) to validate assumptions and diagnose problems.
     //
+    // Check step for ZLS build-on-save functionality
+    // This step performs compilation without linking to quickly catch syntax errors
+    const check_step = b.step("check", "Check if the project compiles (used by ZLS build-on-save)");
+
+    // Check the main module
+    const check_mod = b.addTest(.{
+        .root_module = mod,
+    });
+    check_step.dependOn(&check_mod.step);
+
+    // Check the main executable
+    const check_exe = b.addExecutable(.{
+        .name = "prozy_check",
+        .root_module = exe.root_module,
+    });
+    check_step.dependOn(&check_exe.step);
+
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
 }
