@@ -1,0 +1,99 @@
+//! Simple ZON configuration for Prozy
+//!
+//! This file demonstrates Prozy configuration using ZON (Zig Object Notation).
+//! ZON provides a more native, type-safe configuration format for Zig applications.
+//!
+//! Note: Full ZON evaluation support is experimental. For production use,
+//! JSON format is recommended until ZON AST evaluation is fully implemented.
+
+.{
+    .proxy = .{
+        .listen_host = "127.0.0.1",
+        .listen_port = 8080,
+        .max_connections = null,
+        .reuse_address = true,
+    },
+
+    .mode = .reverse_proxy,
+
+    .cache = .{
+        .enabled = true,
+        .max_size = 10 * 1024 * 1024, // 10MB
+    },
+
+    .rate_limit = .{
+        .enabled = false,
+        .max_per_ip = 100,
+        .max_global = 10000,
+    },
+
+    .access_control = .{
+        .enabled = false,
+        .default_policy = .allow,
+        .allow_list = &[_][]const u8{},
+        .deny_list = &[_][]const u8{},
+    },
+
+    .health_check = .{
+        .enabled = true,
+        .interval_seconds = 10,
+        .timeout_ms = 5000,
+        .unhealthy_threshold = 3,
+        .healthy_threshold = 2,
+    },
+
+    .admin = .{
+        .enabled = false,
+        .listen_host = "127.0.0.1",
+        .listen_port = 9090,
+    },
+
+    .logging = .{
+        .level = .info,
+        .enable_connection_logging = true,
+        .enable_stats = true,
+    },
+
+    .clusters = &[_]ClusterConfig{
+        .{
+            .name = "default_backend",
+            .backends = &[_]BackendConfig{
+                .{
+                    .host = "127.0.0.1",
+                    .port = 3003,
+                    .weight = 1,
+                },
+            },
+            .strategy = .round_robin,
+            .max_concurrent = 1000,
+        },
+    },
+
+    .routes = &[_]RouteConfig{
+        .{
+            .name = "default_route",
+            .match = .{
+                .host = null,
+                .path_prefix = null,
+                .methods = &[_][]const u8{},
+            },
+            .cluster = "default_backend",
+            .cache_policy = .{
+                .allow = true,
+                .ttl_seconds = 300,
+                .max_size = 1024 * 1024,
+            },
+            .timeout_policy = .{
+                .connect_timeout_ms = 5000,
+                .request_timeout_ms = 30000,
+                .response_timeout_ms = 60000,
+                .idle_timeout_seconds = 30,
+            },
+            .concurrency_policy = .{
+                .max_concurrent = 1000,
+                .max_queue_depth = 100,
+                .reject_when_full = false,
+            },
+        },
+    },
+}

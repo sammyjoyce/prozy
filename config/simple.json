@@ -1,0 +1,32 @@
+{
+  "proxy": {
+    "listen_host": "127.0.0.1",
+    "listen_port": 8080
+  },
+  "mode": "reverse_proxy",
+  "cache": {
+    "enabled": true,
+    "max_size": 10485760
+  },
+  "clusters": [
+    {
+      "name": "default_backend",
+      "backends": [
+        {
+          "host": "127.0.0.1",
+          "port": 3003,
+          "weight": 1
+        }
+      ],
+      "strategy": "round_robin",
+      "max_concurrent": 1000
+    }
+  ],
+  "routes": [
+    {
+      "name": "default_route",
+      "match": {},
+      "cluster": "default_backend"
+    }
+  ]
+}

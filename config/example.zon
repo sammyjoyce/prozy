@@ -1,0 +1,240 @@
+//! Full-featured ZON configuration for Prozy
+//!
+//! This file demonstrates all available configuration options using ZON format.
+//! ZON (Zig Object Notation) provides type safety and native Zig syntax.
+//!
+//! Note: Full ZON evaluation support is experimental. For production use,
+//! JSON format is recommended until ZON AST evaluation is fully implemented.
+
+.{
+    // Core proxy settings
+    .proxy = .{
+        .listen_host = "0.0.0.0",
+        .listen_port = 8080,
+        .max_connections = 10000,
+        .reuse_address = true,
+    },
+
+    // Operating mode: reverse_proxy, forward_proxy, or tunnel_only
+    .mode = .reverse_proxy,
+
+    // HTTP response caching configuration
+    .cache = .{
+        .enabled = true,
+        .max_size = 100 * 1024 * 1024, // 100MB
+    },
+
+    // Rate limiting configuration
+    .rate_limit = .{
+        .enabled = true,
+        .max_per_ip = 100, // Connections per IP
+        .max_global = 10000, // Total concurrent connections
+    },
+
+    // IP-based access control
+    .access_control = .{
+        .enabled = false,
+        .default_policy = .allow,
+        .allow_list = &[_][]const u8{
+            "10.0.0.0/8",
+            "192.168.0.0/16",
+        },
+        .deny_list = &[_][]const u8{
+            "192.168.1.100",
+        },
+    },
+
+    // Backend health check configuration
+    .health_check = .{
+        .enabled = true,
+        .interval_seconds = 10,
+        .timeout_ms = 5000,
+        .unhealthy_threshold = 3,
+        .healthy_threshold = 2,
+    },
+
+    // Admin server for management API
+    .admin = .{
+        .enabled = true,
+        .listen_host = "127.0.0.1",
+        .listen_port = 9090,
+    },
+
+    // Logging configuration
+    .logging = .{
+        .level = .info,
+        .enable_connection_logging = true,
+        .enable_stats = true,
+    },
+
+    // Backend clusters with load balancing
+    .clusters = &[_]ClusterConfig{
+        // API backend cluster
+        .{
+            .name = "api_backend",
+            .backends = &[_]BackendConfig{
+                .{
+                    .host = "10.0.1.10",
+                    .port = 8080,
+                    .weight = 5,
+                },
+                .{
+                    .host = "10.0.1.11",
+                    .port = 8080,
+                    .weight = 3,
+                },
+                .{
+                    .host = "10.0.1.12",
+                    .port = 8080,
+                    .weight = 2,
+                },
+            },
+            .strategy = .weighted_round_robin,
+            .max_concurrent = 1000,
+        },
+
+        // Static content backend cluster
+        .{
+            .name = "static_backend",
+            .backends = &[_]BackendConfig{
+                .{
+                    .host = "10.0.2.10",
+                    .port = 80,
+                    .weight = 1,
+                },
+                .{
+                    .host = "10.0.2.11",
+                    .port = 80,
+                    .weight = 1,
+                },
+            },
+            .strategy = .round_robin,
+            .max_concurrent = 500,
+        },
+
+        // WebSocket backend cluster
+        .{
+            .name = "websocket_backend",
+            .backends = &[_]BackendConfig{
+                .{
+                    .host = "10.0.3.10",
+                    .port = 8080,
+                    .weight = 1,
+                },
+            },
+            .strategy = .ip_hash, // Session affinity for WebSockets
+            .max_concurrent = 2000,
+        },
+    },
+
+    // Routing rules
+    .routes = &[_]RouteConfig{
+        // API routes with aggressive caching
+        .{
+            .name = "api_route",
+            .match = .{
+                .host = "api.example.com",
+                .path_prefix = "/v1/",
+                .methods = &[_][]const u8{ "GET", "POST", "PUT", "DELETE" },
+            },
+            .cluster = "api_backend",
+            .cache_policy = .{
+                .allow = true,
+                .ttl_seconds = 300, // 5 minutes
+                .max_size = 1024 * 1024, // 1MB
+            },
+            .timeout_policy = .{
+                .connect_timeout_ms = 5000,
+                .request_timeout_ms = 30000,
+                .response_timeout_ms = 60000,
+                .idle_timeout_seconds = 30,
+            },
+            .concurrency_policy = .{
+                .max_concurrent = 1000,
+                .max_queue_depth = 100,
+                .reject_when_full = false,
+            },
+        },
+
+        // Static content with long caching
+        .{
+            .name = "static_route",
+            .match = .{
+                .host = "static.example.com",
+                .path_prefix = "/assets/",
+                .methods = &[_][]const u8{"GET"},
+            },
+            .cluster = "static_backend",
+            .cache_policy = .{
+                .allow = true,
+                .ttl_seconds = 3600, // 1 hour
+                .max_size = 5 * 1024 * 1024, // 5MB
+            },
+            .timeout_policy = .{
+                .connect_timeout_ms = 3000,
+                .request_timeout_ms = 10000,
+                .response_timeout_ms = 30000,
+                .idle_timeout_seconds = 60,
+            },
+            .concurrency_policy = .{
+                .max_concurrent = 500,
+                .max_queue_depth = 50,
+                .reject_when_full = true,
+            },
+        },
+
+        // WebSocket routes (no caching)
+        .{
+            .name = "websocket_route",
+            .match = .{
+                .host = "ws.example.com",
+                .path_prefix = "/ws/",
+                .methods = &[_][]const u8{ "GET", "POST" },
+            },
+            .cluster = "websocket_backend",
+            .cache_policy = .{
+                .allow = false, // No caching for WebSockets
+                .ttl_seconds = 0,
+                .max_size = 0,
+            },
+            .timeout_policy = .{
+                .connect_timeout_ms = 5000,
+                .request_timeout_ms = 60000,
+                .response_timeout_ms = 0, // No timeout for long-lived connections
+                .idle_timeout_seconds = 300, // 5 minutes idle
+            },
+            .concurrency_policy = .{
+                .max_concurrent = 2000,
+                .max_queue_depth = 200,
+                .reject_when_full = false,
+            },
+        },
+
+        // Catch-all default route
+        .{
+            .name = "default_route",
+            .match = .{
+                .host = null, // Match any host
+                .path_prefix = null, // Match any path
+                .methods = &[_][]const u8{}, // Match any method
+            },
+            .cluster = "api_backend",
+            .cache_policy = .{
+                .allow = false,
+                .ttl_seconds = 0,
+                .max_size = 0,
+            },
+            .timeout_policy = .{
+                .connect_timeout_ms = 5000,
+                .request_timeout_ms = 30000,
+                .response_timeout_ms = 60000,
+                .idle_timeout_seconds = 30,
+            },
+            .concurrency_policy = .{
+                .max_concurrent = 1000,
+                .max_queue_depth = 100,
+                .reject_when_full = false,
+            },
+        },
+    },
+}

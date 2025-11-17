@@ -650,6 +650,8 @@ Recent fixes addressed critical architectural issues identified during PR review
 
 6. **Fixed Host header security issue**: Eliminated "default" fallback for missing Host headers to prevent cache pollution across different virtual hosts/APIs. Requests without Host headers now bypass caching entirely while still being forwarded to backends, with warning logs to identify misconfigured clients.
 
+7. **Implemented memory-safe configuration hot reload**: Fixed critical use-after-free bug in ConfigManager by implementing lease-based memory management with deferred cleanup. The ConfigLease pattern uses atomic reference counting to track active readers, ensuring old configurations remain valid until all readers finish. Retired arenas are queued and only freed when `active_readers` drops to zero, preventing premature memory reclamation during hot reloads.
+
 These improvements demonstrate our commitment to addressing feedback proactively and maintaining code quality throughout development.
 
 ## Safety

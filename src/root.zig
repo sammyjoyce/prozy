@@ -110,6 +110,16 @@ pub const AdminServer = admin.AdminServer;
 const health = @import("prozy/health.zig");
 pub const HealthChecker = health.HealthChecker;
 
+// Configuration hot reload
+const config = @import("prozy/config.zig");
+pub const Config = config.Config;
+pub const ConfigManager = config.ConfigManager;
+pub const ConfigLease = config.ConfigManager.ConfigLease;
+pub const ProxyConfig = config.ProxyConfig;
+pub const BackendConfig = config.BackendConfig;
+pub const ClusterConfig = config.ClusterConfig;
+pub const RouteConfig = config.RouteConfig;
+
 // Proxy core
 const proxy = @import("prozy/proxy.zig");
 pub const RunOptions = proxy.RunOptions;
