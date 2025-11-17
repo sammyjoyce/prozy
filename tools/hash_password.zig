@@ -90,8 +90,7 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        const stderr = std.io.getStdErr().writer();
-        try stderr.writeAll(
+        std.debug.print(
             \\Usage: hash_password <password> [cost]
             \\
             \\Arguments:
@@ -108,7 +107,7 @@ pub fn main() !void {
             \\  12 = ~250ms per hash (recommended, good balance)
             \\  15 = ~2s per hash (very secure, but slow)
             \\
-        );
+        , .{});
         std.process.exit(1);
     }
 
@@ -120,41 +119,39 @@ pub fn main() !void {
 
     // Validate cost range
     if (cost < 4 or cost > 31) {
-        const stderr = std.io.getStdErr().writer();
-        try stderr.print("Error: cost must be between 4 and 31 (got: {d})\n", .{cost});
+        std.debug.print("Error: cost must be between 4 and 31 (got: {d})\n", .{cost});
         std.process.exit(1);
     }
 
-    const stdout = std.io.getStdOut().writer();
-    try stdout.print("Hashing password with cost={d}...\n", .{cost});
+    std.debug.print("Hashing password with cost={d}...\n", .{cost});
 
     // Measure hashing time
-    const start_time = std.time.milliTimestamp();
+    const start_time = std.time.Instant.now() catch null;
     const hash = try hashPassword(allocator, password, cost);
     defer allocator.free(hash);
-    const end_time = std.time.milliTimestamp();
+    const end_time = std.time.Instant.now() catch null;
 
-    const duration_ms = end_time - start_time;
+    const duration_ms = if (start_time) |st| if (end_time) |et| et.since(st) / std.time.ns_per_ms else 0 else 0;
 
-    try stdout.print("\nPassword hash generated in {d}ms:\n", .{duration_ms});
-    try stdout.print("{s}\n\n", .{hash});
+    std.debug.print("\nPassword hash generated in {d}ms:\n", .{duration_ms});
+    std.debug.print("{s}\n\n", .{hash});
 
-    try stdout.writeAll("Add this to your Prozy configuration:\n\n");
-    try stdout.writeAll("JSON format:\n");
-    try stdout.writeAll("  {\n");
-    try stdout.writeAll("    \"authentication\": {\n");
-    try stdout.writeAll("      \"users\": [\n");
-    try stdout.print("        {{ \"username\": \"admin\", \"password_hash\": \"{s}\" }}\n", .{hash});
-    try stdout.writeAll("      ]\n");
-    try stdout.writeAll("    }\n");
-    try stdout.writeAll("  }\n\n");
+    std.debug.print("Add this to your Prozy configuration:\n\n", .{});
+    std.debug.print("JSON format:\n", .{});
+    std.debug.print("  {{\n", .{});
+    std.debug.print("    \"authentication\": {{\n", .{});
+    std.debug.print("      \"users\": [\n", .{});
+    std.debug.print("        {{ \"username\": \"admin\", \"password_hash\": \"{s}\" }}\n", .{hash});
+    std.debug.print("      ]\n", .{});
+    std.debug.print("    }}\n", .{});
+    std.debug.print("  }}\n\n", .{});
 
-    try stdout.writeAll("ZON format:\n");
-    try stdout.writeAll("  .{\n");
-    try stdout.writeAll("    .authentication = .{\n");
-    try stdout.writeAll("      .users = &[_].{\n");
-    try stdout.print("        .{{ .username = \"admin\", .password_hash = \"{s}\" }},\n", .{hash});
-    try stdout.writeAll("      },\n");
-    try stdout.writeAll("    },\n");
-    try stdout.writeAll("  }\n");
+    std.debug.print("ZON format:\n", .{});
+    std.debug.print("  .{{\n", .{});
+    std.debug.print("    .authentication = .{{\n", .{});
+    std.debug.print("      .users = &[_].{{\n", .{});
+    std.debug.print("        .{{ .username = \"admin\", .password_hash = \"{s}\" }},\n", .{hash});
+    std.debug.print("      }},\n", .{});
+    std.debug.print("    }},\n", .{});
+    std.debug.print("  }}\n", .{});
 }

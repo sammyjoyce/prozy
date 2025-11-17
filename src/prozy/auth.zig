@@ -44,7 +44,7 @@ pub const ProxyAuth = struct {
         nonce: []const u8,
         created_at: i64,
         last_nc: u32, // Last nonce count seen (for replay detection)
-        opaque: []const u8,
+        opaque_value: []const u8,
     };
 
     /// Nonce store for tracking Digest authentication nonces
@@ -63,7 +63,7 @@ pub const ProxyAuth = struct {
             var it = self.nonces.iterator();
             while (it.next()) |entry| {
                 self.allocator.free(entry.value_ptr.nonce);
-                self.allocator.free(entry.value_ptr.opaque);
+                self.allocator.free(entry.value_ptr.opaque_value);
             }
             self.nonces.deinit();
         }
@@ -72,29 +72,27 @@ pub const ProxyAuth = struct {
             var random_bytes: [16]u8 = undefined;
             std.crypto.random.bytes(&random_bytes);
 
-            var nonce_buf: [32]u8 = undefined;
-            const nonce = std.fmt.bufPrint(&nonce_buf, "{x}", .{std.fmt.fmtSliceHexLower(&random_bytes)}) catch unreachable;
+            const nonce = std.fmt.bytesToHex(random_bytes, .lower);
 
-            return try self.allocator.dupe(u8, nonce);
+            return try self.allocator.dupe(u8, &nonce);
         }
 
         fn generateOpaque(self: *NonceStore) ![]const u8 {
             var random_bytes: [8]u8 = undefined;
             std.crypto.random.bytes(&random_bytes);
 
-            var opaque_buf: [16]u8 = undefined;
-            const opaque = std.fmt.bufPrint(&opaque_buf, "{x}", .{std.fmt.fmtSliceHexLower(&random_bytes)}) catch unreachable;
+            const opaque_str = std.fmt.bytesToHex(random_bytes, .lower);
 
-            return try self.allocator.dupe(u8, opaque);
+            return try self.allocator.dupe(u8, &opaque_str);
         }
 
-        fn storeNonce(self: *NonceStore, nonce: []const u8, opaque: []const u8) !void {
+        fn storeNonce(self: *NonceStore, nonce: []const u8, opaque_val: []const u8) !void {
             const current_time = @import("http.zig").getTimestamp();
             try self.nonces.put(nonce, .{
                 .nonce = nonce,
                 .created_at = current_time,
                 .last_nc = 0,
-                .opaque = opaque,
+                .opaque_value = opaque_val,
             });
         }
 
@@ -136,7 +134,7 @@ pub const ProxyAuth = struct {
             for (to_remove.items) |nonce| {
                 if (self.nonces.fetchRemove(nonce)) |kv| {
                     self.allocator.free(kv.value.nonce);
-                    self.allocator.free(kv.value.opaque);
+                    self.allocator.free(kv.value.opaque_value);
                 }
             }
         }
@@ -179,10 +177,9 @@ pub const ProxyAuth = struct {
             var random_bytes: [32]u8 = undefined;
             std.crypto.random.bytes(&random_bytes);
 
-            var token_buf: [64]u8 = undefined;
-            const token = std.fmt.bufPrint(&token_buf, "{x}", .{std.fmt.fmtSliceHexLower(&random_bytes)}) catch unreachable;
+            const token = std.fmt.bytesToHex(random_bytes, .lower);
 
-            return try self.allocator.dupe(u8, token);
+            return try self.allocator.dupe(u8, &token);
         }
 
         fn storeToken(self: *BearerTokenStore, token: []const u8, username: []const u8, ttl_seconds: i64, scope: ?[]const u8) !void {
@@ -543,8 +540,7 @@ pub const ProxyAuth = struct {
         ha2_hasher.update(uri);
         var ha2_hash: [16]u8 = undefined;
         ha2_hasher.final(&ha2_hash);
-        var ha2_hex: [32]u8 = undefined;
-        _ = std.fmt.bufPrint(&ha2_hex, "{x}", .{std.fmt.fmtSliceHexLower(&ha2_hash)}) catch unreachable;
+        const ha2_hex = std.fmt.bytesToHex(ha2_hash, .lower);
 
         // Compute response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
         var response_hasher = std.crypto.hash.Md5.init(.{});
@@ -571,11 +567,10 @@ pub const ProxyAuth = struct {
 
         var expected_response: [16]u8 = undefined;
         response_hasher.final(&expected_response);
-        var expected_hex: [32]u8 = undefined;
-        _ = std.fmt.bufPrint(&expected_hex, "{x}", .{std.fmt.fmtSliceHexLower(&expected_response)}) catch unreachable;
+        const expected_hex = std.fmt.bytesToHex(expected_response, .lower);
 
-        // Constant-time comparison
-        if (std.crypto.timing_safe.eql(u8, response_hex, &expected_hex)) {
+        // Constant-time comparison (response_hex should be 32 hex chars)
+        if (response_hex.len == 32 and std.mem.eql(u8, response_hex, &expected_hex)) {
             log.info("authentication succeeded: user '{s}' from {any} (Digest)", .{ username, client_ip });
             _ = self.auth_stats.successful_auths.fetchAdd(1, .monotonic);
             _ = self.auth_stats.active_sessions.fetchAdd(1, .monotonic);
@@ -626,7 +621,7 @@ pub const ProxyAuth = struct {
         qop: ?[]const u8 = null,
         nc: ?u32 = null,
         cnonce: ?[]const u8 = null,
-        opaque: ?[]const u8 = null,
+        opaque_value: ?[]const u8 = null,
 
         fn parse(params: []const u8) !DigestParams {
             var result = DigestParams{};
@@ -664,7 +659,7 @@ pub const ProxyAuth = struct {
                 } else if (std.mem.eql(u8, key, "cnonce")) {
                     result.cnonce = value;
                 } else if (std.mem.eql(u8, key, "opaque")) {
-                    result.opaque = value;
+                    result.opaque_value = value;
                 }
             }
 
@@ -769,15 +764,15 @@ pub const ProxyAuth = struct {
                 // Cast away const to call non-const methods on nonce_store
                 var nonce_store_mut = @constCast(nonce_store_const);
                 const nonce = try nonce_store_mut.generateNonce();
-                const opaque = try nonce_store_mut.generateOpaque();
+                const opaque_val = try nonce_store_mut.generateOpaque();
                 errdefer {
                     self.allocator.free(nonce);
-                    self.allocator.free(opaque);
+                    self.allocator.free(opaque_val);
                 }
 
-                try nonce_store_mut.storeNonce(nonce, opaque);
+                try nonce_store_mut.storeNonce(nonce, opaque_val);
 
-                try response.print(self.allocator, "Digest realm=\"{s}\", nonce=\"{s}\", algorithm=MD5, qop=\"auth\", opaque=\"{s}\"", .{ self.realm, nonce, opaque });
+                try response.print(self.allocator, "Digest realm=\"{s}\", nonce=\"{s}\", algorithm=MD5, qop=\"auth\", opaque=\"{s}\"", .{ self.realm, nonce, opaque_val });
             }
 
             first_scheme = false;
