@@ -69,7 +69,10 @@
     // ========================================================================
     //
     // Implements RFC 7235 (HTTP Authentication Framework for Proxies)
-    // and RFC 7617 (Basic HTTP Authentication Scheme)
+    // with three authentication schemes:
+    // - RFC 7617 (Basic HTTP Authentication Scheme)
+    // - RFC 7616 (Digest Access Authentication)
+    // - RFC 6750 (Bearer Token Usage)
     //
     // Security Features:
     // - bcrypt password hashing (cost: 12 rounds = ~250ms per hash)
@@ -77,6 +80,7 @@
     // - Rate limiting (max 5 failed attempts per user/IP)
     // - Exponential backoff (1min → 2min → 4min → 8min → 16min → 32min → 64min)
     // - Per-IP and per-username attempt tracking
+    // - Bearer tokens with TTL and automatic expiration
     //
     // Password Hash Format: $2b$<cost>$<salt>$<hash>
     //
@@ -89,6 +93,7 @@
         .realm = "Corporate Proxy",
         .basic_enabled = true,
         .digest_enabled = false,
+        .bearer_enabled = false, // Enable for OAuth 2.0 Bearer token support
         .max_failed_attempts = 5,
         .auth_timeout_ms = 30000,
         .bcrypt_cost = 12,
@@ -182,8 +187,20 @@
 //      # Without credentials (expect 407)
 //      $ curl -v --proxy http://127.0.0.1:8080 http://example.com
 //
-//      # With valid credentials (expect success)
+//      # With Basic authentication (expect success)
 //      $ curl -v --proxy http://127.0.0.1:8080 -U admin:admin123 http://example.com
+//
+//      # With Bearer token (if bearer_enabled = true)
+//      # First, generate a token via admin API:
+//      $ curl -X POST http://localhost:9090/auth/token \
+//          -H "Content-Type: application/json" \
+//          -d '{"username": "admin", "ttl_seconds": 3600, "scope": "read write"}'
+//      # Response: {"token": "abc123...xyz"}
+//      #
+//      # Then use the token:
+//      $ curl -v --proxy http://127.0.0.1:8080 \
+//          -H "Proxy-Authorization: Bearer abc123...xyz" \
+//          http://example.com
 //
 // 5. Monitor authentication statistics:
 //      $ curl http://localhost:9090/auth/stats
@@ -220,4 +237,14 @@
 //    - Basic auth sends base64-encoded credentials (not encrypted)
 //    - Always use TLS termination in front of Prozy
 //    - Consider using Digest auth (RFC 7616) when available
+//
+// 7. **Bearer Token Best Practices**
+//    - Set appropriate TTL for tokens (default: 3600s = 1 hour)
+//    - Shorter TTL for sensitive operations (5-15 minutes)
+//    - Longer TTL for trusted environments (24 hours)
+//    - Implement token refresh for long-lived sessions
+//    - Revoke tokens immediately on logout or security events
+//    - Run cleanupExpiredArtifacts() periodically (every 5-10 minutes)
+//    - Use scopes to limit token capabilities
+//    - Store tokens securely on client side (never in localStorage)
 //

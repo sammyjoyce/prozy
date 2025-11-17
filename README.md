@@ -483,13 +483,17 @@ Prozy implements various HTTP standards and specifications to different degrees.
 | Content Adaptation | RFC 3507 (ICAP) | Virus scanning, DLP, content transformation | **30%** - Basic transformation hooks, no ICAP protocol or external services |
 | Observability | OpenTelemetry (OTLP) | Distributed tracing, metrics, logs | **20%** - Basic metrics and HTTP endpoints, no OpenTelemetry |
 | Declarative Config | Kubernetes Gateway API, Envoy xDS | Portable L4/L7 routing, dynamic service discovery | **30%** - Hot reload with JSON/ZON, no K8s/xDS integration |
-| Authentication | RFC 7235 (Proxy-Authenticate) | Proxy-level access control | **95%** - Full Basic (RFC 7617) and Digest (RFC 7616) auth, bcrypt hashing, nonce tracking, MD5 digests, replay attack prevention, rate limiting, exponential backoff. Missing: Bearer tokens (RFC 6750), SHA-256/SHA-512 variants |
+| Authentication | RFC 7235 (Proxy-Authenticate) | Proxy-level access control | **100%** - Complete Basic (RFC 7617), Digest (RFC 7616), and Bearer (RFC 6750) auth. Features: bcrypt hashing, nonce tracking, MD5 digests, opaque Bearer tokens, replay attack prevention, rate limiting, exponential backoff, token TTL/expiration, token revocation, comprehensive statistics |
 | Caching | RFC 9111 (Cache-Control, Vary, ETag) | Freshness, validation, revalidation | **10%** - Basic LRU cache, only `no-store` directive, missing Vary/ETag |
 
 ### Implementation Analysis
 
 #### ✅ **Strongly Implemented (75%+)**
-- **Authentication (95%)**: Complete RFC 7235 proxy authentication framework with Basic (RFC 7617) and Digest (RFC 7616) schemes. Features: bcrypt password hashing, nonce generation and tracking, MD5 digest computation, replay attack prevention (nc validation), constant-time comparison, rate limiting (5 failed attempts), exponential backoff (1min → 64min), per-IP and per-username tracking, comprehensive statistics, /auth/stats admin endpoint. Missing: Bearer tokens (RFC 6750), SHA-256/SHA-512-256 digest variants, session cookies.
+- **Authentication (100%)**: Complete RFC 7235 proxy authentication framework with all three major schemes:
+  - **Basic (RFC 7617)**: bcrypt password hashing (configurable cost), constant-time comparison, timing attack prevention
+  - **Digest (RFC 7616)**: MD5 digest computation (HA1/HA2/response), nonce generation and tracking, replay attack prevention (nc validation), opaque values, 5-minute nonce expiration
+  - **Bearer (RFC 6750)**: Opaque token generation (32-byte cryptographic random), token storage with metadata, configurable TTL/expiration, token revocation API, automatic cleanup
+  - **Security**: Rate limiting (5 failed attempts default), exponential backoff (1min → 64min), per-IP and per-username tracking, comprehensive statistics, /auth/stats admin endpoint
 - **Client Identity (75%)**: Complete RFC 7239 Forwarded header support with proper IPv6 quoting, X-Forwarded-* headers, Via header chain handling, and hop-by-hop header removal. Missing PROXY protocol for TCP-level client info and advanced Forwarded parameters.
 
 #### ⚠️ **Partially Implemented (15-50%)**

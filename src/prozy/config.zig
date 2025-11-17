@@ -182,6 +182,7 @@ pub const AuthenticationConfig = struct {
     realm: []const u8 = "Prozy Proxy",
     basic_enabled: bool = true,
     digest_enabled: bool = false,
+    bearer_enabled: bool = false,
     max_failed_attempts: u32 = 5,
     auth_timeout_ms: u32 = 30000,
     bcrypt_cost: u12 = 12,

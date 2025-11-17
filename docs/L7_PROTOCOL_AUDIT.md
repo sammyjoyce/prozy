@@ -414,10 +414,10 @@ const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
 
 ### 8. Authentication and Authorization
 
-#### RFC 7235/7616/7617 – HTTP Authentication
-**Status**: ✅ **IMPLEMENTED** (Basic RFC 7617 + Digest RFC 7616), ⚠️ Bearer tokens not yet implemented
+#### RFC 7235/7616/7617/6750 – HTTP Authentication
+**Status**: ✅ **FULLY IMPLEMENTED** (Basic RFC 7617 + Digest RFC 7616 + Bearer RFC 6750)
 
-**What's Implemented** (RFC 7235 - Proxy Authentication Framework, RFC 7617 - Basic Scheme, RFC 7616 - Digest Scheme):
+**What's Implemented** (RFC 7235 - Proxy Authentication Framework, RFC 7617 - Basic Scheme, RFC 7616 - Digest Scheme, RFC 6750 - Bearer Token):
 - ✅ **`Proxy-Authenticate` header generation** - `src/prozy/auth.zig:380-390`
   - Generates `407 Proxy Authentication Required` responses
   - Includes `Proxy-Authenticate: Basic realm="..."` challenge
@@ -464,10 +464,20 @@ const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
   - `/auth/stats` endpoint for authentication metrics
   - JSON response with success rates, failure counts, active sessions
   - 404 response when authentication disabled
+- ✅ **Bearer Token Scheme (RFC 6750)** - `src/prozy/auth.zig:150-243,587-613`
+  - Opaque token generation with 32-byte cryptographic random values
+  - Token storage with metadata (username, issued_at, expires_at, scope)
+  - Configurable TTL for token expiration
+  - Token validation with automatic expiration checking
+  - Token revocation API for immediate invalidation
+  - Automatic cleanup of expired tokens
+  - Bearer challenge generation in 407 responses
+  - Token-based authentication in Proxy-Authorization header
+  - Comprehensive token lifecycle management
 
 **What's NOT Implemented**:
 - ❌ **Digest SHA-256/SHA-512 variants** - Only MD5 algorithm supported (RFC 7616 specifies MD5 as baseline)
-- ❌ **Bearer Token Scheme (RFC 6750)** - No OAuth/JWT validation
+- ❌ **JWT Token Validation** - Only opaque tokens supported, no JWT signature verification
 - ❌ **Multi-factor Authentication** - No 2FA support
 - ❌ **Credential rotation/expiration** - No automatic password aging
 - ❌ **Authentication logging to file** - Only console logging

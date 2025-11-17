@@ -4,12 +4,15 @@ const log = std.log.scoped(.auth);
 
 /// RFC 7235 Proxy Authentication implementation
 ///
-/// Provides HTTP proxy authentication with support for Basic and Digest schemes.
+/// Provides HTTP proxy authentication with support for Basic, Digest, and Bearer schemes.
+/// Implements RFC 7617 (Basic), RFC 7616 (Digest), and RFC 6750 (Bearer Token).
 /// Integrates with Prozy's existing access control and rate limiting infrastructure.
 ///
 /// Security features:
 /// - Constant-time credential comparison to prevent timing attacks
 /// - bcrypt password hashing with configurable cost factor
+/// - Nonce generation and tracking for Digest authentication
+/// - Bearer token generation with TTL and automatic expiration
 /// - Rate limiting for failed authentication attempts
 /// - Per-IP and per-username attempt tracking
 /// - Comprehensive audit logging
@@ -20,6 +23,7 @@ pub const ProxyAuth = struct {
     realm: []const u8,
     credentials: ?CredentialStore = null,
     nonce_store: ?NonceStore = null,
+    bearer_token_store: ?BearerTokenStore = null,
     auth_stats: AuthStats,
     mutex: std.Thread.RwLock = .{},
 
@@ -32,6 +36,7 @@ pub const ProxyAuth = struct {
     const AuthSchemes = struct {
         basic: bool = true,
         digest: bool = false,
+        bearer: bool = false,
     };
 
     /// Nonce information for Digest authentication
@@ -137,6 +142,110 @@ pub const ProxyAuth = struct {
         }
     };
 
+    /// Token information for Bearer authentication (RFC 6750)
+    const TokenInfo = struct {
+        token: []const u8,
+        username: []const u8,
+        issued_at: i64,
+        expires_at: i64,
+        scope: ?[]const u8 = null,
+    };
+
+    /// Bearer token store for RFC 6750 OAuth 2.0 Bearer tokens
+    const BearerTokenStore = struct {
+        tokens: std.StringHashMap(TokenInfo),
+        allocator: std.mem.Allocator,
+
+        fn init(allocator: std.mem.Allocator) BearerTokenStore {
+            return .{
+                .tokens = std.StringHashMap(TokenInfo).init(allocator),
+                .allocator = allocator,
+            };
+        }
+
+        fn deinit(self: *BearerTokenStore) void {
+            var it = self.tokens.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.value_ptr.token);
+                self.allocator.free(entry.value_ptr.username);
+                if (entry.value_ptr.scope) |scope| {
+                    self.allocator.free(scope);
+                }
+            }
+            self.tokens.deinit();
+        }
+
+        fn generateToken(self: *BearerTokenStore) ![]const u8 {
+            var random_bytes: [32]u8 = undefined;
+            std.crypto.random.bytes(&random_bytes);
+
+            var token_buf: [64]u8 = undefined;
+            const token = std.fmt.bufPrint(&token_buf, "{x}", .{std.fmt.fmtSliceHexLower(&random_bytes)}) catch unreachable;
+
+            return try self.allocator.dupe(u8, token);
+        }
+
+        fn storeToken(self: *BearerTokenStore, token: []const u8, username: []const u8, ttl_seconds: i64, scope: ?[]const u8) !void {
+            const current_time = @import("http.zig").getTimestamp();
+            const expires_at = current_time + ttl_seconds;
+
+            const username_copy = try self.allocator.dupe(u8, username);
+            errdefer self.allocator.free(username_copy);
+
+            const scope_copy = if (scope) |s| try self.allocator.dupe(u8, s) else null;
+            errdefer if (scope_copy) |s| self.allocator.free(s);
+
+            try self.tokens.put(token, .{
+                .token = token,
+                .username = username_copy,
+                .issued_at = current_time,
+                .expires_at = expires_at,
+                .scope = scope_copy,
+            });
+        }
+
+        fn validateToken(self: *BearerTokenStore, token: []const u8) ?TokenInfo {
+            if (self.tokens.get(token)) |info| {
+                const current_time = @import("http.zig").getTimestamp();
+
+                // Check if token has expired
+                if (current_time > info.expires_at) {
+                    log.debug("bearer token expired: current={d}, expires={d}", .{ current_time, info.expires_at });
+                    return null;
+                }
+
+                return info;
+            }
+            return null;
+        }
+
+        fn revokeToken(self: *BearerTokenStore, token: []const u8) void {
+            if (self.tokens.fetchRemove(token)) |kv| {
+                self.allocator.free(kv.value.username);
+                if (kv.value.scope) |scope| {
+                    self.allocator.free(scope);
+                }
+            }
+        }
+
+        fn cleanupExpiredTokens(self: *BearerTokenStore) void {
+            const current_time = @import("http.zig").getTimestamp();
+            var to_remove = std.ArrayList([]const u8).init(self.allocator);
+            defer to_remove.deinit();
+
+            var it = self.tokens.iterator();
+            while (it.next()) |entry| {
+                if (current_time > entry.value_ptr.expires_at) {
+                    to_remove.append(entry.key_ptr.*) catch continue;
+                }
+            }
+
+            for (to_remove.items) |token| {
+                self.revokeToken(token);
+            }
+        }
+    };
+
     const CredentialStore = struct {
         users: std.StringHashMap(UserCredentials),
         arena: std.heap.ArenaAllocator,
@@ -197,6 +306,7 @@ pub const ProxyAuth = struct {
     pub const AuthOptions = struct {
         basic_enabled: bool = true,
         digest_enabled: bool = false,
+        bearer_enabled: bool = false,
         max_failed_attempts: u32 = 5,
         auth_timeout_ms: u32 = 30000,
         bcrypt_cost: u12 = 12,
@@ -218,10 +328,12 @@ pub const ProxyAuth = struct {
             .realm = try allocator.dupe(u8, realm),
             .credentials = CredentialStore.init(allocator),
             .nonce_store = if (options.digest_enabled) NonceStore.init(allocator) else null,
+            .bearer_token_store = if (options.bearer_enabled) BearerTokenStore.init(allocator) else null,
             .auth_stats = .{},
             .enabled_schemes = .{
                 .basic = options.basic_enabled,
                 .digest = options.digest_enabled,
+                .bearer = options.bearer_enabled,
             },
             .max_failed_attempts = options.max_failed_attempts,
             .auth_timeout_ms = options.auth_timeout_ms,
@@ -234,6 +346,9 @@ pub const ProxyAuth = struct {
             store.deinit();
         }
         if (self.nonce_store) |*store| {
+            store.deinit();
+        }
+        if (self.bearer_token_store) |*store| {
             store.deinit();
         }
         self.allocator.free(self.realm);
@@ -306,12 +421,18 @@ pub const ProxyAuth = struct {
                 return .unsupported_scheme;
             }
             return self.authenticateBasic(header_value[6..], client_ip);
-        } else if (std.ascii.eqlIgnoreCase(header_value[0..5], "Digest")) {
+        } else if (std.ascii.eqlIgnoreCase(header_value[0..6], "Digest")) {
             if (!self.enabled_schemes.digest) {
                 log.debug("authentication failed: Digest scheme disabled for {any}", .{client_ip});
                 return .unsupported_scheme;
             }
-            return self.authenticateDigest(header_value[6..], client_ip);
+            return self.authenticateDigest(header_value[7..], client_ip);
+        } else if (std.ascii.eqlIgnoreCase(header_value[0..6], "Bearer")) {
+            if (!self.enabled_schemes.bearer) {
+                log.debug("authentication failed: Bearer scheme disabled for {any}", .{client_ip});
+                return .unsupported_scheme;
+            }
+            return self.authenticateBearer(header_value[7..], client_ip);
         } else {
             log.debug("authentication failed: unsupported scheme from {any}", .{client_ip});
             return .unsupported_scheme;
@@ -464,6 +585,34 @@ pub const ProxyAuth = struct {
         log.debug("authentication failed: invalid Digest response for user '{s}' from {any}", .{ username, client_ip });
         _ = self.auth_stats.failed_auths.fetchAdd(1, .monotonic);
         return .invalid_credentials;
+    }
+
+    /// Bearer token authentication (RFC 6750)
+    fn authenticateBearer(self: *Self, token: []const u8, client_ip: IpKey) AuthResult {
+        // Trim whitespace from token
+        const trimmed_token = std.mem.trim(u8, token, " \t");
+        if (trimmed_token.len == 0) {
+            log.debug("authentication failed: empty Bearer token from {any}", .{client_ip});
+            return .malformed_header;
+        }
+
+        // Validate token against token store
+        if (self.bearer_token_store) |*token_store_const| {
+            var token_store_mut = @constCast(token_store_const);
+            if (token_store_mut.validateToken(trimmed_token)) |token_info| {
+                log.info("authentication succeeded: user '{s}' from {any} (Bearer)", .{ token_info.username, client_ip });
+                _ = self.auth_stats.successful_auths.fetchAdd(1, .monotonic);
+                _ = self.auth_stats.active_sessions.fetchAdd(1, .monotonic);
+                return .success;
+            } else {
+                log.debug("authentication failed: invalid or expired Bearer token from {any}", .{client_ip});
+                _ = self.auth_stats.failed_auths.fetchAdd(1, .monotonic);
+                return .invalid_credentials;
+            }
+        } else {
+            log.err("authentication failed: Bearer token store not initialized", .{});
+            return .internal_error;
+        }
     }
 
     /// Digest authentication parameters
@@ -634,6 +783,13 @@ pub const ProxyAuth = struct {
             first_scheme = false;
         }
 
+        // Add Bearer challenge if enabled
+        if (self.enabled_schemes.bearer) {
+            if (!first_scheme) try response.appendSlice(self.allocator, ", ");
+            try response.print(self.allocator, "Bearer realm=\"{s}\"", .{self.realm});
+            first_scheme = false;
+        }
+
         try response.appendSlice(self.allocator, "\r\n");
         try response.appendSlice(self.allocator, "Content-Length: 27\r\n");
         try response.appendSlice(self.allocator, "Content-Type: text/plain\r\n");
@@ -659,6 +815,67 @@ pub const ProxyAuth = struct {
         } else {
             log.debug("session ended, active_sessions: {d} -> {d}", .{ prev, prev - 1 });
         }
+    }
+
+    /// Generate and issue a Bearer token for a user (RFC 6750)
+    ///
+    /// Returns an opaque token that can be used for authentication.
+    /// The token is stored internally with the specified TTL and scope.
+    ///
+    /// Arguments:
+    /// - username: The username to associate with the token
+    /// - ttl_seconds: Time-to-live for the token in seconds (default: 3600 = 1 hour)
+    /// - scope: Optional scope string for the token (e.g., "read write")
+    pub fn generateBearerToken(self: *Self, username: []const u8, ttl_seconds: i64, scope: ?[]const u8) ![]const u8 {
+        if (self.bearer_token_store) |*token_store_const| {
+            var token_store_mut = @constCast(token_store_const);
+
+            // Generate cryptographically secure random token
+            const token = try token_store_mut.generateToken();
+            errdefer self.allocator.free(token);
+
+            // Store token with metadata
+            try token_store_mut.storeToken(token, username, ttl_seconds, scope);
+
+            log.info("generated Bearer token for user '{s}' with TTL {d}s", .{ username, ttl_seconds });
+            return token;
+        } else {
+            log.err("Bearer token generation failed: token store not initialized", .{});
+            return error.TokenStoreNotInitialized;
+        }
+    }
+
+    /// Revoke a Bearer token
+    ///
+    /// Immediately invalidates the token, preventing further authentication.
+    pub fn revokeBearerToken(self: *Self, token: []const u8) void {
+        if (self.bearer_token_store) |*token_store_const| {
+            var token_store_mut = @constCast(token_store_const);
+            token_store_mut.revokeToken(token);
+            log.info("revoked Bearer token", .{});
+        } else {
+            log.warn("Bearer token revocation failed: token store not initialized", .{});
+        }
+    }
+
+    /// Cleanup expired tokens and nonces
+    ///
+    /// Should be called periodically to remove expired authentication artifacts.
+    /// Recommended interval: every 5-10 minutes.
+    pub fn cleanupExpiredArtifacts(self: *Self) void {
+        // Cleanup expired nonces (Digest authentication)
+        if (self.nonce_store) |*nonce_store_const| {
+            var nonce_store_mut = @constCast(nonce_store_const);
+            nonce_store_mut.cleanupExpiredNonces();
+        }
+
+        // Cleanup expired tokens (Bearer authentication)
+        if (self.bearer_token_store) |*token_store_const| {
+            var token_store_mut = @constCast(token_store_const);
+            token_store_mut.cleanupExpiredTokens();
+        }
+
+        log.debug("cleaned up expired authentication artifacts", .{});
     }
 
     /// Hash password using bcrypt-style format with SHA-256
