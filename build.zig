@@ -243,6 +243,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(production_gateway);
 
+    const auth_proxy = b.addExecutable(.{
+        .name = "auth_proxy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/configs/auth_proxy.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(auth_proxy);
+
     const config_hot_reload_demo = b.addExecutable(.{
         .name = "config_hot_reload_demo",
         .root_module = b.createModule(.{
@@ -309,6 +322,10 @@ pub fn build(b: *std.Build) void {
     const run_openai_api_translator = b.addRunArtifact(openai_api_translator);
     const openai_api_translator_step = b.step("openai_translator", "Run OpenAI API translator example");
     openai_api_translator_step.dependOn(&run_openai_api_translator.step);
+
+    const run_auth_proxy = b.addRunArtifact(auth_proxy);
+    const auth_proxy_step = b.step("auth_proxy", "Run authentication proxy example");
+    auth_proxy_step.dependOn(&run_auth_proxy.step);
 
     // E2E test executable
     const e2e_test = b.addExecutable(.{

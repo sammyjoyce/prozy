@@ -83,6 +83,12 @@ const access = @import("prozy/access.zig");
 pub const AccessControl = access.AccessControl;
 pub const RateLimiter = access.RateLimiter;
 
+// Authentication
+const auth = @import("prozy/auth.zig");
+pub const ProxyAuth = auth.ProxyAuth;
+pub const AuthResult = auth.ProxyAuth.AuthResult;
+pub const BasicCredentials = auth.BasicCredentials;
+
 // HTTP layer
 const http = @import("prozy/http.zig");
 pub const HTTPInspector = http.HTTPInspector;

@@ -143,6 +143,12 @@ pub const HTTPInspector = struct {
         return null;
     }
 
+    /// Find Proxy-Authorization header value (case-insensitive)
+    /// Used for RFC 7235 proxy authentication
+    pub fn findProxyAuthorizationHeader(headers: []const u8) ?[]const u8 {
+        return findHeader(headers, "Proxy-Authorization");
+    }
+
     /// List of hop-by-hop headers that must be removed before forwarding (RFC 9110 Section 7.6.1)
     /// NOTE: Transfer-Encoding is NOT included because we don't decode/re-encode chunked bodies.
     /// As a simple forwarding proxy, we preserve Transfer-Encoding to maintain message integrity.
@@ -221,7 +227,7 @@ pub const HTTPInspector = struct {
     /// Only http, https are allowed. Rejects arbitrary values like "ftp", "javascript:", etc.
     fn isValidProtocol(proto: []const u8) bool {
         return std.ascii.eqlIgnoreCase(proto, "http") or
-               std.ascii.eqlIgnoreCase(proto, "https");
+            std.ascii.eqlIgnoreCase(proto, "https");
     }
 
     /// Manipulate HTTP request headers: add proxy headers, remove hop-by-hop headers

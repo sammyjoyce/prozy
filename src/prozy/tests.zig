@@ -28,6 +28,8 @@ const Backend = root.Backend;
 const LoadBalancer = root.LoadBalancer;
 const HTTPInspector = root.HTTPInspector;
 const HTTPCache = root.HTTPCache;
+const ProxyAuth = root.ProxyAuth;
+const AuthResult = root.AuthResult;
 
 // ============= Unit Tests =============
 
@@ -2102,4 +2104,153 @@ test "HTTPInspector: X-Forwarded-Proto with trailing whitespace trimmed" {
     try testing.expect(std.mem.indexOf(u8, modified, "proto=https") != null);
     // Should NOT contain trailing spaces
     try testing.expect(std.mem.indexOf(u8, modified, "proto=https  ") == null);
+}
+
+// ============= Proxy Authentication Tests =============
+
+test "Proxy authentication enable and configuration" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Enable proxy authentication
+    try proxy.enableProxyAuthentication("Test Realm", .{
+        .basic_enabled = true,
+        .digest_enabled = false,
+        .max_failed_attempts = 5,
+        .auth_timeout_ms = 30000,
+    });
+
+    try testing.expect(proxy.proxy_auth != null);
+    try testing.expectEqualStrings("Test Realm", proxy.proxy_auth.?.realm);
+}
+
+test "Proxy authentication user management" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Enable proxy authentication
+    try proxy.enableProxyAuthentication("Company Proxy", .{
+        .basic_enabled = true,
+        .digest_enabled = false,
+    });
+
+    // Add users
+    try proxy.addAuthUser("alice", "alicepass");
+    try proxy.addAuthUser("bob", "bobpass");
+
+    // Test authentication statistics
+    const stats = proxy.getAuthStats();
+    try testing.expect(stats != null);
+    try testing.expectEqual(@as(u64, 0), stats.?.total_auth_requests);
+}
+
+test "Proxy authentication with RunOptions" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    const options = RunOptions{
+        .enable_proxy_authentication = true,
+        .auth_realm = "Options Test",
+        .auth_basic_enabled = true,
+        .auth_digest_enabled = false,
+        .auth_max_failed_attempts = 3,
+        .auth_timeout_ms = 60000,
+    };
+
+    try testing.expect(options.enable_proxy_authentication);
+    try testing.expectEqualStrings("Options Test", options.auth_realm);
+    try testing.expect(options.auth_basic_enabled);
+    try testing.expect(!options.auth_digest_enabled);
+    try testing.expectEqual(@as(u32, 3), options.auth_max_failed_attempts);
+    try testing.expectEqual(@as(u32, 60000), options.auth_timeout_ms);
+}
+
+test "Proxy authentication integration with other features" {
+    const allocator = testing.allocator;
+
+    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    defer proxy.deinit();
+
+    // Enable multiple features including authentication
+    try proxy.enableAccessControl(.allow);
+    proxy.enableRateLimiting(10, 100);
+    try proxy.enableProxyAuthentication("Multi Feature", .{
+        .basic_enabled = true,
+        .digest_enabled = false,
+    });
+    proxy.enableCaching(1024 * 1024);
+
+    // All features should be enabled
+    try testing.expect(proxy.access_control != null);
+    try testing.expect(proxy.rate_limiter != null);
+    try testing.expect(proxy.proxy_auth != null);
+    try testing.expect(proxy.http_cache != null);
+
+    // Add authentication user
+    try proxy.addAuthUser("testuser", "testpass");
+
+    // Test that we can get stats from all features
+    const auth_stats = proxy.getAuthStats();
+    try testing.expect(auth_stats != null);
+    try testing.expectEqual(@as(u64, 0), auth_stats.?.total_auth_requests);
+}
+
+test "Proxy authentication password verification and session tracking" {
+    const allocator = testing.allocator;
+
+    // Create auth instance
+    var auth = try ProxyAuth.init(allocator, "Test Realm", .{
+        .basic_enabled = true,
+        .max_failed_attempts = 5,
+        .bcrypt_cost = 10,
+    });
+    defer auth.deinit();
+
+    // Add test users
+    try auth.addUser("alice", "correctPassword");
+    try auth.addUser("bob", "secret123");
+
+    const client_ip = IpKey{ .ipv4 = 0x7F000001 };
+
+    // Test 1: Correct credentials should succeed
+    const valid_alice = "Basic YWxpY2U6Y29ycmVjdFBhc3N3b3Jk"; // base64("alice:correctPassword")
+    const result1 = auth.authenticate(valid_alice, client_ip);
+    try testing.expectEqual(ProxyAuth.AuthResult.success, result1);
+
+    var stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.successful_auths);
+    try testing.expectEqual(@as(u64, 1), stats.active_sessions);
+
+    // Test 2: Incorrect password should fail (this tests the password verification fix)
+    const invalid_alice = "Basic YWxpY2U6d3JvbmdQYXNzd29yZA=="; // base64("alice:wrongPassword")
+    const result2 = auth.authenticate(invalid_alice, client_ip);
+    try testing.expectEqual(ProxyAuth.AuthResult.invalid_credentials, result2);
+
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.failed_auths);
+    try testing.expectEqual(@as(u64, 1), stats.active_sessions); // Should not increment on failure
+
+    // Test 3: Another valid user should succeed
+    const valid_bob = "Basic Ym9iOnNlY3JldDEyMw=="; // base64("bob:secret123")
+    const result3 = auth.authenticate(valid_bob, client_ip);
+    try testing.expectEqual(ProxyAuth.AuthResult.success, result3);
+
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 2), stats.successful_auths);
+    try testing.expectEqual(@as(u64, 2), stats.active_sessions);
+
+    // Test 4: End session should decrement counter (fixes session tracking bug)
+    auth.endSession();
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.active_sessions);
+
+    auth.endSession();
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 0), stats.active_sessions);
 }

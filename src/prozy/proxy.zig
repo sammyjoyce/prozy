@@ -84,6 +84,7 @@ const HTTPInspector = @import("http.zig").HTTPInspector;
 const HTTPCache = @import("http.zig").HTTPCache;
 const Backend = @import("backend.zig").Backend;
 const LoadBalancer = @import("backend.zig").LoadBalancer;
+const ProxyAuth = @import("auth.zig").ProxyAuth;
 const resolveListenAddress = @import("transport.zig").resolveListenAddress;
 const connectToBackend = @import("transport.zig").connectToBackend;
 const extractClientIp = @import("transport.zig").extractClientIp;
@@ -116,6 +117,18 @@ pub const RunOptions = struct {
     enable_caching: bool = true,
     /// Enable load balancing across multiple backends
     enable_load_balancing: bool = false,
+    /// Enable RFC 7235 proxy authentication
+    enable_proxy_authentication: bool = false,
+    /// Authentication realm for Proxy-Authenticate header
+    auth_realm: []const u8 = "Prozy Proxy",
+    /// Enable Basic authentication scheme
+    auth_basic_enabled: bool = true,
+    /// Enable Digest authentication scheme (Phase 2)
+    auth_digest_enabled: bool = false,
+    /// Maximum failed authentication attempts before blocking
+    auth_max_failed_attempts: u32 = 5,
+    /// Authentication timeout in milliseconds
+    auth_timeout_ms: u32 = 30000,
 };
 
 pub const Proxy = struct {
@@ -133,6 +146,7 @@ pub const Proxy = struct {
     http_inspector: HTTPInspector,
     http_cache: ?HTTPCache = null,
     load_balancer: ?LoadBalancer = null,
+    proxy_auth: ?ProxyAuth = null,
 
     // Phase 3: Routing and lifecycle
     router: ?*Router = null,
@@ -160,6 +174,9 @@ pub const Proxy = struct {
         if (self.http_cache) |*cache| {
             cache.deinit();
         }
+        if (self.proxy_auth) |*auth| {
+            auth.deinit();
+        }
     }
 
     /// Enable access control with default policy
@@ -180,6 +197,37 @@ pub const Proxy = struct {
     /// Enable load balancing with multiple backends
     pub fn enableLoadBalancing(self: *Self, backends: []Backend, strategy: LoadBalancer.Strategy) void {
         self.load_balancer = LoadBalancer.init(backends, strategy);
+    }
+
+    /// Enable RFC 7235 proxy authentication
+    pub fn enableProxyAuthentication(self: *Self, realm: []const u8, options: ProxyAuth.AuthOptions) !void {
+        self.proxy_auth = try ProxyAuth.init(self.allocator, realm, options);
+    }
+
+    /// Add a user to the authentication store
+    pub fn addAuthUser(self: *Self, username: []const u8, password: []const u8) !void {
+        if (self.proxy_auth) |*auth| {
+            try auth.addUser(username, password);
+        } else {
+            return error.AuthenticationNotEnabled;
+        }
+    }
+
+    /// Remove a user from the authentication store
+    pub fn removeAuthUser(self: *Self, username: []const u8) !void {
+        if (self.proxy_auth) |*auth| {
+            try auth.removeUser(username);
+        } else {
+            return error.AuthenticationNotEnabled;
+        }
+    }
+
+    /// Get authentication statistics if enabled
+    pub fn getAuthStats(self: *const Self) ?ProxyAuth.AuthStatsSnapshot {
+        if (self.proxy_auth) |*auth| {
+            return auth.getStats();
+        }
+        return null;
     }
 
     /// Get current statistics snapshot
@@ -314,6 +362,31 @@ pub const Proxy = struct {
         if (self.router) |router| {
             log.info("routing mode: {} ({} routes, {} clusters)", .{ router.mode, router.routes.len, router.clusters.len });
         }
+        if (options.enable_proxy_authentication) {
+            var schemes_buffer: [64]u8 = undefined;
+            var schemes_len: usize = 0;
+
+            if (options.auth_basic_enabled) {
+                const basic_str = "Basic";
+                if (schemes_len + basic_str.len <= schemes_buffer.len) {
+                    @memcpy(schemes_buffer[schemes_len..][0..basic_str.len], basic_str);
+                    schemes_len += basic_str.len;
+                }
+            }
+            if (options.auth_digest_enabled) {
+                const digest_str = "Digest";
+                if (schemes_len > 0 and schemes_len + 2 + digest_str.len <= schemes_buffer.len) {
+                    schemes_buffer[schemes_len] = ',';
+                    schemes_buffer[schemes_len + 1] = ' ';
+                    schemes_len += 2;
+                    @memcpy(schemes_buffer[schemes_len..][0..digest_str.len], digest_str);
+                    schemes_len += digest_str.len;
+                }
+            }
+
+            const schemes_str = schemes_buffer[0..schemes_len];
+            log.info("proxy authentication: ENABLED (realm: {s}, schemes: {s})", .{ options.auth_realm, schemes_str });
+        }
 
         var connection_group: std.Io.Group = .init;
         defer connection_group.wait(io);
@@ -373,6 +446,7 @@ pub const Proxy = struct {
                 if (self.rate_limiter) |*limiter| limiter else null,
                 if (self.load_balancer) |*lb| lb else null,
                 if (self.http_cache) |*cache| cache else null,
+                if (self.proxy_auth) |*auth| auth else null, // RFC 7235 Proxy Authentication
                 self.router, // Phase 3: Pass router for advanced routing
             });
         }
@@ -511,6 +585,7 @@ pub const Proxy = struct {
         rate_limiter: ?*RateLimiter,
         load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
+        proxy_auth: ?*ProxyAuth, // RFC 7235 Proxy Authentication
         router: ?*Router, // Phase 3: Optional router for advanced routing
     ) void {
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
@@ -549,8 +624,8 @@ pub const Proxy = struct {
         var parsed_request: ?HTTPInspector.HTTPRequest = null;
         var request_headers: []const u8 = &[_]u8{};
 
-        if (router != null or options.enable_caching or options.enable_http_inspection) {
-            // Buffer initial request for inspection/routing
+        if (router != null or options.enable_caching or options.enable_http_inspection or options.enable_proxy_authentication) {
+            // Buffer initial request for inspection/routing/authentication
             var client_read_buf: [4096]u8 = undefined;
             var client_reader = client_stream.reader(io, &client_read_buf);
 
@@ -563,6 +638,40 @@ pub const Proxy = struct {
                 // Parse HTTP request line
                 parsed_request = HTTPInspector.parseRequestLine(request_buffer[0..bytes_read]);
                 request_headers = request_buffer[0..bytes_read];
+            }
+        }
+
+        // RFC 7235 Proxy Authentication check
+        if (options.enable_proxy_authentication and proxy_auth != null) {
+            // Find Proxy-Authorization header
+            const auth_header = HTTPInspector.findProxyAuthorizationHeader(request_headers);
+
+            const auth_result = proxy_auth.?.authenticate(auth_header, client_ip);
+
+            if (auth_result != .success) {
+                log.warn("authentication failed for {any}: {s}", .{ client_ip, @tagName(auth_result) });
+
+                // Generate 407 Proxy Authentication Required response
+                const auth_response = proxy_auth.?.generateAuthChallenge() catch |err| {
+                    log.err("failed to generate auth challenge: {s}", .{@errorName(err)});
+                    const fallback_response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Prozy Proxy\"\r\nContent-Length: 27\r\n\r\nProxy authentication required";
+                    var error_write_buf: [4096]u8 = undefined;
+                    var error_writer = client_stream.writer(io, &error_write_buf);
+                    _ = Writer.writeAll(&error_writer.interface, fallback_response) catch {};
+                    _ = Writer.flush(&error_writer.interface) catch {};
+                    return;
+                };
+                defer allocator.free(auth_response);
+
+                var error_write_buf: [4096]u8 = undefined;
+                var error_writer = client_stream.writer(io, &error_write_buf);
+                _ = Writer.writeAll(&error_writer.interface, auth_response) catch {};
+                _ = Writer.flush(&error_writer.interface) catch {};
+                return;
+            }
+
+            if (!builtin.is_test) {
+                log.info("authentication successful for {any}", .{client_ip});
             }
         }
 
