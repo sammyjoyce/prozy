@@ -107,6 +107,9 @@ pub const RouterError = router.RouterError;
 const admin = @import("prozy/admin.zig");
 pub const AdminServer = admin.AdminServer;
 
+const health = @import("prozy/health.zig");
+pub const HealthChecker = health.HealthChecker;
+
 // Proxy core
 const proxy = @import("prozy/proxy.zig");
 pub const RunOptions = proxy.RunOptions;

@@ -204,6 +204,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(admin_server_demo);
 
+    const health_check_demo = b.addExecutable(.{
+        .name = "health_check_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/health_check_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(health_check_demo);
+
     // Example run steps
     const run_async_io_demo = b.addRunArtifact(async_io_demo);
     const async_io_demo_step = b.step("async_io_demo", "Run async I/O demo");
@@ -224,6 +237,10 @@ pub fn build(b: *std.Build) void {
     const run_admin_server_demo = b.addRunArtifact(admin_server_demo);
     const admin_server_demo_step = b.step("admin_server_demo", "Run admin server demonstration");
     admin_server_demo_step.dependOn(&run_admin_server_demo.step);
+
+    const run_health_check_demo = b.addRunArtifact(health_check_demo);
+    const health_check_demo_step = b.step("health_check_demo", "Run health check demonstration");
+    health_check_demo_step.dependOn(&run_health_check_demo.step);
 
     // E2E test executable
     const e2e_test = b.addExecutable(.{

@@ -1709,10 +1709,14 @@ test "Proxy runWithIoOptions API with custom configuration" {
     var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
-    // Test with custom configuration options
+    // Test with custom configuration options (avoid overriding `max_connections`
+    // so the implementation short-circuits in test builds and never touches the
+    // real network).
     try proxy.runWithIoOptions(io, .{
-        .connect_timeout = .none, // Use default timeout
-        .max_connections = 500, // Limit connections
+        .connect_timeout = .none,
+        .reuse_address = false,
+        .enable_stats = false,
+        .enable_caching = false,
     });
 }
 

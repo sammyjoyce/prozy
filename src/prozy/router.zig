@@ -232,7 +232,7 @@ test "Router reverse proxy basic routing" {
         .path = "/v1/users",
         .version = "HTTP/1.1",
     };
-    const headers = "Host: api.example.com\r\n\r\n";
+    const headers = "GET /v1/users HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
     const client_ip = IpKey{ .ipv4 = 0x7F000001 }; // 127.0.0.1
 
     // Route the request
@@ -272,7 +272,7 @@ test "Router no matching route" {
         .path = "/v2/users",
         .version = "HTTP/1.1",
     };
-    const headers = "Host: other.example.com\r\n\r\n";
+    const headers = "GET /v2/users HTTP/1.1\r\nHost: other.example.com\r\n\r\n";
     const client_ip = IpKey{ .ipv4 = 0x7F000001 };
 
     // Should fail to route
@@ -307,14 +307,15 @@ test "Router forward proxy URI parsing" {
         .path = "http://example.com/path/to/resource",
         .version = "HTTP/1.1",
     };
-    const headers = "\r\n";
+    const headers = "GET http://example.com/path/to/resource HTTP/1.1\r\n\r\n";
     const client_ip = IpKey{ .ipv4 = 0x7F000001 };
 
     // Route the request
     const decision = try router.routeRequest(&req, headers, client_ip);
 
     // Verify decision
-    try std.testing.expect(decision.backend != undefined);
+    try std.testing.expectEqualStrings("127.0.0.1", decision.backend.host);
+    try std.testing.expectEqual(@as(u16, 8080), decision.backend.port);
 
     // Release the connection
     router.releaseConnection("forward-cluster");
