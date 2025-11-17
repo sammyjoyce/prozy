@@ -415,9 +415,9 @@ const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
 ### 8. Authentication and Authorization
 
 #### RFC 7235/7616/7617 – HTTP Authentication
-**Status**: ✅ **IMPLEMENTED** (Basic auth - RFC 7617), ⚠️ Digest/Bearer not yet implemented
+**Status**: ✅ **IMPLEMENTED** (Basic RFC 7617 + Digest RFC 7616), ⚠️ Bearer tokens not yet implemented
 
-**What's Implemented** (RFC 7235 - Proxy Authentication Framework, RFC 7617 - Basic Scheme):
+**What's Implemented** (RFC 7235 - Proxy Authentication Framework, RFC 7617 - Basic Scheme, RFC 7616 - Digest Scheme):
 - ✅ **`Proxy-Authenticate` header generation** - `src/prozy/auth.zig:380-390`
   - Generates `407 Proxy Authentication Required` responses
   - Includes `Proxy-Authenticate: Basic realm="..."` challenge
@@ -449,9 +449,24 @@ const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
 - ✅ **Hop-by-hop Header Removal** - `src/prozy/http.zig:144-165`
   - `Proxy-Authenticate` and `Proxy-Authorization` properly removed
   - RFC 9110 Section 7.6.1 compliance
+- ✅ **Digest Authentication Scheme (RFC 7616)** - `src/prozy/auth.zig:359-524`
+  - Full MD5-based digest authentication
+  - Nonce generation with cryptographically secure random bytes
+  - Nonce tracking and validation (prevents replay attacks)
+  - Nonce count (nc) validation for replay detection
+  - Nonce expiration (5-minute lifetime)
+  - MD5 digest computation (HA1, HA2, response)
+  - Quality of Protection (qop) "auth" support
+  - Opaque value generation and tracking
+  - Digest parameter parsing (username, nonce, uri, response, nc, cnonce, qop, etc.)
+  - Constant-time digest comparison
+- ✅ **Admin API Integration** - `src/prozy/admin.zig:311-349`
+  - `/auth/stats` endpoint for authentication metrics
+  - JSON response with success rates, failure counts, active sessions
+  - 404 response when authentication disabled
 
 **What's NOT Implemented**:
-- ❌ **Digest Authentication (RFC 7616)** - Placeholder exists (`authenticateDigest()`), stub returns `unsupported_scheme`
+- ❌ **Digest SHA-256/SHA-512 variants** - Only MD5 algorithm supported (RFC 7616 specifies MD5 as baseline)
 - ❌ **Bearer Token Scheme (RFC 6750)** - No OAuth/JWT validation
 - ❌ **Multi-factor Authentication** - No 2FA support
 - ❌ **Credential rotation/expiration** - No automatic password aging

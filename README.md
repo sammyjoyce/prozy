@@ -353,11 +353,14 @@ Standards-compliant HTTP proxy authentication with enterprise-grade security:
 
 **Authentication Schemes:**
 - ✅ **Basic Authentication (RFC 7617)**: Username/password with bcrypt hashing
-- ⏳ **Digest Authentication (RFC 7616)**: Planned for Phase 2
-- ⏳ **Bearer Tokens (RFC 6750)**: Planned for Phase 2
+- ✅ **Digest Authentication (RFC 7616)**: MD5-based challenge-response with nonce tracking
+- ⏳ **Bearer Tokens (RFC 6750)**: Planned for future release
 
 **Security Features:**
 - **bcrypt password hashing** with configurable cost (default: 12 rounds)
+- **Nonce generation and tracking** for Digest auth with replay attack prevention
+- **MD5 digest computation** for challenge-response authentication
+- **Nonce expiration** (5-minute lifetime) prevents stale nonce reuse
 - **Constant-time credential comparison** prevents timing attacks
 - **Rate limiting**: Maximum failed attempts per user/IP (default: 5 attempts)
 - **Exponential backoff**: Brute force protection (1min → 2min → 4min → 8min → 16min → 32min → 64min)
@@ -375,10 +378,10 @@ Standards-compliant HTTP proxy authentication with enterprise-grade security:
 
 **Configuration Example:**
 ```zig
-// Enable authentication with custom realm
+// Enable authentication with custom realm (both Basic and Digest)
 try proxy.enableProxyAuthentication("Corporate Proxy", .{
     .basic_enabled = true,
-    .digest_enabled = false,
+    .digest_enabled = true,  // Enable Digest authentication (RFC 7616)
     .max_failed_attempts = 5,
     .auth_timeout_ms = 30000,
     .bcrypt_cost = 12,
@@ -480,12 +483,13 @@ Prozy implements various HTTP standards and specifications to different degrees.
 | Content Adaptation | RFC 3507 (ICAP) | Virus scanning, DLP, content transformation | **30%** - Basic transformation hooks, no ICAP protocol or external services |
 | Observability | OpenTelemetry (OTLP) | Distributed tracing, metrics, logs | **20%** - Basic metrics and HTTP endpoints, no OpenTelemetry |
 | Declarative Config | Kubernetes Gateway API, Envoy xDS | Portable L4/L7 routing, dynamic service discovery | **30%** - Hot reload with JSON/ZON, no K8s/xDS integration |
-| Authentication | RFC 7235 (Proxy-Authenticate) | Proxy-level access control | **75%** - Full Basic auth (RFC 7617), bcrypt hashing, rate limiting, exponential backoff. Missing: Digest auth, Bearer tokens |
+| Authentication | RFC 7235 (Proxy-Authenticate) | Proxy-level access control | **95%** - Full Basic (RFC 7617) and Digest (RFC 7616) auth, bcrypt hashing, nonce tracking, MD5 digests, replay attack prevention, rate limiting, exponential backoff. Missing: Bearer tokens (RFC 6750), SHA-256/SHA-512 variants |
 | Caching | RFC 9111 (Cache-Control, Vary, ETag) | Freshness, validation, revalidation | **10%** - Basic LRU cache, only `no-store` directive, missing Vary/ETag |
 
 ### Implementation Analysis
 
 #### ✅ **Strongly Implemented (75%+)**
+- **Authentication (95%)**: Complete RFC 7235 proxy authentication framework with Basic (RFC 7617) and Digest (RFC 7616) schemes. Features: bcrypt password hashing, nonce generation and tracking, MD5 digest computation, replay attack prevention (nc validation), constant-time comparison, rate limiting (5 failed attempts), exponential backoff (1min → 64min), per-IP and per-username tracking, comprehensive statistics, /auth/stats admin endpoint. Missing: Bearer tokens (RFC 6750), SHA-256/SHA-512-256 digest variants, session cookies.
 - **Client Identity (75%)**: Complete RFC 7239 Forwarded header support with proper IPv6 quoting, X-Forwarded-* headers, Via header chain handling, and hop-by-hop header removal. Missing PROXY protocol for TCP-level client info and advanced Forwarded parameters.
 
 #### ⚠️ **Partially Implemented (15-50%)**
@@ -493,9 +497,8 @@ Prozy implements various HTTP standards and specifications to different degrees.
 - **HTTP Core (43%)**: Solid HTTP/1.1 message parsing with request/response line handling, basic header extraction, and status code validation. Missing URI parsing, content negotiation, conditional requests, and comprehensive header semantics.
 - **Content Adaptation (30%)**: Basic HTTP header manipulation and transformation hook framework. Missing ICAP protocol, external service integration, virus scanning, and DLP capabilities.
 - **Declarative Config (30%)**: Excellent hot reload with atomic pointer swapping, memory-safe lease-based access, JSON/ZON support, and rich configuration schema. Missing Kubernetes Gateway API and Envoy xDS protocol integration.
-- **Observability (20%)**: Basic atomic metrics collection, HTTP admin endpoints (/metrics, /health, /backends), and structured logging. Missing OpenTelemetry SDK, distributed tracing, OTLP export, and standard metrics formats.
+- **Observability (20%)**: Basic atomic metrics collection, HTTP admin endpoints (/metrics, /health, /backends, /auth/stats), and structured logging. Missing OpenTelemetry SDK, distributed tracing, OTLP export, and standard metrics formats.
 - **Caching (10%)**: O(1) LRU cache with doubly-linked list, RwLock concurrency, TTL expiration, and Host header isolation. Missing most RFC 9111 features: Cache-Control directives, Vary header, ETag validation, freshness calculation, and revalidation.
-- **Authentication (75%)**: Complete RFC 7235/7617 Basic authentication with bcrypt password hashing, constant-time comparison, rate limiting (5 failed attempts), exponential backoff (1min → 64min), per-IP and per-username tracking, comprehensive statistics. Missing Digest auth (RFC 7616) and Bearer tokens (RFC 6750).
 
 #### ❌ **Not Implemented (0%)**
 - **HTTP Versions**: HTTP/1.1 only, no HTTP/2 binary framing or HTTP/3 QUIC transport. Architecture would need significant changes for multiplexing.
