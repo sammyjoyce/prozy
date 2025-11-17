@@ -262,33 +262,38 @@ pub const ProxyAuth = struct {
     fn validateUserCredentials(self: *Self, username: []const u8, password: []const u8, client_ip: IpKey) AuthResult {
         const store = &self.credentials.?;
 
-        // Shared lock for reading credentials
-        self.mutex.lockShared();
-        defer self.mutex.unlockShared();
+        // Read credentials with shared lock, then release before exclusive lock needed
+        const password_hash: []const u8 = blk: {
+            self.mutex.lockShared();
+            defer self.mutex.unlockShared();
 
-        const credentials = store.users.get(username) orelse {
-            log.debug("authentication failed: unknown user '{s}' from {any}", .{ username, client_ip });
-            _ = self.auth_stats.failed_auths.fetchAdd(1, .monotonic);
-            return .invalid_credentials;
+            const credentials = store.users.get(username) orelse {
+                log.debug("authentication failed: unknown user '{s}' from {any}", .{ username, client_ip });
+                _ = self.auth_stats.failed_auths.fetchAdd(1, .monotonic);
+                return .invalid_credentials;
+            };
+
+            // Check rate limiting
+            const current_time = @import("http.zig").getTimestamp();
+            if (credentials.failed_attempts >= self.max_failed_attempts) {
+                const time_since_last = current_time - credentials.last_attempt_time;
+                const backoff_seconds = std.time.s_per_min * @as(i64, 1) << @min(credentials.failed_attempts - 5, 5); // Exponential backoff
+
+                if (time_since_last < backoff_seconds) {
+                    log.warn("authentication blocked: too many failed attempts for user '{s}' from {any}", .{ username, client_ip });
+                    _ = self.auth_stats.blocked_ips.fetchAdd(1, .monotonic);
+                    return .too_many_attempts;
+                }
+            }
+
+            break :blk credentials.password_hash;
         };
 
-        // Check rate limiting
+        // Verify password (no lock needed)
+        const password_valid = verifyPassword(password, password_hash);
+
+        // Update credentials (acquires exclusive lock)
         const current_time = @import("http.zig").getTimestamp();
-        if (credentials.failed_attempts >= self.max_failed_attempts) {
-            const time_since_last = current_time - credentials.last_attempt_time;
-            const backoff_seconds = std.time.s_per_min * @as(i64, 1) << @min(credentials.failed_attempts - 5, 5); // Exponential backoff
-
-            if (time_since_last < backoff_seconds) {
-                log.warn("authentication blocked: too many failed attempts for user '{s}' from {any}", .{ username, client_ip });
-                _ = self.auth_stats.blocked_ips.fetchAdd(1, .monotonic);
-                return .too_many_attempts;
-            }
-        }
-
-        // Verify password using constant-time comparison
-        const password_valid = verifyPassword(password, credentials.password_hash);
-
-        // Update credentials atomically
         self.updateCredentialsAfterAttempt(username, password_valid, current_time) catch |err| {
             log.err("failed to update credentials for user '{s}': {s}", .{ username, @errorName(err) });
         };
@@ -363,46 +368,87 @@ pub const ProxyAuth = struct {
         return self.auth_stats.getSnapshot();
     }
 
-    /// Hash password using bcrypt
+    /// End an authenticated session (decrement active session counter)
+    ///
+    /// Should be called when a client connection closes after successful authentication.
+    /// This ensures the active_sessions metric accurately reflects current state.
+    pub fn endSession(self: *Self) void {
+        const prev = self.auth_stats.active_sessions.fetchSub(1, .monotonic);
+        if (prev == 0) {
+            log.warn("endSession called but active_sessions was already 0", .{});
+        } else {
+            log.debug("session ended, active_sessions: {d} -> {d}", .{ prev, prev - 1 });
+        }
+    }
+
+    /// Hash password using bcrypt-style format with SHA-256
+    ///
+    /// Format: $2b$<cost>$<salt>$<hash>
+    /// Uses SHA-256 for demonstration; production should use proper bcrypt library.
     fn hashPassword(allocator: std.mem.Allocator, password: []const u8, cost: u12) ![]const u8 {
-        // Generate random salt
+        // Generate random salt (16 bytes)
         var salt: [16]u8 = undefined;
         std.crypto.random.bytes(&salt);
 
-        // Hash with bcrypt (simplified implementation)
-        // In production, use a proper bcrypt library
-        const hash: [60]u8 = std.mem.zeroes([60]u8);
-        _ = hash; // Use hash in production implementation
+        // Encode salt to base64
+        var salt_b64: [24]u8 = undefined; // base64 of 16 bytes = 24 chars
+        const salt_encoded = std.base64.standard.Encoder.encode(&salt_b64, &salt);
 
-        // For now, use a simple hash - replace with proper bcrypt in production
-        var hex_buf: [32]u8 = undefined;
-        var hex_len: usize = 0;
-        for (salt) |byte| {
-            if (hex_len + 2 <= hex_buf.len) {
-                const written = try std.fmt.bufPrint(hex_buf[hex_len..], "{x:0<2}", .{byte});
-                hex_len += written.len;
-            }
-        }
-        const hash_str = try std.fmt.allocPrint(allocator, "$2b${d}${d}", .{ cost, hex_len });
-        defer allocator.free(hash_str);
+        // Hash password with salt using SHA-256 (simulating bcrypt work factor)
+        var hash_input: [256]u8 = undefined;
+        const input = try std.fmt.bufPrint(&hash_input, "{s}{s}{d}", .{ password, salt_encoded, cost });
 
-        // Include password in hash calculation (simplified)
-        _ = password; // Use password in proper bcrypt implementation
+        var hash_output: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(input, &hash_output, .{});
 
-        return allocator.dupe(u8, hash_str);
+        // Encode hash to base64
+        var hash_b64: [44]u8 = undefined; // base64 of 32 bytes = 44 chars
+        const hash_encoded = std.base64.standard.Encoder.encode(&hash_b64, &hash_output);
+
+        // Return in bcrypt-style format: $2b$<cost>$<salt>$<hash>
+        return std.fmt.allocPrint(allocator, "$2b${d}${s}${s}", .{ cost, salt_encoded, hash_encoded });
     }
 
-    /// Verify password against bcrypt hash using constant-time comparison
+    /// Verify password against hash using constant-time comparison
+    ///
+    /// Extracts salt and cost from hash, recomputes hash of password, and compares.
+    /// Uses constant-time comparison to prevent timing attacks.
     fn verifyPassword(password: []const u8, hash: []const u8) bool {
-        // Simplified verification - replace with proper bcrypt in production
-        // In a real implementation, this would extract the salt from the hash,
-        // compute the bcrypt hash of the password with that salt, and compare
-        _ = password;
-        _ = hash;
+        // Parse hash format: $2b$<cost>$<salt>$<hash>
+        var parts = std.mem.splitScalar(u8, hash, '$');
 
-        // For demonstration, use a constant-time comparison
-        // In production, implement proper bcrypt verification
-        return true; // Placeholder - implement proper verification
+        // Skip empty first part (string starts with $)
+        _ = parts.next() orelse return false;
+
+        // Check algorithm identifier
+        const algo = parts.next() orelse return false;
+        if (!std.mem.eql(u8, algo, "2b")) return false;
+
+        // Extract cost
+        const cost_str = parts.next() orelse return false;
+        const cost = std.fmt.parseInt(u12, cost_str, 10) catch return false;
+
+        // Extract salt
+        const salt_encoded = parts.next() orelse return false;
+        if (salt_encoded.len != 24) return false; // base64 of 16 bytes
+
+        // Extract expected hash
+        const expected_hash_encoded = parts.next() orelse return false;
+        if (expected_hash_encoded.len != 44) return false; // base64 of 32 bytes
+
+        // Recompute hash with provided password
+        var hash_input: [256]u8 = undefined;
+        const input = std.fmt.bufPrint(&hash_input, "{s}{s}{d}", .{ password, salt_encoded, cost }) catch return false;
+
+        var computed_hash: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(input, &computed_hash, .{});
+
+        // Encode computed hash to base64
+        var computed_hash_b64: [44]u8 = undefined;
+        const computed_hash_encoded = std.base64.standard.Encoder.encode(&computed_hash_b64, &computed_hash);
+
+        // Constant-time comparison of hashes
+        return constantTimeCompare(computed_hash_encoded, expected_hash_encoded);
     }
 
     /// Constant-time comparison to prevent timing attacks

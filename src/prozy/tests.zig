@@ -2200,3 +2200,57 @@ test "Proxy authentication integration with other features" {
     try testing.expect(auth_stats != null);
     try testing.expectEqual(@as(u64, 0), auth_stats.?.total_auth_requests);
 }
+
+test "Proxy authentication password verification and session tracking" {
+    const allocator = testing.allocator;
+
+    // Create auth instance
+    var auth = try ProxyAuth.init(allocator, "Test Realm", .{
+        .basic_enabled = true,
+        .max_failed_attempts = 5,
+        .bcrypt_cost = 10,
+    });
+    defer auth.deinit();
+
+    // Add test users
+    try auth.addUser("alice", "correctPassword");
+    try auth.addUser("bob", "secret123");
+
+    const client_ip = IpKey{ .ipv4 = 0x7F000001 };
+
+    // Test 1: Correct credentials should succeed
+    const valid_alice = "Basic YWxpY2U6Y29ycmVjdFBhc3N3b3Jk"; // base64("alice:correctPassword")
+    const result1 = auth.authenticate(valid_alice, client_ip);
+    try testing.expectEqual(ProxyAuth.AuthResult.success, result1);
+
+    var stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.successful_auths);
+    try testing.expectEqual(@as(u64, 1), stats.active_sessions);
+
+    // Test 2: Incorrect password should fail (this tests the password verification fix)
+    const invalid_alice = "Basic YWxpY2U6d3JvbmdQYXNzd29yZA=="; // base64("alice:wrongPassword")
+    const result2 = auth.authenticate(invalid_alice, client_ip);
+    try testing.expectEqual(ProxyAuth.AuthResult.invalid_credentials, result2);
+
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.failed_auths);
+    try testing.expectEqual(@as(u64, 1), stats.active_sessions); // Should not increment on failure
+
+    // Test 3: Another valid user should succeed
+    const valid_bob = "Basic Ym9iOnNlY3JldDEyMw=="; // base64("bob:secret123")
+    const result3 = auth.authenticate(valid_bob, client_ip);
+    try testing.expectEqual(ProxyAuth.AuthResult.success, result3);
+
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 2), stats.successful_auths);
+    try testing.expectEqual(@as(u64, 2), stats.active_sessions);
+
+    // Test 4: End session should decrement counter (fixes session tracking bug)
+    auth.endSession();
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 1), stats.active_sessions);
+
+    auth.endSession();
+    stats = auth.getStats();
+    try testing.expectEqual(@as(u64, 0), stats.active_sessions);
+}
