@@ -174,28 +174,111 @@ pub const HTTPInspector = struct {
         return false;
     }
 
-    /// Parse Cache-Control header to check for no-store directive
-    /// Returns true if the response should NOT be cached
-    pub fn hasCacheControlNoStore(headers: []const u8) bool {
-        const cache_control = findHeader(headers, "Cache-Control") orelse return false;
+    /// RFC 9111 Cache-Control directives
+    pub const CacheControlDirectives = struct {
+        max_age: ?u32 = null, // RFC 9111 Section 5.2.2.1
+        s_maxage: ?u32 = null, // RFC 9111 Section 5.2.2.2 (shared caches)
+        no_cache: bool = false, // RFC 9111 Section 5.2.2.4
+        no_store: bool = false, // RFC 9111 Section 5.2.2.5
+        must_revalidate: bool = false, // RFC 9111 Section 5.2.2.3
+        proxy_revalidate: bool = false, // RFC 9111 Section 5.2.2.7
+        private: bool = false, // RFC 9111 Section 5.2.2.6
+        public: bool = false, // RFC 9111 Section 5.2.2.1
+        no_transform: bool = false, // RFC 9111 Section 5.2.2.8
+        immutable: bool = false, // RFC 8246 (extension)
 
-        // Look for "no-store" directive (case-insensitive)
+        /// Check if response is cacheable by proxy (shared cache)
+        pub fn isCacheable(self: CacheControlDirectives) bool {
+            // no-store: MUST NOT be cached (RFC 9111 Section 5.2.2.5)
+            if (self.no_store) return false;
+
+            // private: only cacheable by browser, not proxy (RFC 9111 Section 5.2.2.6)
+            if (self.private) return false;
+
+            return true;
+        }
+
+        /// Get TTL (Time To Live) in seconds for cache entry
+        /// s-maxage takes precedence for shared caches (proxies)
+        pub fn getTTL(self: CacheControlDirectives, default_ttl: u32) u32 {
+            // s-maxage takes precedence for shared caches (RFC 9111 Section 5.2.2.2)
+            if (self.s_maxage) |ttl| return ttl;
+
+            // max-age fallback
+            if (self.max_age) |ttl| return ttl;
+
+            // Use default TTL if no explicit directive
+            return default_ttl;
+        }
+
+        /// Check if response requires revalidation before serving from cache
+        pub fn requiresRevalidation(self: CacheControlDirectives) bool {
+            // no-cache: MUST revalidate before use (RFC 9111 Section 5.2.2.4)
+            if (self.no_cache) return true;
+
+            // must-revalidate: MUST revalidate when stale (RFC 9111 Section 5.2.2.3)
+            if (self.must_revalidate) return true;
+
+            // proxy-revalidate: proxies MUST revalidate when stale (RFC 9111 Section 5.2.2.7)
+            if (self.proxy_revalidate) return true;
+
+            return false;
+        }
+    };
+
+    /// Parse Cache-Control header into structured directives (RFC 9111)
+    pub fn parseCacheControl(headers: []const u8) CacheControlDirectives {
+        var directives = CacheControlDirectives{};
+        const cache_control = findHeader(headers, "Cache-Control") orelse return directives;
+
         // Cache-Control can have multiple directives separated by commas
         var it = std.mem.splitSequence(u8, cache_control, ",");
         while (it.next()) |directive_raw| {
             // Trim whitespace using std.mem.trim
             const directive = std.mem.trim(u8, directive_raw, " \t");
 
-            // Check if this directive is "no-store" (ignore any =value part)
-            const equals_idx = std.mem.indexOf(u8, directive, "=");
-            const directive_name = if (equals_idx) |idx| directive[0..idx] else directive;
+            // Parse directive=value format
+            if (std.mem.indexOf(u8, directive, "=")) |eq_idx| {
+                const name = directive[0..eq_idx];
+                const value = std.mem.trim(u8, directive[eq_idx + 1 ..], " \t\""); // Trim quotes too
 
-            if (std.ascii.eqlIgnoreCase(directive_name, "no-store")) {
-                return true;
+                // Parse directives with values
+                if (std.ascii.eqlIgnoreCase(name, "max-age")) {
+                    directives.max_age = std.fmt.parseInt(u32, value, 10) catch null;
+                } else if (std.ascii.eqlIgnoreCase(name, "s-maxage")) {
+                    directives.s_maxage = std.fmt.parseInt(u32, value, 10) catch null;
+                }
+            } else {
+                // Boolean directives (no value)
+                if (std.ascii.eqlIgnoreCase(directive, "no-cache")) {
+                    directives.no_cache = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "no-store")) {
+                    directives.no_store = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "must-revalidate")) {
+                    directives.must_revalidate = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "proxy-revalidate")) {
+                    directives.proxy_revalidate = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "private")) {
+                    directives.private = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "public")) {
+                    directives.public = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "no-transform")) {
+                    directives.no_transform = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "immutable")) {
+                    directives.immutable = true;
+                }
             }
         }
 
-        return false;
+        return directives;
+    }
+
+    /// Parse Cache-Control header to check for no-store directive (legacy function)
+    /// Returns true if the response should NOT be cached
+    /// NOTE: Use parseCacheControl() for full RFC 9111 compliance
+    pub fn hasCacheControlNoStore(headers: []const u8) bool {
+        const directives = parseCacheControl(headers);
+        return directives.no_store;
     }
 
     /// Check if an IP address string is IPv6 (contains colons)
