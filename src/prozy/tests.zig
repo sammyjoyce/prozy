@@ -1751,13 +1751,7 @@ test "HTTPInspector: manipulate headers - add RFC 7239 Forwarded header" {
 
     const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
 
-    const original_request =
-        \\GET /api/users HTTP/1.1
-        \\Host: example.com
-        \\User-Agent: TestClient/1.0
-        \\
-        \\
-    ;
+    const original_request = "GET /api/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: TestClient/1.0\r\n\r\n";
 
     const client_ip = "192.168.1.100";
     const client_proto = "http";
@@ -1792,14 +1786,7 @@ test "HTTPInspector: manipulate headers - detect upstream X-Forwarded-Proto" {
 
     const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
 
-    const original_request =
-        \\GET /api/secure HTTP/1.1
-        \\Host: example.com
-        \\X-Forwarded-Proto: https
-        \\User-Agent: TestClient/1.0
-        \\
-        \\
-    ;
+    const original_request = "GET /api/secure HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-Proto: https\r\nUser-Agent: TestClient/1.0\r\n\r\n";
 
     const client_ip = "192.168.1.100";
     const client_proto = "http"; // Direct connection is HTTP
@@ -1826,13 +1813,7 @@ test "HTTPInspector: manipulate headers - Connection: close always added" {
 
     const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
 
-    const original_request =
-        \\GET /api/users HTTP/1.1
-        \\Host: example.com
-        \\Connection: keep-alive
-        \\
-        \\
-    ;
+    const original_request = "GET /api/users HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
 
     const client_ip = "10.0.0.50";
     const client_proto = "http";
@@ -1898,12 +1879,7 @@ test "HTTPInspector: manipulate headers - without host header" {
 
     const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
 
-    const original_request =
-        \\GET /api/users HTTP/1.1
-        \\User-Agent: TestClient/1.0
-        \\
-        \\
-    ;
+    const original_request = "GET /api/users HTTP/1.1\r\nUser-Agent: TestClient/1.0\r\n\r\n";
 
     const client_ip = "192.168.1.100";
     const client_proto = "http";
