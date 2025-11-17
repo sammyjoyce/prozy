@@ -141,14 +141,7 @@ pub const AdminServer = struct {
     }
 
     fn handleHealth(writer: *const Io.Reader.Interface) void {
-        const response =
-            \\HTTP/1.1 200 OK
-            \\Content-Type: application/json
-            \\Content-Length: 15
-            \\
-            \\{"status":"ok"}
-            \\
-        ;
+        const response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}";
         _ = Writer.writeAll(writer, response) catch {};
     }
 
@@ -191,13 +184,7 @@ pub const AdminServer = struct {
         }) catch "# Error formatting metrics\n";
 
         var header_buffer: [256]u8 = undefined;
-        const headers = std.fmt.bufPrint(&header_buffer,
-            \\HTTP/1.1 200 OK
-            \\Content-Type: text/plain; version=0.0.4
-            \\Content-Length: {}
-            \\
-            \\
-        , .{body.len}) catch return;
+        const headers = std.fmt.bufPrint(&header_buffer, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n", .{body.len}) catch return;
 
         _ = Writer.writeAll(writer, headers) catch {};
         _ = Writer.writeAll(writer, body) catch {};
@@ -240,25 +227,12 @@ pub const AdminServer = struct {
             const body = stream.getWritten();
 
             var header_buffer: [256]u8 = undefined;
-            const headers = std.fmt.bufPrint(&header_buffer,
-                \\HTTP/1.1 200 OK
-                \\Content-Type: application/json
-                \\Content-Length: {}
-                \\
-                \\
-            , .{body.len}) catch return;
+            const headers = std.fmt.bufPrint(&header_buffer, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", .{body.len}) catch return;
 
             _ = Writer.writeAll(writer, headers) catch {};
             _ = Writer.writeAll(writer, body) catch {};
         } else {
-            const response =
-                \\HTTP/1.1 200 OK
-                \\Content-Type: application/json
-                \\Content-Length: 17
-                \\
-                \\{"backends":null}
-                \\
-            ;
+            const response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\n\r\n{\"backends\":null}";
             _ = Writer.writeAll(writer, response) catch {};
         }
     }
@@ -292,25 +266,12 @@ pub const AdminServer = struct {
             const body = stream.getWritten();
 
             var header_buffer: [256]u8 = undefined;
-            const headers = std.fmt.bufPrint(&header_buffer,
-                \\HTTP/1.1 200 OK
-                \\Content-Type: application/json
-                \\Content-Length: {}
-                \\
-                \\
-            , .{body.len}) catch return;
+            const headers = std.fmt.bufPrint(&header_buffer, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", .{body.len}) catch return;
 
             _ = Writer.writeAll(writer, headers) catch {};
             _ = Writer.writeAll(writer, body) catch {};
         } else {
-            const response =
-                \\HTTP/1.1 200 OK
-                \\Content-Type: application/json
-                \\Content-Length: 15
-                \\
-                \\{"routes":null}
-                \\
-            ;
+            const response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"routes\":null}";
             _ = Writer.writeAll(writer, response) catch {};
         }
     }
@@ -320,9 +281,7 @@ pub const AdminServer = struct {
             const snapshot = auth.getStats();
 
             var buffer: [2048]u8 = undefined;
-            const body = std.fmt.bufPrint(&buffer,
-                \\{{"total_auth_requests":{},"successful_auths":{},"failed_auths":{},"blocked_ips":{},"active_sessions":{},"success_rate":{d:.2}}}
-            , .{
+            const body = std.fmt.bufPrint(&buffer, "{{\"total_auth_requests\":{},\"successful_auths\":{},\"failed_auths\":{},\"blocked_ips\":{},\"active_sessions\":{},\"success_rate\":{d:.2}}}", .{
                 snapshot.total_auth_requests,
                 snapshot.successful_auths,
                 snapshot.failed_auths,
@@ -332,50 +291,25 @@ pub const AdminServer = struct {
             }) catch "# Error formatting auth stats\n";
 
             var header_buffer: [256]u8 = undefined;
-            const headers = std.fmt.bufPrint(&header_buffer,
-                \\HTTP/1.1 200 OK
-                \\Content-Type: application/json
-                \\Content-Length: {}
-                \\
-                \\
-            , .{body.len}) catch return;
+            const headers = std.fmt.bufPrint(&header_buffer, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", .{body.len}) catch return;
 
             _ = Writer.writeAll(writer, headers) catch {};
             _ = Writer.writeAll(writer, body) catch {};
         } else {
-            const response =
-                \\HTTP/1.1 404 Not Found
-                \\Content-Type: application/json
-                \\Content-Length: 48
-                \\
-                \\{"error":"Authentication not enabled on proxy"}
-                \\
-            ;
+            const response = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 48\r\n\r\n{\"error\":\"Authentication not enabled on proxy\"}";
             _ = Writer.writeAll(writer, response) catch {};
         }
     }
 
     fn handle404(writer: *const Io.Reader.Interface, path: []const u8) void {
         _ = path;
-        const response =
-            \\HTTP/1.1 404 Not Found
-            \\Content-Type: text/plain
-            \\Content-Length: 9
-            \\
-            \\Not Found
-        ;
+        const response = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 9\r\n\r\nNot Found";
         _ = Writer.writeAll(writer, response) catch {};
     }
 
     fn handle405(writer: *const Io.Reader.Interface, method: []const u8) void {
         _ = method;
-        const response =
-            \\HTTP/1.1 405 Method Not Allowed
-            \\Content-Type: text/plain
-            \\Content-Length: 18
-            \\
-            \\Method Not Allowed
-        ;
+        const response = "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nMethod Not Allowed";
         _ = Writer.writeAll(writer, response) catch {};
     }
 };
