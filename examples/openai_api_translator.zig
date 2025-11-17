@@ -141,6 +141,21 @@ fn convertRequestToChat(
     };
 }
 
+/// Free memory allocated by convertRequestToChat
+fn freeChatCompletionsRequest(allocator: std.mem.Allocator, req: ChatCompletionsRequest) void {
+    allocator.free(req.model);
+    for (req.messages) |msg| {
+        allocator.free(msg.content);
+    }
+    allocator.free(req.messages);
+    if (req.stop) |stop| {
+        for (stop) |s| {
+            allocator.free(s);
+        }
+        allocator.free(stop);
+    }
+}
+
 /// Convert Chat Completions response to Responses API response
 fn convertResponseToResponses(
     allocator: std.mem.Allocator,
@@ -166,6 +181,13 @@ fn convertResponseToResponses(
     };
 }
 
+/// Free memory allocated by convertResponseToResponses
+fn freeResponsesAPIResponse(allocator: std.mem.Allocator, resp: ResponsesAPIResponse) void {
+    allocator.free(resp.id);
+    allocator.free(resp.model);
+    allocator.free(resp.output);
+}
+
 /// Simple HTTP request transformer (demonstration)
 fn transformRequest(
     allocator: std.mem.Allocator,
@@ -189,18 +211,14 @@ fn transformRequest(
 
     // Convert to Chat Completions format
     const chat_req = try convertRequestToChat(allocator, parsed.value);
+    defer freeChatCompletionsRequest(allocator, chat_req);
 
     log.info("Converted to Chat Completions request:", .{});
     log.info("  Model: {s}", .{chat_req.model});
     log.info("  Messages: {}", .{chat_req.messages.len});
 
     // Serialize to JSON
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
-
-    try std.json.stringify(chat_req, .{}, result.writer());
-
-    return result.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, chat_req, .{});
 }
 
 /// Simple HTTP response transformer (demonstration)
@@ -226,18 +244,14 @@ fn transformResponse(
 
     // Convert to Responses API format
     const responses_resp = try convertResponseToResponses(allocator, parsed.value);
+    defer freeResponsesAPIResponse(allocator, responses_resp);
 
     log.info("Converted to Responses API response:", .{});
     log.info("  ID: {s}", .{responses_resp.id});
     log.info("  Output length: {}", .{responses_resp.output.len});
 
     // Serialize to JSON
-    var result = std.ArrayList(u8).init(allocator);
-    errdefer result.deinit();
-
-    try std.json.stringify(responses_resp, .{}, result.writer());
-
-    return result.toOwnedSlice();
+    return std.json.Stringify.valueAlloc(allocator, responses_resp, .{});
 }
 
 pub fn main() !void {

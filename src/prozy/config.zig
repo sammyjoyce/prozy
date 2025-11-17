@@ -56,6 +56,7 @@
 //! ```
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Backend = @import("backend.zig").Backend;
 const LoadBalancer = @import("backend.zig").LoadBalancer;
 const Route = @import("routing.zig").Route;
@@ -68,6 +69,12 @@ const HttpMode = @import("routing.zig").HttpMode;
 const AccessControl = @import("access.zig").AccessControl;
 
 const log = std.log;
+
+fn logValidationError(comptime fmt: []const u8, args: anytype) void {
+    if (!builtin.is_test) {
+        log.err(fmt, args);
+    }
+}
 
 /// Configuration errors
 pub const ConfigError = error{
@@ -195,25 +202,25 @@ pub const Config = struct {
     pub fn validate(self: Config) ConfigError!void {
         // Validate proxy settings
         if (self.proxy.listen_port == 0) {
-            log.err("invalid proxy port: 0", .{});
+            logValidationError("invalid proxy port: 0", .{});
             return ConfigError.ValidationFailed;
         }
 
         // Validate clusters
         for (self.clusters) |cluster| {
             if (cluster.backends.len == 0) {
-                log.err("cluster '{s}' has no backends", .{cluster.name});
+                logValidationError("cluster '{s}' has no backends", .{cluster.name});
                 return ConfigError.ValidationFailed;
             }
 
             // Validate backends
             for (cluster.backends) |backend| {
                 if (backend.port == 0) {
-                    log.err("invalid backend port: 0 in cluster '{s}'", .{cluster.name});
+                    logValidationError("invalid backend port: 0 in cluster '{s}'", .{cluster.name});
                     return ConfigError.ValidationFailed;
                 }
                 if (backend.weight == 0) {
-                    log.err("invalid backend weight: 0 in cluster '{s}'", .{cluster.name});
+                    logValidationError("invalid backend weight: 0 in cluster '{s}'", .{cluster.name});
                     return ConfigError.ValidationFailed;
                 }
             }
@@ -229,7 +236,7 @@ pub const Config = struct {
                 }
             }
             if (!found) {
-                log.err("route '{s}' references unknown cluster '{s}'", .{ route.name, route.cluster });
+                logValidationError("route '{s}' references unknown cluster '{s}'", .{ route.name, route.cluster });
                 return ConfigError.ValidationFailed;
             }
         }
@@ -458,15 +465,28 @@ fn loadConfigFromZon(allocator: std.mem.Allocator, path: []const u8) !*Config {
 
 /// Parse ZON configuration from string
 fn parseZonConfig(allocator: std.mem.Allocator, source: []const u8) !*Config {
-    // Parse ZON using Zig's parser
-    const parsed = std.zig.parseZon(allocator, source) catch |err| {
+    const zon_source = try allocator.allocSentinel(u8, source.len, 0);
+    defer allocator.free(zon_source);
+    std.mem.copyForwards(u8, zon_source[0..source.len], source);
+
+    var ast = std.zig.Ast.parse(allocator, zon_source, .zon) catch |err| {
         log.err("failed to parse ZON config: {s}", .{@errorName(err)});
         return ConfigError.ParseFailed;
     };
-    defer parsed.deinit(allocator);
+    defer ast.deinit(allocator);
+
+    if (ast.errors.len != 0) {
+        const parse_error = ast.errors[0];
+        const token_text = ast.tokenSlice(parse_error.token);
+        log.err(
+            "failed to parse ZON config: {s} near '{s}'",
+            .{ @tagName(parse_error.tag), token_text },
+        );
+        return ConfigError.ParseFailed;
+    }
 
     // Evaluate the ZON AST to extract configuration
-    const zon_config = try evaluateZonAst(allocator, parsed.ast);
+    const zon_config = try evaluateZonAst(allocator, ast);
 
     // Convert to Config
     const config = try allocator.create(Config);
@@ -487,29 +507,78 @@ fn parseZonConfig(allocator: std.mem.Allocator, source: []const u8) !*Config {
 }
 
 /// Evaluate ZON AST to extract configuration
-/// Note: This is a simplified implementation that uses @import for evaluation
-/// A full implementation would walk the AST manually
-fn evaluateZonAst(allocator: std.mem.Allocator, ast: std.zig.Ast) !JsonConfig {
-    // For now, we'll use a simplified approach that relies on the ZON
-    // being evaluable as a Zig struct literal
-    // A production implementation would walk the AST nodes manually
+fn evaluateZonAst(allocator: std.mem.Allocator, ast: std.zig.Ast) ConfigError!JsonConfig {
+    if (ast.mode != .zon) {
+        log.err("expected ZON AST but received mode {s}", .{@tagName(ast.mode)});
+        return ConfigError.ParseFailed;
+    }
 
-    // This is a placeholder - full ZON AST evaluation is complex
-    // For practical use, we recommend JSON format until full ZON support is implemented
-    _ = ast;
-
-    log.warn("ZON parsing is experimental - full AST evaluation not yet implemented", .{});
-    log.warn("Using default configuration. Please use JSON format for production.", .{});
-
-    // Return default config for now
-    return JsonConfig{
-        .proxy = .{
-            .listen_host = try allocator.dupe(u8, "127.0.0.1"),
-            .listen_port = 8080,
-        },
-        .clusters = &[_]ClusterConfig{},
-        .routes = &[_]RouteConfig{},
+    var zoir = std.zig.ZonGen.generate(allocator, ast, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return ConfigError.OutOfMemory,
     };
+    defer zoir.deinit(allocator);
+
+    const zon_options: std.zon.parse.Options = .{
+        .ignore_unknown_fields = true,
+        .free_on_error = true,
+    };
+
+    var diagnostics = std.zon.parse.Diagnostics{};
+    defer releaseZonDiagnostics(&diagnostics, allocator);
+
+    const zon_config = std.zon.parse.fromZoirAlloc(JsonConfig, allocator, ast, zoir, &diagnostics, zon_options) catch |err| switch (err) {
+        error.OutOfMemory => return ConfigError.OutOfMemory,
+        error.ParseZon => {
+            logZonDiagnostics(&diagnostics);
+            return ConfigError.ParseFailed;
+        },
+    };
+
+    return zon_config;
+}
+
+fn releaseZonDiagnostics(diag: *std.zon.parse.Diagnostics, allocator: std.mem.Allocator) void {
+    diag.ast = .{
+        .source = "",
+        .tokens = .empty,
+        .nodes = .empty,
+        .extra_data = &.{},
+        .mode = .zon,
+        .errors = &.{},
+    };
+    diag.zoir = .{
+        .nodes = .empty,
+        .extra = &.{},
+        .limbs = &.{},
+        .string_bytes = &.{},
+        .compile_errors = &.{},
+        .error_notes = &.{},
+    };
+    diag.deinit(allocator);
+}
+
+fn logZonDiagnostics(diag: *const std.zon.parse.Diagnostics) void {
+    var iterator = diag.iterateErrors();
+    var reported = false;
+    while (iterator.next()) |err| {
+        reported = true;
+        const loc = err.getLocation(diag);
+        log.err(
+            "failed to evaluate ZON config at {d}:{d}: {f}",
+            .{ loc.line + 1, loc.column + 1, err.fmtMessage(diag) },
+        );
+        var notes = err.iterateNotes(diag);
+        while (notes.next()) |note| {
+            const note_loc = note.getLocation(diag);
+            log.err(
+                "  note {d}:{d}: {f}",
+                .{ note_loc.line + 1, note_loc.column + 1, note.fmtMessage(diag) },
+            );
+        }
+    }
+    if (!reported) {
+        log.err("failed to evaluate ZON config: invalid data or syntax", .{});
+    }
 }
 
 /// Duplicate access control config into arena
@@ -693,4 +762,161 @@ test "Format detection - JSON" {
 test "Format detection - ZON" {
     try std.testing.expectEqual(ConfigFormat.zon, detectConfigFormat("config.zon"));
     try std.testing.expectEqual(ConfigFormat.zon, detectConfigFormat("/path/to/config.zon"));
+}
+
+test "ZON parsing - full configuration coverage" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const source =
+        \\ .{
+        \\     .proxy = .{
+        \\         .listen_host = "0.0.0.0",
+        \\         .listen_port = 9090,
+        \\         .max_connections = 123,
+        \\         .reuse_address = false,
+        \\     },
+        \\     .mode = .forward_proxy,
+        \\     .cache = .{
+        \\         .enabled = true,
+        \\         .max_size = 512,
+        \\     },
+        \\     .rate_limit = .{
+        \\         .enabled = true,
+        \\         .max_per_ip = 5,
+        \\         .max_global = 10,
+        \\     },
+        \\     .access_control = .{
+        \\         .enabled = true,
+        \\         .default_policy = .deny,
+        \\         .allow_list = .{"10.0.0.1"},
+        \\         .deny_list = .{"20.0.0.1"},
+        \\     },
+        \\     .health_check = .{
+        \\         .enabled = false,
+        \\         .interval_seconds = 30,
+        \\         .timeout_ms = 100,
+        \\         .unhealthy_threshold = 7,
+        \\         .healthy_threshold = 3,
+        \\     },
+        \\     .admin = .{
+        \\         .enabled = true,
+        \\         .listen_host = "127.0.0.1",
+        \\         .listen_port = 7777,
+        \\     },
+        \\     .logging = .{
+        \\         .level = .debug,
+        \\         .enable_connection_logging = false,
+        \\         .enable_stats = false,
+        \\     },
+        \\     .clusters = .{
+        \\         .{
+        \\             .name = "alpha",
+        \\             .backends = .{
+        \\                 .{ .host = "10.0.0.5", .port = 80, .weight = 2 },
+        \\             },
+        \\             .strategy = .round_robin,
+        \\             .max_concurrent = 42,
+        \\         },
+        \\     },
+        \\     .routes = .{
+        \\         .{
+        \\             .name = "route_one",
+        \\             .match = .{
+        \\                 .host = "service.local",
+        \\                 .path_prefix = "/api",
+        \\                 .methods = .{"GET", "POST"},
+        \\             },
+        \\             .cluster = "alpha",
+        \\             .cache_policy = .{
+        \\                 .allow = true,
+        \\                 .ttl_seconds = 9,
+        \\                 .max_size = 10,
+        \\             },
+        \\             .timeout_policy = .{
+        \\                 .connect_timeout_ms = 1,
+        \\                 .request_timeout_ms = 2,
+        \\                 .response_timeout_ms = 3,
+        \\                 .idle_timeout_seconds = 4,
+        \\             },
+        \\             .concurrency_policy = .{
+        \\                 .max_concurrent = 11,
+        \\                 .max_queue_depth = 12,
+        \\                 .reject_when_full = true,
+        \\             },
+        \\         },
+        \\     },
+        \\ }
+    ;
+
+    const config = try parseZon(allocator, source);
+
+    try std.testing.expectEqualStrings("0.0.0.0", config.proxy.listen_host);
+    try std.testing.expectEqual(@as(u16, 9090), config.proxy.listen_port);
+    try std.testing.expectEqual(@as(?usize, 123), config.proxy.max_connections);
+    try std.testing.expect(!config.proxy.reuse_address);
+
+    try std.testing.expectEqual(HttpMode.forward_proxy, config.mode);
+
+    try std.testing.expect(config.cache.enabled);
+    try std.testing.expectEqual(@as(usize, 512), config.cache.max_size);
+
+    try std.testing.expect(config.rate_limit.enabled);
+    try std.testing.expectEqual(@as(u32, 5), config.rate_limit.max_per_ip);
+    try std.testing.expectEqual(@as(u32, 10), config.rate_limit.max_global);
+
+    try std.testing.expect(config.access_control.enabled);
+    try std.testing.expectEqual(AccessControl.Policy.deny, config.access_control.default_policy);
+    try std.testing.expectEqual(@as(usize, 1), config.access_control.allow_list.len);
+    try std.testing.expectEqualStrings("10.0.0.1", config.access_control.allow_list[0]);
+    try std.testing.expectEqual(@as(usize, 1), config.access_control.deny_list.len);
+    try std.testing.expectEqualStrings("20.0.0.1", config.access_control.deny_list[0]);
+
+    try std.testing.expect(!config.health_check.enabled);
+    try std.testing.expectEqual(@as(u64, 30), config.health_check.interval_seconds);
+    try std.testing.expectEqual(@as(u64, 100), config.health_check.timeout_ms);
+    try std.testing.expectEqual(@as(u32, 7), config.health_check.unhealthy_threshold);
+    try std.testing.expectEqual(@as(u32, 3), config.health_check.healthy_threshold);
+
+    try std.testing.expect(config.admin.enabled);
+    try std.testing.expectEqualStrings("127.0.0.1", config.admin.listen_host);
+    try std.testing.expectEqual(@as(u16, 7777), config.admin.listen_port);
+
+    try std.testing.expectEqual(std.log.Level.debug, config.logging.level);
+    try std.testing.expect(!config.logging.enable_connection_logging);
+    try std.testing.expect(!config.logging.enable_stats);
+
+    try std.testing.expectEqual(@as(usize, 1), config.clusters.len);
+    const cluster = config.clusters[0];
+    try std.testing.expectEqualStrings("alpha", cluster.name);
+    try std.testing.expectEqual(@as(usize, 1), cluster.backends.len);
+    try std.testing.expectEqualStrings("10.0.0.5", cluster.backends[0].host);
+    try std.testing.expectEqual(@as(u16, 80), cluster.backends[0].port);
+    try std.testing.expectEqual(@as(u32, 2), cluster.backends[0].weight);
+    try std.testing.expectEqual(LoadBalancer.Strategy.round_robin, cluster.strategy);
+    try std.testing.expectEqual(@as(u32, 42), cluster.max_concurrent);
+
+    try std.testing.expectEqual(@as(usize, 1), config.routes.len);
+    const route = config.routes[0];
+    try std.testing.expectEqualStrings("route_one", route.name);
+    try std.testing.expectEqualStrings("alpha", route.cluster);
+    try std.testing.expectEqualStrings("service.local", route.match.host.?);
+    try std.testing.expectEqualStrings("/api", route.match.path_prefix.?);
+    try std.testing.expectEqual(@as(usize, 2), route.match.methods.len);
+    try std.testing.expectEqualStrings("GET", route.match.methods[0]);
+    try std.testing.expectEqualStrings("POST", route.match.methods[1]);
+
+    try std.testing.expect(route.cache_policy.allow);
+    try std.testing.expectEqual(@as(u32, 9), route.cache_policy.ttl_seconds);
+    try std.testing.expectEqual(@as(usize, 10), route.cache_policy.max_size);
+
+    try std.testing.expectEqual(@as(u64, 1), route.timeout_policy.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 2), route.timeout_policy.request_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 3), route.timeout_policy.response_timeout_ms);
+    try std.testing.expectEqual(@as(i64, 4), route.timeout_policy.idle_timeout_seconds);
+
+    try std.testing.expectEqual(@as(u32, 11), route.concurrency_policy.max_concurrent);
+    try std.testing.expectEqual(@as(u32, 12), route.concurrency_policy.max_queue_depth);
+    try std.testing.expect(route.concurrency_policy.reject_when_full);
 }
