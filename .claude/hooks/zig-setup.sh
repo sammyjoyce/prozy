@@ -3,7 +3,8 @@
 # Runs at the start of each Claude Code session
 # Tries multiple strategies to ensure Zig 0.16.0-dev is available
 
-set -e
+# Note: Not using 'set -e' to allow graceful fallback across strategies
+# in restricted environments (e.g., Claude Code web)
 
 # Latest nightly version (fallback if all else fails)
 NIGHTLY_VERSION="0.16.0-dev.1316+181b25ce4"
@@ -15,14 +16,33 @@ download_and_extract_zig() {
     local url="$1"
     local dest="$2"
 
+    # Validate URL format
+    if [[ ! "$url" =~ ^https?:// ]]; then
+        echo "❌ Invalid URL format: $url"
+        return 1
+    fi
+
+    # Create destination directory if it doesn't exist
+    mkdir -p "$dest" || return 1
+
+    echo "   Downloading from: $url"
+
     if command -v curl >/dev/null 2>&1; then
-        curl -fL "$url" | tar -xJ -C "$dest" --strip-components=1 2>/dev/null
+        if ! curl -fL "$url" 2>&1 | tar -xJ -C "$dest" --strip-components=1 2>&1; then
+            echo "❌ Download or extraction failed"
+            return 1
+        fi
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO- "$url" | tar -xJ -C "$dest" --strip-components=1 2>/dev/null
+        if ! wget -qO- "$url" 2>&1 | tar -xJ -C "$dest" --strip-components=1 2>&1; then
+            echo "❌ Download or extraction failed"
+            return 1
+        fi
     else
         echo "❌ Neither curl nor wget available"
         return 1
     fi
+
+    return 0
 }
 
 # Function to setup Zig via Nix flake (preferred method)
@@ -80,7 +100,14 @@ setup_with_nix() {
 # Function to install Zig via system package manager
 install_via_package_manager() {
     echo "📥 Attempting to install Zig via package manager..."
-    
+
+    # Skip package manager installation in restricted environments (Claude Code web)
+    if [[ ! -w /etc/sudoers ]] && [[ ! -w /etc/apt ]] 2>/dev/null; then
+        echo "⚠️  Insufficient permissions for package manager installation"
+        echo "   Skipping package manager strategy..."
+        return 1
+    fi
+
     if command -v apt &>/dev/null; then
         echo "🔧 Installing Zig via apt..."
         sudo apt update && sudo apt install -y zig
@@ -122,10 +149,11 @@ install_zig_master() {
 
     # Fetch latest master version from index.json
     echo "📦 Fetching latest Zig master version..."
+    ZIG_INDEX=""
     if command -v curl >/dev/null 2>&1; then
-        ZIG_INDEX=$(curl -fsSL https://ziglang.org/download/index.json 2>/dev/null)
+        ZIG_INDEX=$(curl -fsSL https://ziglang.org/download/index.json 2>&1) || true
     elif command -v wget >/dev/null 2>&1; then
-        ZIG_INDEX=$(wget -qO- https://ziglang.org/download/index.json 2>/dev/null)
+        ZIG_INDEX=$(wget -qO- https://ziglang.org/download/index.json 2>&1) || true
     else
         echo "❌ Neither curl nor wget available"
         return 1
@@ -133,9 +161,15 @@ install_zig_master() {
 
     # Extract version and URL for the platform
     PLATFORM_KEY="${ZIG_ARCH}-${ZIG_OS}"
-    ZIG_URL=$(echo "$ZIG_INDEX" | grep -A2 "\"$PLATFORM_KEY\"" | grep "tarball" | sed -E 's/.*"tarball": "([^"]+)".*/\1/')
+    ZIG_URL=""
 
-    if [[ -z "$ZIG_URL" ]]; then
+    # Only parse if we got valid JSON (starts with '{')
+    if [[ "$ZIG_INDEX" == "{"* ]]; then
+        ZIG_URL=$(echo "$ZIG_INDEX" | grep -A2 "\"$PLATFORM_KEY\"" | grep "tarball" | sed -E 's/.*"tarball": "([^"]+)".*/\1/' 2>/dev/null || true)
+    fi
+
+    # Validate URL format before using it
+    if [[ -z "$ZIG_URL" ]] || [[ ! "$ZIG_URL" =~ ^https?:// ]]; then
         echo "⚠️  Could not parse latest version, using fallback..."
         ZIG_URL="https://ziglang.org/builds/zig-${ZIG_ARCH}-${ZIG_OS}-${NIGHTLY_VERSION}.tar.xz"
     fi
@@ -145,8 +179,6 @@ install_zig_master() {
 
     # Create directory
     mkdir -p "$ZIG_DIR"
-
-    echo "📦 Downloading Zig from: $ZIG_URL"
 
     if ! download_and_extract_zig "$ZIG_URL" "$ZIG_DIR"; then
         echo "❌ Download failed"
@@ -226,24 +258,28 @@ if [[ "$SKIP_ZIG_INSTALL" != "true" ]]; then
     else
         echo "❌ All Zig installation strategies failed"
         echo "Please install Zig 0.16.0-dev manually: https://ziglang.org/download/"
-        exit 1
+        echo ""
+        echo "⚠️  Continuing setup without Zig - you may need to install it manually"
     fi
 fi
 
 # Final verification
 if ! command -v zig &>/dev/null; then
     echo "❌ Zig installation failed - zig not in PATH"
-    exit 1
-fi
+    echo "⚠️  You will need to install Zig 0.16.0-dev manually before building"
+    echo "   Download from: https://ziglang.org/download/"
+    echo ""
+    # Don't exit with error - allow hook to complete for environment setup
+else
+    ZIG_VERSION=$(zig version)
+    echo "✅ Zig version: $ZIG_VERSION"
 
-ZIG_VERSION=$(zig version)
-echo "✅ Zig version: $ZIG_VERSION"
-
-# Verify we have the minimum required version (0.16.0-dev)
-if [[ ! "$ZIG_VERSION" =~ ^0\.16\. ]]; then
-    echo "⚠️  Warning: Prozy requires Zig 0.16.0-dev or later for async I/O"
-    echo "   Current version: $ZIG_VERSION"
-    echo "   Consider updating via: nix flake update (if using Nix)"
+    # Verify we have the minimum required version (0.16.0-dev)
+    if [[ ! "$ZIG_VERSION" =~ ^0\.16\. ]]; then
+        echo "⚠️  Warning: Prozy requires Zig 0.16.0-dev or later for async I/O"
+        echo "   Current version: $ZIG_VERSION"
+        echo "   Consider updating via: nix flake update (if using Nix)"
+    fi
 fi
 
 # Verify project structure
@@ -314,17 +350,21 @@ fi
 # Verify the project can be built
 echo ""
 echo "🔧 Verifying build system..."
-cd "$CLAUDE_PROJECT_DIR"
+if [[ -d "$CLAUDE_PROJECT_DIR" ]]; then
+    cd "$CLAUDE_PROJECT_DIR" || true
+else
+    echo "⚠️  Project directory not accessible: $CLAUDE_PROJECT_DIR"
+fi
 
-if zig build --help &>/dev/null; then
+if command -v zig &>/dev/null && zig build --help &>/dev/null; then
     echo "✅ Build system is functional"
-    
+
     # Fetch dependencies if build.zig.zon exists
     if [[ -f "$CLAUDE_PROJECT_DIR/build.zig.zon" ]]; then
         echo "📦 Fetching build dependencies..."
         zig build --fetch 2>/dev/null || true
     fi
-    
+
     # Pre-build if possible (fail silently to not block setup)
     echo "🏗️  Attempting pre-build..."
     if zig build >/dev/null 2>&1; then
@@ -332,14 +372,14 @@ if zig build --help &>/dev/null; then
     else
         echo "⚠️  Build failed - may need dependency updates"
     fi
-    
+
     # List available build steps
     echo ""
     echo "📋 Available build targets:"
     zig build --help 2>/dev/null | grep -E "^\s+zig build [a-z_-]+" | head -10 || echo "  Run 'zig build --help' for details"
 else
     echo "⚠️  Warning: Could not verify build system"
-    echo "   This may indicate a problem with build.zig"
+    echo "   Run 'zig build --help' manually to check build.zig"
 fi
 
 echo ""
