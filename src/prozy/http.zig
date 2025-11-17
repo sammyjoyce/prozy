@@ -140,6 +140,322 @@ pub const HTTPInspector = struct {
         }
         return null;
     }
+
+    /// List of hop-by-hop headers that must be removed before forwarding (RFC 9110 Section 7.6.1)
+    /// NOTE: Transfer-Encoding is NOT included because we don't decode/re-encode chunked bodies.
+    /// As a simple forwarding proxy, we preserve Transfer-Encoding to maintain message integrity.
+    const hop_by_hop_headers = [_][]const u8{
+        "Connection",
+        "Keep-Alive",
+        "Proxy-Connection",
+        "TE",
+        "Trailer",
+        "Upgrade",
+        "Proxy-Authenticate",
+        "Proxy-Authorization",
+    };
+
+    /// Check if a header is hop-by-hop and should be removed
+    /// NOTE: Transfer-Encoding is preserved to maintain body framing for chunked messages
+    fn isHopByHopHeader(header_name: []const u8) bool {
+        for (hop_by_hop_headers) |hop_by_hop| {
+            if (std.ascii.eqlIgnoreCase(header_name, hop_by_hop)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Parse Cache-Control header to check for no-store directive
+    /// Returns true if the response should NOT be cached
+    pub fn hasCacheControlNoStore(headers: []const u8) bool {
+        const cache_control = findHeader(headers, "Cache-Control") orelse return false;
+
+        // Look for "no-store" directive (case-insensitive)
+        // Cache-Control can have multiple directives separated by commas
+        var it = std.mem.splitSequence(u8, cache_control, ",");
+        while (it.next()) |directive_raw| {
+            // Trim whitespace using std.mem.trim
+            const directive = std.mem.trim(u8, directive_raw, " \t");
+
+            // Check if this directive is "no-store" (ignore any =value part)
+            const equals_idx = std.mem.indexOf(u8, directive, "=");
+            const directive_name = if (equals_idx) |idx| directive[0..idx] else directive;
+
+            if (std.ascii.eqlIgnoreCase(directive_name, "no-store")) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// Manipulate HTTP request headers: add proxy headers, remove hop-by-hop headers
+    /// Returns a new buffer with the modified request
+    /// Caller must provide a buffer large enough (recommend original size + 512 bytes for added headers)
+    pub fn manipulateRequestHeaders(
+        self: *const HTTPInspector,
+        allocator: std.mem.Allocator,
+        original_request: []const u8,
+        client_ip: []const u8,
+        client_proto: []const u8,
+        host_header: ?[]const u8,
+    ) ![]u8 {
+        // Find where headers end
+        const headers_end = findHeadersEnd(original_request) orelse {
+            // No headers end marker found, return original
+            return try allocator.dupe(u8, original_request);
+        };
+
+        // Split request into request line + headers + body
+        var lines = std.mem.splitSequence(u8, original_request[0..headers_end], "\r\n");
+        const request_line = lines.next() orelse return error.InvalidRequest;
+
+        // Build new request in a buffer
+        var modified_request: std.ArrayList(u8) = .{};
+        errdefer modified_request.deinit(allocator);
+
+        // 1. Write request line
+        try modified_request.appendSlice(allocator, request_line);
+        try modified_request.appendSlice(allocator, "\r\n");
+
+        // 2. Add/modify headers
+        // First, copy existing headers (excluding hop-by-hop headers and Connection-listed headers)
+        var connection_header_tokens: std.ArrayList([]const u8) = .{};
+        defer connection_header_tokens.deinit(allocator);
+
+        // First pass: find Connection header to identify additional hop-by-hop headers
+        var temp_it = std.mem.splitSequence(u8, original_request[0..headers_end], "\r\n");
+        _ = temp_it.next(); // Skip request line
+        while (temp_it.next()) |line| {
+            if (line.len == 0) break;
+
+            const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
+            const header_name = line[0..colon_idx];
+
+            if (std.ascii.eqlIgnoreCase(header_name, "Connection")) {
+                var value = line[colon_idx + 1 ..];
+                while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) {
+                    value = value[1..];
+                }
+
+                // Parse comma-separated tokens
+                var token_it = std.mem.splitSequence(u8, value, ",");
+                while (token_it.next()) |token_raw| {
+                    // Trim whitespace using std.mem.trim
+                    const token = std.mem.trim(u8, token_raw, " \t");
+                    if (token.len > 0) {
+                        try connection_header_tokens.append(allocator, try allocator.dupe(u8, token));
+                    }
+                }
+            }
+        }
+
+        // Second pass: copy headers, skipping hop-by-hop headers
+        var header_it = std.mem.splitSequence(u8, original_request[0..headers_end], "\r\n");
+        _ = header_it.next(); // Skip request line
+
+        var saw_via = false;
+        var saw_x_forwarded_for = false;
+        var saw_x_forwarded_proto = false;
+        var saw_x_forwarded_host = false;
+
+        while (header_it.next()) |line| {
+            if (line.len == 0) break;
+
+            const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
+            const header_name = line[0..colon_idx];
+
+            // Skip hop-by-hop headers
+            if (isHopByHopHeader(header_name)) {
+                continue;
+            }
+
+            // Skip headers listed in Connection header
+            var skip = false;
+            for (connection_header_tokens.items) |token| {
+                if (std.ascii.eqlIgnoreCase(header_name, token)) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) continue;
+
+            // Track which proxy headers already exist
+            if (std.ascii.eqlIgnoreCase(header_name, "Via")) {
+                saw_via = true;
+            } else if (std.ascii.eqlIgnoreCase(header_name, "X-Forwarded-For")) {
+                saw_x_forwarded_for = true;
+            } else if (std.ascii.eqlIgnoreCase(header_name, "X-Forwarded-Proto")) {
+                saw_x_forwarded_proto = true;
+            } else if (std.ascii.eqlIgnoreCase(header_name, "X-Forwarded-Host")) {
+                saw_x_forwarded_host = true;
+            }
+
+            // Copy header as-is
+            try modified_request.appendSlice(allocator, line);
+            try modified_request.appendSlice(allocator, "\r\n");
+        }
+
+        // 3. Add X-Forwarded-* headers if enabled and not already present
+        if (self.add_forwarded_headers) {
+            if (!saw_x_forwarded_for) {
+                try modified_request.appendSlice(allocator, "X-Forwarded-For: ");
+                try modified_request.appendSlice(allocator, client_ip);
+                try modified_request.appendSlice(allocator, "\r\n");
+            }
+
+            if (!saw_x_forwarded_proto) {
+                try modified_request.appendSlice(allocator, "X-Forwarded-Proto: ");
+                try modified_request.appendSlice(allocator, client_proto);
+                try modified_request.appendSlice(allocator, "\r\n");
+            }
+
+            if (!saw_x_forwarded_host and host_header != null) {
+                try modified_request.appendSlice(allocator, "X-Forwarded-Host: ");
+                try modified_request.appendSlice(allocator, host_header.?);
+                try modified_request.appendSlice(allocator, "\r\n");
+            }
+        }
+
+        // 4. Add Via header if enabled
+        if (self.add_via_header and !saw_via) {
+            // Via: 1.1 prozy-name
+            try modified_request.appendSlice(allocator, "Via: 1.1 ");
+            try modified_request.appendSlice(allocator, self.proxy_name);
+            try modified_request.appendSlice(allocator, "\r\n");
+        }
+
+        // 5. End headers section
+        try modified_request.appendSlice(allocator, "\r\n");
+
+        // 6. Append body (if any)
+        if (headers_end < original_request.len) {
+            const body = original_request[headers_end..];
+            try modified_request.appendSlice(allocator, body);
+        }
+
+        // Free Connection header tokens
+        for (connection_header_tokens.items) |token| {
+            allocator.free(token);
+        }
+
+        return try modified_request.toOwnedSlice(allocator);
+    }
+
+    /// Manipulate HTTP response headers: add Via header, remove hop-by-hop headers
+    /// Returns a new buffer with the modified response
+    /// Note: This only modifies headers, not the body
+    pub fn manipulateResponseHeaders(
+        self: *const HTTPInspector,
+        allocator: std.mem.Allocator,
+        original_response: []const u8,
+    ) ![]u8 {
+        // Find where headers end
+        const headers_end = findHeadersEnd(original_response) orelse {
+            // No headers end marker found, return original
+            return try allocator.dupe(u8, original_response);
+        };
+
+        // Split response into status line + headers + body
+        var lines = std.mem.splitSequence(u8, original_response[0..headers_end], "\r\n");
+        const status_line = lines.next() orelse return error.InvalidResponse;
+
+        // Build new response in a buffer
+        var modified_response: std.ArrayList(u8) = .{};
+        errdefer modified_response.deinit(allocator);
+
+        // 1. Write status line
+        try modified_response.appendSlice(allocator, status_line);
+        try modified_response.appendSlice(allocator, "\r\n");
+
+        // 2. First pass: find Connection header to identify additional hop-by-hop headers (RFC 9110 Section 7.6.1)
+        var connection_header_tokens: std.ArrayList([]const u8) = .{};
+        defer {
+            for (connection_header_tokens.items) |token| {
+                allocator.free(token);
+            }
+            connection_header_tokens.deinit(allocator);
+        }
+
+        var temp_it = std.mem.splitSequence(u8, original_response[0..headers_end], "\r\n");
+        _ = temp_it.next(); // Skip status line
+        while (temp_it.next()) |line| {
+            if (line.len == 0) break;
+
+            const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
+            const header_name = line[0..colon_idx];
+
+            if (std.ascii.eqlIgnoreCase(header_name, "Connection")) {
+                const value = line[colon_idx + 1 ..];
+
+                // Parse comma-separated tokens
+                var token_it = std.mem.splitSequence(u8, value, ",");
+                while (token_it.next()) |token_raw| {
+                    const token = std.mem.trim(u8, token_raw, " \t");
+                    if (token.len > 0) {
+                        try connection_header_tokens.append(allocator, try allocator.dupe(u8, token));
+                    }
+                }
+            }
+        }
+
+        // 3. Second pass: copy headers (excluding hop-by-hop headers and Connection-nominated headers)
+        var header_it = std.mem.splitSequence(u8, original_response[0..headers_end], "\r\n");
+        _ = header_it.next(); // Skip status line
+
+        var saw_via = false;
+
+        while (header_it.next()) |line| {
+            if (line.len == 0) break;
+
+            const colon_idx = std.mem.indexOf(u8, line, ":") orelse continue;
+            const header_name = line[0..colon_idx];
+
+            // Skip hop-by-hop headers
+            if (isHopByHopHeader(header_name)) {
+                continue;
+            }
+
+            // Skip headers listed in Connection header
+            var skip = false;
+            for (connection_header_tokens.items) |token| {
+                if (std.ascii.eqlIgnoreCase(header_name, token)) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) continue;
+
+            // Track if Via header exists
+            if (std.ascii.eqlIgnoreCase(header_name, "Via")) {
+                saw_via = true;
+            }
+
+            // Copy header as-is
+            try modified_response.appendSlice(allocator, line);
+            try modified_response.appendSlice(allocator, "\r\n");
+        }
+
+        // 3. Add Via header if enabled and not present
+        if (self.add_via_header and !saw_via) {
+            // Via: 1.1 prozy-name
+            try modified_response.appendSlice(allocator, "Via: 1.1 ");
+            try modified_response.appendSlice(allocator, self.proxy_name);
+            try modified_response.appendSlice(allocator, "\r\n");
+        }
+
+        // 4. End headers section
+        try modified_response.appendSlice(allocator, "\r\n");
+
+        // 5. Append body (if any)
+        if (headers_end < original_response.len) {
+            const body = original_response[headers_end..];
+            try modified_response.appendSlice(allocator, body);
+        }
+
+        return try modified_response.toOwnedSlice(allocator);
+    }
 };
 
 /// Get current Unix timestamp in seconds (public utility for HTTP and backend modules)

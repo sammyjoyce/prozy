@@ -55,6 +55,37 @@ pub const IpKey = union(enum) {
             .ipv6 => |v6| try writer.print("IPv6:{x}", .{v6}),
         }
     }
+
+    /// Convert IpKey to dotted decimal notation (IPv4) or colon-hexadecimal notation (IPv6)
+    /// Suitable for use in HTTP headers like X-Forwarded-For
+    /// IPv6 format: 8 groups of 4 hex digits separated by colons (e.g., 2001:0db8:0000:0000:0000:0000:0000:0001)
+    pub fn toStringAlloc(self: IpKey, allocator: std.mem.Allocator) ![]u8 {
+        return switch (self) {
+            .ipv4 => |v4| {
+                // Convert u32 back to bytes
+                const bytes = [4]u8{
+                    @intCast((v4 >> 24) & 0xFF),
+                    @intCast((v4 >> 16) & 0xFF),
+                    @intCast((v4 >> 8) & 0xFF),
+                    @intCast(v4 & 0xFF),
+                };
+                return std.fmt.allocPrint(allocator, "{}.{}.{}.{}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
+            },
+            .ipv6 => |v6| {
+                // Standard IPv6 format: 8 groups of 4 hex digits separated by colons
+                // Extract each 16-bit group from the u128 value
+                const g0 = @as(u16, @intCast((v6 >> 112) & 0xFFFF));
+                const g1 = @as(u16, @intCast((v6 >> 96) & 0xFFFF));
+                const g2 = @as(u16, @intCast((v6 >> 80) & 0xFFFF));
+                const g3 = @as(u16, @intCast((v6 >> 64) & 0xFFFF));
+                const g4 = @as(u16, @intCast((v6 >> 48) & 0xFFFF));
+                const g5 = @as(u16, @intCast((v6 >> 32) & 0xFFFF));
+                const g6 = @as(u16, @intCast((v6 >> 16) & 0xFFFF));
+                const g7 = @as(u16, @intCast(v6 & 0xFFFF));
+                return std.fmt.allocPrint(allocator, "{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}:{x:0>4}", .{ g0, g1, g2, g3, g4, g5, g6, g7 });
+            },
+        };
+    }
 };
 
 // Context for IpKey HashMap

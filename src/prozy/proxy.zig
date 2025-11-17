@@ -362,6 +362,7 @@ pub const Proxy = struct {
             _ = connection_group.async(io, handleClientWithFeatures, .{
                 client_stream,
                 io,
+                self.allocator,
                 self.backend_host,
                 self.backend_port,
                 options.connect_timeout,
@@ -499,6 +500,7 @@ pub const Proxy = struct {
     fn handleClientWithFeatures(
         client_stream: net.Stream,
         io: Io,
+        allocator: std.mem.Allocator,
         backend_host: []const u8,
         backend_port: u16,
         connect_timeout: Timeout,
@@ -802,7 +804,14 @@ pub const Proxy = struct {
 
         // Forward any buffered request data from cache check before bidirectional copy
         if (buffered_request_size > 0) {
-            forwardBufferedData(&backend_writer.interface, request_buffer[0..buffered_request_size]) catch |err| {
+            const bytes_sent = forwardBufferedData(
+                &backend_writer.interface,
+                request_buffer[0..buffered_request_size],
+                http_inspector,
+                client_ip,
+                allocator,
+                options.enable_http_inspection,
+            ) catch |err| {
                 log.err("failed to forward buffered data: {s}", .{@errorName(err)});
                 if (options.enable_stats) {
                     stats.recordError();
@@ -810,7 +819,8 @@ pub const Proxy = struct {
                 return;
             };
             if (options.enable_stats) {
-                stats.recordBytesClientToBackend(@intCast(buffered_request_size));
+                // Record actual bytes sent to backend (including any added headers)
+                stats.recordBytesClientToBackend(@intCast(bytes_sent));
             }
         }
 
@@ -837,22 +847,98 @@ pub const Proxy = struct {
         }
     }
 
-    fn forwardBufferedData(writer: *Writer, buffered_data: []const u8) !void {
+    /// Forward buffered request data to backend, with optional header manipulation
+    /// Returns the number of bytes actually sent to the backend
+    fn forwardBufferedData(
+        writer: *Writer,
+        buffered_data: []const u8,
+        http_inspector: *const HTTPInspector,
+        client_ip: IpKey,
+        allocator: std.mem.Allocator,
+        enable_header_manipulation: bool,
+    ) !usize {
         // Precondition: buffered_data must be non-empty and within bounds
-        if (buffered_data.len == 0) return;
+        if (buffered_data.len == 0) return 0;
         if (buffered_data.len > 8192) return error.BufferTooLarge;
 
-        // Write all buffered data to backend
-        Writer.writeAll(writer, buffered_data) catch |err| {
-            log.warn("failed to forward buffered request data: {s}", .{@errorName(err)});
+        // If header manipulation is disabled or inspector disabled, forward as-is
+        if (!enable_header_manipulation or (!http_inspector.add_forwarded_headers and !http_inspector.add_via_header)) {
+            Writer.writeAll(writer, buffered_data) catch |err| {
+                log.warn("failed to forward buffered request data: {s}", .{@errorName(err)});
+                return err;
+            };
+            Writer.flush(writer) catch |err| {
+                log.warn("failed to flush buffered request data: {s}", .{@errorName(err)});
+                return err;
+            };
+            return buffered_data.len;
+        }
+
+        // Manipulate headers: add X-Forwarded-*, Via, remove hop-by-hop headers
+        const client_ip_str = client_ip.toStringAlloc(allocator) catch |err| {
+            log.warn("failed to convert client IP to string: {s}, forwarding without header manipulation", .{@errorName(err)});
+            // Fallback: forward original request without header manipulation
+            // This is not a failure - we successfully forward the data, just without manipulation
+            Writer.writeAll(writer, buffered_data) catch |write_err| {
+                log.warn("failed to forward buffered request data: {s}", .{@errorName(write_err)});
+                return write_err;
+            };
+            Writer.flush(writer) catch |flush_err| {
+                log.warn("failed to flush buffered request data: {s}", .{@errorName(flush_err)});
+                return flush_err;
+            };
+            return buffered_data.len; // Success - data forwarded successfully
+        };
+        defer allocator.free(client_ip_str);
+
+        // Extract Host header for X-Forwarded-Host
+        const host_header = HTTPInspector.findHeader(buffered_data, "Host");
+
+        // Determine protocol (http or https)
+        // For now, assume http (we don't terminate TLS)
+        // TODO: Detect if behind TLS terminator by checking X-Forwarded-Proto from upstream
+        const client_proto = "http";
+
+        const modified_request = http_inspector.manipulateRequestHeaders(
+            allocator,
+            buffered_data,
+            client_ip_str,
+            client_proto,
+            host_header,
+        ) catch |err| {
+            log.warn("failed to manipulate request headers: {s}, forwarding original request", .{@errorName(err)});
+            // Fallback: forward original request without header manipulation
+            // This is not a failure - we successfully forward the data, just without manipulation
+            Writer.writeAll(writer, buffered_data) catch |write_err| {
+                log.warn("failed to forward buffered request data: {s}", .{@errorName(write_err)});
+                return write_err;
+            };
+            Writer.flush(writer) catch |flush_err| {
+                log.warn("failed to flush buffered request data: {s}", .{@errorName(flush_err)});
+                return flush_err;
+            };
+            return buffered_data.len; // Success - data forwarded successfully
+        };
+        defer allocator.free(modified_request);
+
+        if (!builtin.is_test) {
+            log.info("forwarding request with manipulated headers ({} -> {} bytes)", .{ buffered_data.len, modified_request.len });
+        }
+
+        // Write modified request to backend
+        Writer.writeAll(writer, modified_request) catch |err| {
+            log.warn("failed to forward modified request data: {s}", .{@errorName(err)});
             return err;
         };
 
         // Flush to ensure data is sent immediately
         Writer.flush(writer) catch |err| {
-            log.warn("failed to flush buffered request data: {s}", .{@errorName(err)});
+            log.warn("failed to flush modified request data: {s}", .{@errorName(err)});
             return err;
         };
+
+        // Return actual bytes sent (may be larger than original if headers were added)
+        return modified_request.len;
     }
 
     const PipeJob = struct {
@@ -1361,7 +1447,7 @@ pub const Proxy = struct {
 
         // Response buffer for caching (only for backend->client direction)
         var response_buffer: ?std.ArrayList(u8) = null;
-        defer if (response_buffer) |*buf| buf.deinit();
+        defer if (response_buffer) |*buf| buf.deinit(job.allocator);
 
         // HTTP response state tracking
         var is_cacheable = false;
@@ -1370,7 +1456,7 @@ pub const Proxy = struct {
 
         // Only allocate buffer for backend->client with GET requests
         if (job.direction == .backend_to_client and std.mem.eql(u8, job.request_method, "GET")) {
-            response_buffer = std.ArrayList(u8).init(job.allocator);
+            response_buffer = .{};
             is_cacheable = true;
         }
 
@@ -1429,7 +1515,7 @@ pub const Proxy = struct {
             // Buffer response data if cacheable and under size limit
             if (is_cacheable and is_http_200 and response_buffer != null) {
                 if (total_bytes <= PipeJobWithCaching.max_cacheable_size) {
-                    response_buffer.?.appendSlice(buffer[0..n]) catch |err| {
+                    response_buffer.?.appendSlice(job.allocator, buffer[0..n]) catch |err| {
                         if (!builtin.is_test) {
                             log.warn("failed to buffer response for caching: {s}", .{@errorName(err)});
                         }
@@ -1444,6 +1530,16 @@ pub const Proxy = struct {
                                 items[i + 2] == '\r' and items[i + 3] == '\n')
                             {
                                 headers_complete = true;
+
+                                // SECURITY: Check for Cache-Control: no-store (RFC 9111)
+                                // Do not cache responses marked as no-store (may contain sensitive data)
+                                if (HTTPInspector.hasCacheControlNoStore(items)) {
+                                    is_cacheable = false;
+                                    if (!builtin.is_test) {
+                                        log.info("response has Cache-Control: no-store, will not cache", .{});
+                                    }
+                                }
+
                                 break;
                             }
                         }
