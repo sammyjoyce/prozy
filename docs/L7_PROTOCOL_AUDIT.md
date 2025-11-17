@@ -1,8 +1,70 @@
 # L7 Proxy Protocol Implementation Audit
 
-**Date**: 2025-11-17
-**Audited Version**: Current HEAD (commit 6d28896)
+**Initial Audit Date**: 2025-11-17
+**Initial Version**: commit 6d28896
+**Updated**: 2025-11-17 (after header manipulation implementation)
+**Current Version**: commit a9d0f7b
 **Purpose**: Comprehensive audit of Layer 7 (Application Layer) proxy protocols and standards implemented in Prozy
+
+---
+
+## 🎯 UPDATE (2025-11-17): Header Manipulation Implementation
+
+**Implementation completed in commit a9d0f7b**
+
+Following the initial audit, the following "quick wins" were implemented to improve RFC compliance:
+
+### ✅ Features Implemented
+
+1. **X-Forwarded-* Headers** (De facto standard)
+   - ✅ X-Forwarded-For: Client IP forwarding to backends
+   - ✅ X-Forwarded-Proto: Protocol detection (http/https)
+   - ✅ X-Forwarded-Host: Original Host header preservation
+   - Location: `src/prozy/http.zig:200-354`
+
+2. **Via Header** (RFC 9110 Section 7.6.3)
+   - ✅ Added to requests and responses
+   - ✅ Format: `Via: 1.1 Prozy/1.0`
+   - Location: `src/prozy/http.zig:332-337, 410-415`
+
+3. **Hop-by-Hop Header Removal** (RFC 9110 Section 7.6.1)
+   - ✅ Removes: Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade, Proxy-Authenticate, Proxy-Authorization
+   - ✅ Parses Connection header for additional hop-by-hop headers
+   - Location: `src/prozy/http.zig:144-165, 279-292`
+
+4. **Cache-Control: no-store Detection** (RFC 9111 - Security)
+   - ✅ Prevents caching of sensitive responses
+   - ✅ Parses Cache-Control directive
+   - Location: `src/prozy/http.zig:167-195`, `src/prozy/proxy.zig:1448-1455`
+
+### 📊 Impact on L7 Protocol Compliance
+
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Overall L7 Implementation | ~12% | **~25%** | **+108%** |
+| Proxy-Specific Headers | 0% | **75%** | **+∞** |
+| RFC 9110 Compliance | 15% | **30%** | **+100%** |
+| RFC 9111 Compliance | 20% | **35%** | **+75%** |
+
+### 🔧 Configuration
+
+Header manipulation is **enabled by default** via `RunOptions.enable_http_inspection`:
+
+```zig
+proxy.http_inspector = HTTPInspector.init(
+    .add_forwarded = true,   // X-Forwarded-* headers
+    .add_via = true,          // Via header
+    .proxy_name = "Prozy/1.0" // Identity string
+);
+```
+
+### 📝 Documentation Updates
+
+- `src/root.zig`: Updated Security and Cache sections
+- `src/prozy/http.zig`: Added header manipulation functions
+- `src/prozy/transport.zig`: Added `IpKey.toStringAlloc()` for IP formatting
+
+---
 
 ## Executive Summary
 
@@ -12,17 +74,17 @@
 
 | Category | Status | Coverage |
 |----------|--------|----------|
-| **HTTP Protocol Standards** | ⚠️ Partial | ~15% |
+| **HTTP Protocol Standards** | ⚠️ Partial | ~30% ⬆️ |
 | **TLS/Connection Establishment** | ❌ None | 0% |
-| **Proxy-Specific Headers** | ⚠️ Configured but not implemented | 0% |
+| **Proxy-Specific Headers** | ✅ Implemented | 75% ⬆️ |
 | **Tunneling & Upgrades** | ⚠️ Partial | 50% |
 | **Content Adaptation** | ❌ None | 0% |
 | **Observability** | ⚠️ Basic (non-standard) | ~10% |
 | **Kubernetes/Declarative** | ❌ None | 0% |
 | **Authentication** | ❌ None | 0% |
-| **RFC-Compliant Caching** | ⚠️ Basic (non-compliant) | ~20% |
+| **RFC-Compliant Caching** | ⚠️ Partial | ~35% ⬆️ |
 
-**Overall L7 Protocol Implementation**: **~12%**
+**Overall L7 Protocol Implementation**: **~25%** (previously ~12%)
 
 ---
 
@@ -31,7 +93,7 @@
 ### 1. HTTP Protocol Standards
 
 #### RFC 9110 – HTTP Semantics (June 2022)
-**Status**: ⚠️ **Partially Implemented** (~15%)
+**Status**: ⚠️ **Partially Implemented** (~30%, improved from 15%)
 
 **What's Implemented**:
 - Basic HTTP request line parsing (method, path, version) in `src/prozy/http.zig:19-33`
@@ -39,6 +101,12 @@
 - Simple header extraction with case-insensitive matching in `src/prozy/http.zig:121-142`
 - Content-Length header parsing for response completeness detection
 - Transfer-Encoding: chunked detection
+- ✅ **NEW: Hop-by-hop header removal** (RFC 9110 Section 7.6.1) - `src/prozy/http.zig:144-165, 279-292`
+  - Removes: Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade, Proxy-Authenticate, Proxy-Authorization
+  - Parses Connection header to identify additional hop-by-hop headers
+- ✅ **NEW: Via header** (RFC 9110 Section 7.6.3) - `src/prozy/http.zig:332-337, 410-415`
+  - Added to requests: `Via: 1.1 Prozy/1.0`
+  - Added to responses for proxy chain tracking
 
 **What's NOT Implemented**:
 - ❌ Full HTTP semantics (request/response validation, semantics enforcement)
@@ -47,27 +115,30 @@
 - ❌ Content negotiation (Accept, Accept-Language, Accept-Encoding)
 - ❌ Range requests (byte ranges)
 - ❌ Conditional requests (If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since)
-- ❌ Proper hop-by-hop vs end-to-end header handling
 - ❌ Message body framing validation
 - ❌ Request target forms (only origin-form partially supported, no asterisk-form)
 
-**Code Reference**: `src/prozy/http.zig:18-143`
+**Code Reference**: `src/prozy/http.zig:18-428`
 
 ---
 
 #### RFC 9111 – HTTP Caching (June 2022)
-**Status**: ⚠️ **Basic Implementation, NOT RFC Compliant** (~20%)
+**Status**: ⚠️ **Partial Implementation** (~35%, improved from 20%)
 
 **What's Implemented**:
-- Simple LRU cache for HTTP responses in `src/prozy/http.zig:154-431`
+- Simple LRU cache for HTTP responses in `src/prozy/http.zig:430-717` (HTTPCache struct)
 - GET request caching only
 - Fixed TTL-based expiration
 - Host header-based cache key isolation (security feature)
 - Cache hit/miss tracking
 - O(1) LRU eviction using doubly-linked list
+- ✅ **NEW: Cache-Control: no-store detection** (RFC 9111 security) - `src/prozy/http.zig:167-195`
+  - Parses Cache-Control header for no-store directive
+  - Prevents caching of sensitive responses (passwords, tokens, PII)
+  - Applied during response buffering in `copyPipeWithCaching` - `src/prozy/proxy.zig:1448-1455`
 
 **What's NOT Implemented** (Critical RFC 9111 Requirements):
-- ❌ **Cache-Control directive parsing**: No support for `max-age`, `no-cache`, `no-store`, `must-revalidate`, `private`, `public`, `s-maxage`, `stale-while-revalidate`, `stale-if-error`
+- ❌ **Cache-Control directive parsing**: Partial support (`no-store` only). No support for `max-age`, `no-cache`, `must-revalidate`, `private`, `public`, `s-maxage`, `stale-while-revalidate`, `stale-if-error`
 - ❌ **Vary header handling**: Responses are cached without checking Vary header, violating RFC 9111 Section 4.1
 - ❌ **Age header**: Not added to cached responses (RFC 9111 Section 5.1)
 - ❌ **Revalidation**: No support for ETag/If-None-Match or Last-Modified/If-Modified-Since
@@ -174,7 +245,7 @@ grep -r "std\.crypto\.tls|std\.net\.tls|TlsStream|ClientHello|ServerName" src/
 ### 3. Proxy-Specific HTTP Headers and Metadata
 
 #### RFC 7239 – Forwarded HTTP Extension (June 2014)
-**Status**: ⚠️ **Configured but NOT Implemented**
+**Status**: ⚠️ **NOT Implemented** (X-Forwarded-* implemented instead)
 
 **Configuration Exists**:
 ```zig
@@ -185,32 +256,44 @@ pub const HTTPInspector = struct {
     proxy_name: []const u8 = "Prozy/1.0",
 ```
 
-**Implementation**: ❌ **MISSING**
-- Fields are configured but never used
-- No code adds `Forwarded` header to requests
-- No code adds `Via` header to requests/responses
-- No code adds client IP, protocol, or host information
+**Implementation**: ❌ **RFC 7239 Forwarded header NOT implemented**
+- ❌ No `Forwarded` header per RFC 7239 spec
+- ✅ **De facto X-Forwarded-* headers implemented instead** (see below)
+- ✅ **Via header implemented** (RFC 9110 Section 7.6.3)
 
-**Search Results**:
-```bash
-grep -r "writeAll.*Forwarded|writeAll.*Via|addHeader" src/prozy/
-# No matches found
-```
+**Note**: X-Forwarded-* headers (de facto standard) are more widely supported than RFC 7239 Forwarded header. Most production systems use X-Forwarded-* headers.
 
-**Impact**:
-- Backend servers cannot identify original client IP
-- Cannot detect proxy chains
-- Cannot identify protocol (HTTP vs HTTPS) used by client
-
-**Code Reference**: `src/prozy/http.zig:6-7` (configuration), no implementation found
+**Code Reference**: `src/prozy/http.zig:6-7` (configuration), `src/prozy/http.zig:312-328` (X-Forwarded-* implementation)
 
 ---
 
 #### X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host
-**Status**: ❌ **NOT Implemented**
+**Status**: ✅ **Implemented** (De facto standard)
 
-**Documentation Acknowledgement** (from `src/root.zig:51-52`):
-> "**No X-Forwarded-For handling**: Client IP is extracted from TCP socket only. If behind another proxy, all clients appear to come from the proxy's IP."
+**What's Implemented**:
+- ✅ **X-Forwarded-For**: Client IP address forwarding
+  - IPv4: Dotted decimal notation (e.g., `192.168.1.100`)
+  - IPv6: Hex notation (32 characters)
+  - Location: `src/prozy/http.zig:312-316`, `src/prozy/transport.zig:59-84`
+- ✅ **X-Forwarded-Proto**: Protocol detection (http/https)
+  - Currently always "http" (no TLS termination)
+  - Location: `src/prozy/http.zig:318-322`
+- ✅ **X-Forwarded-Host**: Original Host header preservation
+  - Only added if Host header present in request
+  - Location: `src/prozy/http.zig:324-328`
+
+**Implementation Details**:
+- Headers added by `HTTPInspector.manipulateRequestHeaders()` - `src/prozy/http.zig:200-354`
+- Called from `forwardBufferedData()` during request forwarding - `src/prozy/proxy.zig:840-911`
+- Configurable via `HTTPInspector.add_forwarded_headers` (default: true)
+- Only added if not already present (preserves existing headers from upstream proxies)
+
+**Benefits**:
+- ✅ Backends can identify original client IP for logging, security, geolocation
+- ✅ Protocol detection enables backends to generate correct URLs (http vs https)
+- ✅ Host preservation enables multi-tenant backends to identify virtual host
+
+**Code Reference**: `src/prozy/http.zig:310-329`, `src/prozy/proxy.zig:865-893`
 
 ---
 
@@ -366,12 +449,14 @@ const response = "HTTP/1.1 200 Connection Established\r\n\r\n";
 ---
 
 #### RFC 9111 Section 5.2 – Cache-Control Directives
-**Status**: ❌ **NOT Implemented**
+**Status**: ⚠️ **Partially Implemented** (no-store only)
 
 See RFC 9111 section above for full analysis.
 
+**Implemented Directives**:
+- ✅ **NEW: `no-store`** - Prevents caching of sensitive data (security critical) - `src/prozy/http.zig:167-195`
+
 **Critical Missing Directives**:
-- ❌ `no-store` - May cache sensitive data that should never be cached
 - ❌ `no-cache` - May serve without revalidation
 - ❌ `private` - May cache user-specific responses
 - ❌ `max-age` - Uses fixed TTL instead of origin-specified lifetime
@@ -384,24 +469,52 @@ See RFC 9111 section above for full analysis.
 ### 10. Connection Management
 
 #### RFC 9112 Section 9.6 – Connection Header and Hop-by-Hop Fields
-**Status**: ❌ **NOT Implemented**
+**Status**: ✅ **Implemented** (RFC 9110 Section 7.6.1)
 
-**What Should Be Implemented**:
-- Remove hop-by-hop headers before forwarding: `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`
-- Parse `Connection` header to identify additional hop-by-hop headers
+**What's Implemented**:
+- ✅ **Hop-by-hop header removal** - `src/prozy/http.zig:144-165, 279-292`
+  - Removes: `Connection`, `Keep-Alive`, `Proxy-Connection`, `TE`, `Trailer`, `Transfer-Encoding`, `Upgrade`, `Proxy-Authenticate`, `Proxy-Authorization`
+  - Applied to both requests and responses
+- ✅ **Connection header parsing** - `src/prozy/http.zig:231-262`
+  - Parses `Connection` header to identify additional hop-by-hop headers
+  - Removes headers listed in Connection field
+  - Example: `Connection: foo, bar` removes both "foo" and "bar" headers
 
-**Current Behavior**:
-- Headers are forwarded as-is (raw TCP forwarding after initial request parsing)
-- No header manipulation or removal
+**Implementation Details**:
+- Static list of standard hop-by-hop headers defined in `hop_by_hop_headers` array
+- Two-pass algorithm:
+  1. First pass: Parse Connection header to build list of additional hop-by-hop headers
+  2. Second pass: Copy headers, skipping hop-by-hop headers (standard + Connection-listed)
+- Applied during `manipulateRequestHeaders()` and `manipulateResponseHeaders()`
 
-**Risk**: May forward hop-by-hop headers to backend, causing protocol violations.
+**Benefits**:
+- ✅ Prevents protocol violations (forwarding hop-by-hop headers to backends)
+- ✅ RFC 9110 compliance for proxy header handling
+- ✅ Cleaner backend requests (no proxy-specific headers)
+
+**Code Reference**: `src/prozy/http.zig:144-165, 227-292, 382-407`
 
 ---
 
 #### RFC 9112 Section 9.7 – Via Header
-**Status**: ⚠️ **Configured but NOT Implemented**
+**Status**: ✅ **Implemented** (RFC 9110 Section 7.6.3)
 
-See "Proxy-Specific HTTP Headers" section above.
+**What's Implemented**:
+- ✅ **Via header for requests** - `src/prozy/http.zig:332-337`
+  - Format: `Via: 1.1 Prozy/1.0`
+  - Added if not already present (preserves upstream Via headers)
+- ✅ **Via header for responses** - `src/prozy/http.zig:410-415`
+  - Same format for response chain tracking
+  - Enables loop detection and proxy chain visibility
+
+**Benefits**:
+- ✅ Proxy chain tracking: Backends and clients can see all intermediaries
+- ✅ Loop detection: Multiple proxies can detect request loops
+- ✅ Debugging: Developers can trace request path through infrastructure
+
+**Code Reference**: `src/prozy/http.zig:332-337, 410-415`
+
+See also: "Proxy-Specific HTTP Headers" section for full details.
 
 ---
 
@@ -439,15 +552,15 @@ See "Proxy-Specific HTTP Headers" section above.
 
 | **Standard/Specification** | **Status** | **Notes** |
 |---------------------------|------------|-----------|
-| **RFC 9110 (HTTP Semantics)** | ⚠️ Partial (15%) | Basic request/response parsing only |
-| **RFC 9111 (HTTP Caching)** | ⚠️ Non-compliant (20%) | Fixed TTL, no Cache-Control/Vary/Age |
+| **RFC 9110 (HTTP Semantics)** | ⚠️ Partial (30%) ⬆️ | +Via header, +hop-by-hop removal |
+| **RFC 9111 (HTTP Caching)** | ⚠️ Partial (35%) ⬆️ | +Cache-Control: no-store |
 | **RFC 9112 (HTTP/1.1 Syntax)** | ⚠️ Minimal (10%) | Single request per connection, no keep-alive |
 | **RFC 7540 (HTTP/2)** | ❌ None | Not implemented |
 | **RFC 9114 (HTTP/3)** | ❌ None | Not implemented |
 | **RFC 6066 (SNI)** | ❌ None | No TLS support |
 | **RFC 7301 (ALPN)** | ❌ None | No TLS support |
-| **RFC 7239 (Forwarded)** | ⚠️ Config only | Fields exist but unused |
-| **X-Forwarded-*** | ❌ None | Explicitly not implemented |
+| **RFC 7239 (Forwarded)** | ⚠️ X-Fwd-* instead | X-Forwarded-* headers preferred |
+| **X-Forwarded-*** | ✅ Yes ⬆️ | X-Forwarded-For/Proto/Host |
 | **PROXY Protocol** | ❌ None | Not implemented |
 | **CONNECT Method** | ✅ Yes | Tunnel mode implemented |
 | **RFC 6455 (WebSocket)** | ❌ None | Not implemented |
@@ -457,9 +570,9 @@ See "Proxy-Specific HTTP Headers" section above.
 | **Envoy xDS** | ❌ None | Custom config format (ZON) |
 | **RFC 7235 (Proxy-Authenticate)** | ❌ None | IP-based ACL only |
 | **Conditional Requests** | ❌ None | No ETag/Last-Modified |
-| **Cache-Control** | ❌ None | Fixed TTL only |
-| **Hop-by-hop Headers** | ❌ None | Not removed |
-| **Via Header** | ⚠️ Config only | Field exists but unused |
+| **Cache-Control** | ⚠️ Partial ⬆️ | no-store only |
+| **Hop-by-hop Headers** | ✅ Yes ⬆️ | RFC 9110 compliant |
+| **Via Header** | ✅ Yes ⬆️ | RFC 9110 Section 7.6.3 |
 
 ---
 
@@ -483,15 +596,15 @@ See "Proxy-Specific HTTP Headers" section above.
 ### Critical Gaps for L7 Proxy Usage
 
 **High Priority** (Prevents common L7 proxy use cases):
-1. ❌ **No X-Forwarded-For/Forwarded headers**: Backends cannot identify client IPs
-2. ❌ **No Cache-Control respect**: May cache sensitive data or serve stale content inappropriately
+1. ✅ **~~X-Forwarded-For/Forwarded headers~~**: **IMPLEMENTED** - Backends can now identify client IPs
+2. ✅ **~~Cache-Control: no-store~~**: **IMPLEMENTED** - Sensitive data no longer cached
 3. ❌ **No TLS termination**: Cannot inspect HTTPS traffic or provide SSL offload
 4. ❌ **No HTTP keep-alive**: One request per connection severely limits performance
 5. ❌ **No Vary header handling**: Cache may serve wrong content variants
 
 **Medium Priority** (Limits L7 capabilities):
-1. ❌ **No Via header**: Cannot track proxy chains
-2. ❌ **No hop-by-hop header removal**: Protocol violations possible
+1. ✅ **~~Via header~~**: **IMPLEMENTED** - Can now track proxy chains
+2. ✅ **~~Hop-by-hop header removal~~**: **IMPLEMENTED** - Protocol compliant forwarding
 3. ❌ **No conditional requests**: Cache cannot be validated
 4. ❌ **No HTTP/2 support**: Modern HTTP applications may not work
 5. ❌ **No WebSocket support**: Real-time applications not supported
@@ -515,24 +628,37 @@ See "Proxy-Specific HTTP Headers" section above.
 - ✅ IP-based access control (simple and effective)
 - ✅ Basic HTTP parsing (sufficient for routing)
 
-**Add** (High Value, Low Complexity):
-1. **Implement Forwarded/X-Forwarded-* headers**
-   - Use existing `add_forwarded_headers` config
-   - Add `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Forwarded-Host`
-   - Minimal code change, high compatibility value
+**✅ Completed (commit a9d0f7b)**:
+1. ✅ **~~Implement Forwarded/X-Forwarded-* headers~~**
+   - X-Forwarded-For, X-Forwarded-Proto, X-Forwarded-Host implemented
+   - Uses `add_forwarded_headers` config (default: true)
+   - Location: `src/prozy/http.zig:200-354`
 
-2. **Implement Via header**
-   - Use existing `add_via_header` config
-   - Add proxy identity to Via header chain
-   - RFC compliance improvement
+2. ✅ **~~Implement Via header~~**
+   - Via header added to requests and responses
+   - Uses `add_via_header` config (default: true)
+   - Location: `src/prozy/http.zig:332-337, 410-415`
 
-3. **Remove hop-by-hop headers**
-   - Parse and remove Connection, Keep-Alive, etc.
-   - Prevents protocol violations
+3. ✅ **~~Remove hop-by-hop headers~~**
+   - Connection, Keep-Alive, Proxy-Connection, TE, etc. removed
+   - Parses Connection header for additional hop-by-hop headers
+   - Location: `src/prozy/http.zig:144-165, 279-292`
 
-4. **Add Cache-Control: no-store detection**
-   - Skip caching for sensitive responses
-   - Critical security improvement
+4. ✅ **~~Add Cache-Control: no-store detection~~**
+   - Sensitive responses no longer cached
+   - Security-critical feature per RFC 9111
+   - Location: `src/prozy/http.zig:167-195`
+
+**Next Quick Wins** (Recommended):
+1. **Add RFC 7239 Forwarded header**
+   - Alternative to X-Forwarded-* headers
+   - Format: `Forwarded: for=192.168.1.1;proto=http;host=example.com`
+   - Low complexity, improves standards compliance
+
+2. **Detect X-Forwarded-Proto from upstream**
+   - When behind TLS terminator, detect https protocol
+   - Forward correct protocol to backends
+   - Minimal code change
 
 **Consider** (Medium Value, Medium Complexity):
 1. **HTTP keep-alive support**
