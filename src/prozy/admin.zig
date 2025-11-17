@@ -317,7 +317,7 @@ pub const AdminServer = struct {
 
     fn handleAuthStats(writer: *const Io.Reader.Interface, proxy_auth: ?*const ProxyAuth) void {
         if (proxy_auth) |auth| {
-            const snapshot = auth.stats.getStats();
+            const snapshot = auth.getStats();
 
             var buffer: [2048]u8 = undefined;
             const body = std.fmt.bufPrint(&buffer,

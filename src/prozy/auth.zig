@@ -218,6 +218,7 @@ pub const ProxyAuth = struct {
 
         fn revokeToken(self: *BearerTokenStore, token: []const u8) void {
             if (self.tokens.fetchRemove(token)) |kv| {
+                self.allocator.free(kv.value.token);
                 self.allocator.free(kv.value.username);
                 if (kv.value.scope) |scope| {
                     self.allocator.free(scope);
@@ -570,7 +571,7 @@ pub const ProxyAuth = struct {
         const expected_hex = std.fmt.bytesToHex(expected_response, .lower);
 
         // Constant-time comparison (response_hex should be 32 hex chars)
-        if (response_hex.len == 32 and std.mem.eql(u8, response_hex, &expected_hex)) {
+        if (response_hex.len == 32 and constantTimeCompare(response_hex, &expected_hex)) {
             log.info("authentication succeeded: user '{s}' from {any} (Digest)", .{ username, client_ip });
             _ = self.auth_stats.successful_auths.fetchAdd(1, .monotonic);
             _ = self.auth_stats.active_sessions.fetchAdd(1, .monotonic);
