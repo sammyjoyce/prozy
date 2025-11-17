@@ -5,12 +5,14 @@ const log = std.log;
 pub const HTTPInspector = struct {
     add_forwarded_headers: bool = true,
     add_via_header: bool = true,
+    add_rfc7239_forwarded: bool = true, // RFC 7239 Forwarded header
     proxy_name: []const u8 = "Prozy/1.0",
 
     pub fn init(add_forwarded: bool, add_via: bool, proxy_name: []const u8) HTTPInspector {
         return .{
             .add_forwarded_headers = add_forwarded,
             .add_via_header = add_via,
+            .add_rfc7239_forwarded = true,
             .proxy_name = proxy_name,
         };
     }
@@ -190,6 +192,38 @@ pub const HTTPInspector = struct {
         return false;
     }
 
+    /// Check if an IP address string is IPv6 (contains colons)
+    fn isIPv6(ip: []const u8) bool {
+        return std.mem.indexOf(u8, ip, ":") != null;
+    }
+
+    /// Format IP address for RFC 7239 Forwarded header
+    /// IPv6: quoted with brackets: for="[2001:db8::1]"
+    /// IPv4: unquoted: for=192.168.1.1
+    fn formatForwardedFor(allocator: std.mem.Allocator, ip: []const u8) ![]const u8 {
+        if (isIPv6(ip)) {
+            // IPv6: for="[2001:db8::1]"
+            var formatted: std.ArrayList(u8) = .{};
+            defer formatted.deinit(allocator);
+
+            try formatted.appendSlice(allocator, "\"[");
+            try formatted.appendSlice(allocator, ip);
+            try formatted.appendSlice(allocator, "]\"");
+
+            return formatted.toOwnedSlice(allocator);
+        } else {
+            // IPv4: for=192.168.1.1 (no quotes, no brackets)
+            return allocator.dupe(u8, ip);
+        }
+    }
+
+    /// Validate protocol string against allowed values (RFC 7239 Section 5.4)
+    /// Only http, https are allowed. Rejects arbitrary values like "ftp", "javascript:", etc.
+    fn isValidProtocol(proto: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(proto, "http") or
+               std.ascii.eqlIgnoreCase(proto, "https");
+    }
+
     /// Manipulate HTTP request headers: add proxy headers, remove hop-by-hop headers
     /// Returns a new buffer with the modified request
     /// Caller must provide a buffer large enough (recommend original size + 512 bytes for added headers)
@@ -259,6 +293,10 @@ pub const HTTPInspector = struct {
         var saw_x_forwarded_for = false;
         var saw_x_forwarded_proto = false;
         var saw_x_forwarded_host = false;
+        var saw_rfc7239_forwarded = false;
+
+        // Detect upstream X-Forwarded-Proto to determine if we're behind a TLS terminator
+        var upstream_proto: ?[]const u8 = null;
 
         while (header_it.next()) |line| {
             if (line.len == 0) break;
@@ -288,14 +326,29 @@ pub const HTTPInspector = struct {
                 saw_x_forwarded_for = true;
             } else if (std.ascii.eqlIgnoreCase(header_name, "X-Forwarded-Proto")) {
                 saw_x_forwarded_proto = true;
+                // Extract the value to detect TLS terminator upstream
+                var value = line[colon_idx + 1 ..];
+                // Trim both leading and trailing whitespace
+                value = std.mem.trim(u8, value, " \t");
+                upstream_proto = value;
             } else if (std.ascii.eqlIgnoreCase(header_name, "X-Forwarded-Host")) {
                 saw_x_forwarded_host = true;
+            } else if (std.ascii.eqlIgnoreCase(header_name, "Forwarded")) {
+                saw_rfc7239_forwarded = true;
             }
 
             // Copy header as-is
             try modified_request.appendSlice(allocator, line);
             try modified_request.appendSlice(allocator, "\r\n");
         }
+
+        // Determine effective protocol: use upstream value if present, otherwise use provided client_proto
+        // Validate upstream_proto to prevent injection attacks
+        const validated_upstream = if (upstream_proto) |proto|
+            if (isValidProtocol(proto)) proto else null
+        else
+            null;
+        const effective_proto = validated_upstream orelse client_proto;
 
         // 3. Add X-Forwarded-* headers if enabled and not already present
         if (self.add_forwarded_headers) {
@@ -307,7 +360,7 @@ pub const HTTPInspector = struct {
 
             if (!saw_x_forwarded_proto) {
                 try modified_request.appendSlice(allocator, "X-Forwarded-Proto: ");
-                try modified_request.appendSlice(allocator, client_proto);
+                try modified_request.appendSlice(allocator, effective_proto);
                 try modified_request.appendSlice(allocator, "\r\n");
             }
 
@@ -318,7 +371,24 @@ pub const HTTPInspector = struct {
             }
         }
 
-        // 4. Add Via header if enabled
+        // 4. Add RFC 7239 Forwarded header if enabled and not already present
+        // Format: Forwarded: for=<client-ip>;host=<host>;proto=<protocol>
+        if (self.add_rfc7239_forwarded and !saw_rfc7239_forwarded) {
+            try modified_request.appendSlice(allocator, "Forwarded: for=");
+            const formatted_for = try formatForwardedFor(allocator, client_ip);
+            defer allocator.free(formatted_for);
+            try modified_request.appendSlice(allocator, formatted_for);
+            if (host_header != null) {
+                try modified_request.appendSlice(allocator, ";host=\"");
+                try modified_request.appendSlice(allocator, host_header.?);
+                try modified_request.appendSlice(allocator, "\"");
+            }
+            try modified_request.appendSlice(allocator, ";proto=");
+            try modified_request.appendSlice(allocator, effective_proto);
+            try modified_request.appendSlice(allocator, "\r\n");
+        }
+
+        // 5. Add Via header if enabled
         if (self.add_via_header and !saw_via) {
             // Via: 1.1 prozy-name
             try modified_request.appendSlice(allocator, "Via: 1.1 ");
@@ -326,10 +396,14 @@ pub const HTTPInspector = struct {
             try modified_request.appendSlice(allocator, "\r\n");
         }
 
-        // 5. End headers section
+        // 6. Add Connection: close header (since keep-alive is not supported)
+        // Always add this to ensure the connection is closed after the response
+        try modified_request.appendSlice(allocator, "Connection: close\r\n");
+
+        // 7. End headers section
         try modified_request.appendSlice(allocator, "\r\n");
 
-        // 6. Append body (if any)
+        // 8. Append body (if any)
         if (headers_end < original_request.len) {
             const body = original_request[headers_end..];
             try modified_request.appendSlice(allocator, body);

@@ -1743,3 +1743,363 @@ test "Proxy API hierarchy demonstration" {
     // 3. Convenience wrapper - creates Io internally, default options
     try proxy.run();
 }
+
+// ==================== Header Manipulation Tests ====================
+
+test "HTTPInspector: manipulate headers - add RFC 7239 Forwarded header" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /api/users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: TestClient/1.0\r\n\r\n";
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http";
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should contain RFC 7239 Forwarded header (host must be quoted per RFC 7239)
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=192.168.1.100;host=\"example.com\";proto=http") != null);
+
+    // Should contain X-Forwarded-* headers for compatibility
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-For: 192.168.1.100") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Proto: http") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Host: example.com") != null);
+
+    // Should contain Via header
+    try testing.expect(std.mem.indexOf(u8, modified, "Via: 1.1 Prozy/1.0") != null);
+
+    // Should contain Connection: close
+    try testing.expect(std.mem.indexOf(u8, modified, "Connection: close") != null);
+}
+
+test "HTTPInspector: manipulate headers - detect upstream X-Forwarded-Proto" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /api/secure HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-Proto: https\r\nUser-Agent: TestClient/1.0\r\n\r\n";
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http"; // Direct connection is HTTP
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should preserve the upstream X-Forwarded-Proto: https (TLS terminator upstream)
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Proto: https") != null);
+
+    // RFC 7239 Forwarded header should use "https" from upstream (host must be quoted per RFC 7239)
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=192.168.1.100;host=\"example.com\";proto=https") != null);
+}
+
+test "HTTPInspector: manipulate headers - Connection: close always added" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /api/users HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive\r\n\r\n";
+
+    const client_ip = "10.0.0.50";
+    const client_proto = "http";
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should replace Connection: keep-alive with Connection: close
+    try testing.expect(std.mem.indexOf(u8, modified, "Connection: close") != null);
+
+    // Should NOT contain keep-alive (hop-by-hop header removed)
+    try testing.expect(std.mem.indexOf(u8, modified, "keep-alive") == null);
+}
+
+test "HTTPInspector: manipulate headers - preserve existing Forwarded header" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request =
+        \\GET /api/users HTTP/1.1
+        \\Host: example.com
+        \\Forwarded: for=10.1.1.1;proto=https
+        \\
+        \\
+    ;
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http";
+    const host_header = "example.com";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Should preserve the existing Forwarded header from upstream
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=10.1.1.1;proto=https") != null);
+
+    // Count occurrences - should only be one Forwarded header
+    var count: usize = 0;
+    var search_start: usize = 0;
+    while (std.mem.indexOfPos(u8, modified, search_start, "Forwarded:")) |pos| {
+        count += 1;
+        search_start = pos + 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "HTTPInspector: manipulate headers - without host header" {
+    const allocator = testing.allocator;
+
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /api/users HTTP/1.1\r\nUser-Agent: TestClient/1.0\r\n\r\n";
+
+    const client_ip = "192.168.1.100";
+    const client_proto = "http";
+    const host_header: ?[]const u8 = null;
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        client_ip,
+        client_proto,
+        host_header,
+    );
+    defer allocator.free(modified);
+
+    // Forwarded header should not include host parameter
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=192.168.1.100;proto=http") != null);
+
+    // Should NOT contain X-Forwarded-Host when host_header is null
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-Host:") == null);
+
+    // Should still contain other headers
+    try testing.expect(std.mem.indexOf(u8, modified, "X-Forwarded-For: 192.168.1.100") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "Connection: close") != null);
+}
+
+test "HTTPInspector: RFC 7239 Forwarded header with quoted host" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "192.168.1.1",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // Host parameter must be quoted per RFC 7239
+    try testing.expect(std.mem.indexOf(u8, modified, ";host=\"example.com\"") != null);
+}
+
+test "HTTPInspector: RFC 7239 Forwarded header with host and port" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "192.168.1.1",
+        "http",
+        "example.com:8080",
+    );
+    defer allocator.free(modified);
+
+    // Host with port must be quoted
+    try testing.expect(std.mem.indexOf(u8, modified, ";host=\"example.com:8080\"") != null);
+}
+
+test "HTTPInspector: RFC 7239 Forwarded header with IPv6 address" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "2001:db8::1",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // IPv6 must be quoted and bracketed per RFC 7239 Section 4
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=\"[2001:db8::1]\"") != null);
+}
+
+test "HTTPInspector: RFC 7239 Forwarded header with IPv6 loopback" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "::1",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // IPv6 loopback must be quoted and bracketed
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=\"[::1]\"") != null);
+}
+
+test "HTTPInspector: RFC 7239 Forwarded header with IPv4 address (no quotes)" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "192.168.1.100",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // IPv4 should NOT be quoted or bracketed
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=192.168.1.100") != null);
+    // Should not have quotes around IPv4
+    try testing.expect(std.mem.indexOf(u8, modified, "for=\"192.168.1.100\"") == null);
+}
+
+test "HTTPInspector: RFC 7239 Forwarded header complete format with IPv6" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /test HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "2001:db8::cafe",
+        "https",
+        "api.example.com:443",
+    );
+    defer allocator.free(modified);
+
+    // Complete RFC 7239 format: IPv6 quoted+bracketed, host quoted, proto unquoted
+    try testing.expect(std.mem.indexOf(u8, modified, "Forwarded: for=\"[2001:db8::cafe]\";host=\"api.example.com:443\";proto=https") != null);
+}
+
+test "HTTPInspector: reject invalid protocol injection (ftp)" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    // Malicious upstream tries to inject "ftp" protocol
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-Proto: ftp\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "192.168.1.1",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // Should fall back to client_proto ("http"), rejecting "ftp"
+    try testing.expect(std.mem.indexOf(u8, modified, "proto=http") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "proto=ftp") == null);
+}
+
+test "HTTPInspector: reject invalid protocol injection (javascript:)" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    // Malicious upstream tries to inject "javascript:" protocol
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-Proto: javascript:\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "192.168.1.1",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // Should fall back to client_proto ("http"), rejecting "javascript:"
+    try testing.expect(std.mem.indexOf(u8, modified, "proto=http") != null);
+    try testing.expect(std.mem.indexOf(u8, modified, "proto=javascript:") == null);
+}
+
+test "HTTPInspector: accept valid https protocol from upstream" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-Proto: https\r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "192.168.1.1",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // Should accept valid "https" protocol
+    try testing.expect(std.mem.indexOf(u8, modified, "proto=https") != null);
+}
+
+test "HTTPInspector: X-Forwarded-Proto with trailing whitespace trimmed" {
+    const allocator = testing.allocator;
+    const inspector = HTTPInspector.init(true, true, "Prozy/1.0");
+
+    // Upstream sends X-Forwarded-Proto with trailing spaces
+    const original_request = "GET /test HTTP/1.1\r\nHost: example.com\r\nX-Forwarded-Proto: https  \r\n\r\n";
+
+    const modified = try inspector.manipulateRequestHeaders(
+        allocator,
+        original_request,
+        "192.168.1.1",
+        "http",
+        "example.com",
+    );
+    defer allocator.free(modified);
+
+    // Should use trimmed "https" value
+    try testing.expect(std.mem.indexOf(u8, modified, "proto=https") != null);
+    // Should NOT contain trailing spaces
+    try testing.expect(std.mem.indexOf(u8, modified, "proto=https  ") == null);
+}
