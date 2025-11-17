@@ -103,6 +103,10 @@ const router = @import("prozy/router.zig");
 pub const Router = router.Router;
 pub const RouterError = router.RouterError;
 
+// Admin and management
+const admin = @import("prozy/admin.zig");
+pub const AdminServer = admin.AdminServer;
+
 // Proxy core
 const proxy = @import("prozy/proxy.zig");
 pub const RunOptions = proxy.RunOptions;
