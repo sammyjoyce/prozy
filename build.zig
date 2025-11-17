@@ -256,6 +256,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(config_hot_reload_demo);
 
+    const openai_api_translator = b.addExecutable(.{
+        .name = "openai_api_translator",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/openai_api_translator.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(openai_api_translator);
+
     // Example run steps
     const run_async_io_demo = b.addRunArtifact(async_io_demo);
     const async_io_demo_step = b.step("async_io_demo", "Run async I/O demo");
@@ -292,6 +305,10 @@ pub fn build(b: *std.Build) void {
     const run_config_hot_reload_demo = b.addRunArtifact(config_hot_reload_demo);
     const config_hot_reload_demo_step = b.step("config_reload_demo", "Run configuration hot reload demonstration");
     config_hot_reload_demo_step.dependOn(&run_config_hot_reload_demo.step);
+
+    const run_openai_api_translator = b.addRunArtifact(openai_api_translator);
+    const openai_api_translator_step = b.step("openai_translator", "Run OpenAI API translator example");
+    openai_api_translator_step.dependOn(&run_openai_api_translator.step);
 
     // E2E test executable
     const e2e_test = b.addExecutable(.{
