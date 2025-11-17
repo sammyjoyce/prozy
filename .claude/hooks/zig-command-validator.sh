@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Validate Zig-related bash commands before execution
 # Provides helpful feedback for common mistakes
 
