@@ -1,0 +1,134 @@
+{
+  "proxy": {
+    "listen_host": "0.0.0.0",
+    "listen_port": 8080,
+    "max_connections": 10000,
+    "reuse_address": true
+  },
+  "mode": "reverse_proxy",
+  "cache": {
+    "enabled": true,
+    "max_size": 10485760
+  },
+  "rate_limit": {
+    "enabled": true,
+    "max_per_ip": 100,
+    "max_global": 10000
+  },
+  "access_control": {
+    "enabled": false,
+    "default_policy": "allow",
+    "allow_list": [],
+    "deny_list": []
+  },
+  "health_check": {
+    "enabled": true,
+    "interval_seconds": 10,
+    "timeout_ms": 5000,
+    "unhealthy_threshold": 3,
+    "healthy_threshold": 2
+  },
+  "admin": {
+    "enabled": true,
+    "listen_host": "127.0.0.1",
+    "listen_port": 9090
+  },
+  "logging": {
+    "level": "info",
+    "enable_connection_logging": true,
+    "enable_stats": true
+  },
+  "clusters": [
+    {
+      "name": "api_backend",
+      "backends": [
+        {
+          "host": "10.0.1.10",
+          "port": 8080,
+          "weight": 5
+        },
+        {
+          "host": "10.0.1.11",
+          "port": 8080,
+          "weight": 3
+        },
+        {
+          "host": "10.0.1.12",
+          "port": 8080,
+          "weight": 2
+        }
+      ],
+      "strategy": "weighted_round_robin",
+      "max_concurrent": 1000
+    },
+    {
+      "name": "static_backend",
+      "backends": [
+        {
+          "host": "10.0.2.10",
+          "port": 80,
+          "weight": 1
+        },
+        {
+          "host": "10.0.2.11",
+          "port": 80,
+          "weight": 1
+        }
+      ],
+      "strategy": "round_robin",
+      "max_concurrent": 500
+    }
+  ],
+  "routes": [
+    {
+      "name": "api_route",
+      "match": {
+        "host": "api.example.com",
+        "path_prefix": "/v1/",
+        "methods": ["GET", "POST", "PUT", "DELETE"]
+      },
+      "cluster": "api_backend",
+      "cache_policy": {
+        "allow": true,
+        "ttl_seconds": 300,
+        "max_size": 1048576
+      },
+      "timeout_policy": {
+        "connect_timeout_ms": 5000,
+        "request_timeout_ms": 30000,
+        "response_timeout_ms": 60000,
+        "idle_timeout_seconds": 30
+      },
+      "concurrency_policy": {
+        "max_concurrent": 1000,
+        "max_queue_depth": 100,
+        "reject_when_full": false
+      }
+    },
+    {
+      "name": "static_route",
+      "match": {
+        "host": "static.example.com",
+        "path_prefix": "/assets/",
+        "methods": ["GET"]
+      },
+      "cluster": "static_backend",
+      "cache_policy": {
+        "allow": true,
+        "ttl_seconds": 3600,
+        "max_size": 5242880
+      },
+      "timeout_policy": {
+        "connect_timeout_ms": 3000,
+        "request_timeout_ms": 10000,
+        "response_timeout_ms": 30000,
+        "idle_timeout_seconds": 60
+      },
+      "concurrency_policy": {
+        "max_concurrent": 500,
+        "max_queue_depth": 50,
+        "reject_when_full": true
+      }
+    }
+  ]
+}
