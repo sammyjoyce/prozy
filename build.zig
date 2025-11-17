@@ -217,6 +217,32 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(health_check_demo);
 
+    const forward_proxy = b.addExecutable(.{
+        .name = "forward_proxy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/forward_proxy.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(forward_proxy);
+
+    const production_gateway = b.addExecutable(.{
+        .name = "production_gateway",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/production_gateway.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(production_gateway);
+
     // Example run steps
     const run_async_io_demo = b.addRunArtifact(async_io_demo);
     const async_io_demo_step = b.step("async_io_demo", "Run async I/O demo");
@@ -241,6 +267,14 @@ pub fn build(b: *std.Build) void {
     const run_health_check_demo = b.addRunArtifact(health_check_demo);
     const health_check_demo_step = b.step("health_check_demo", "Run health check demonstration");
     health_check_demo_step.dependOn(&run_health_check_demo.step);
+
+    const run_forward_proxy = b.addRunArtifact(forward_proxy);
+    const forward_proxy_step = b.step("forward_proxy", "Run forward proxy example");
+    forward_proxy_step.dependOn(&run_forward_proxy.step);
+
+    const run_production_gateway = b.addRunArtifact(production_gateway);
+    const production_gateway_step = b.step("production_gateway", "Run production gateway example");
+    production_gateway_step.dependOn(&run_production_gateway.step);
 
     // E2E test executable
     const e2e_test = b.addExecutable(.{
