@@ -33,11 +33,12 @@
 //!
 //! ### Cache Behavior
 //! - **GET requests only**: Only GET requests are cached. POST/PUT/DELETE bypass cache.
-//! - **Basic cacheability**: Cache does NOT respect Cache-Control, Vary, or other
-//!   HTTP caching headers. All GET responses are cached with a fixed TTL.
-//! - **No cache population from backend**: Currently, responses from backends are
-//!   streamed directly to clients but NOT buffered and stored in the cache for future
-//!   requests. This is planned for a future release.
+//! - **Cache-Control: no-store respected**: Responses with `Cache-Control: no-store`
+//!   are NOT cached (security feature per RFC 9111).
+//! - **Partial RFC compliance**: Cache does NOT respect other Cache-Control directives,
+//!   Vary headers, or conditional requests. All cacheable GET responses use a fixed TTL.
+//! - **Limited cache population**: Responses from backends are buffered and stored in
+//!   cache for GET requests only (via copyPipeWithCaching).
 //! - **Fixed-size buffers**: Request headers are buffered in an 8KB buffer. Headers
 //!   larger than 8KB will cause cache checking to fail (request still forwarded).
 //!
@@ -48,8 +49,15 @@
 //!   not per request (consistent with one-request-per-connection assumption).
 //!
 //! ### Security
-//! - **No X-Forwarded-For handling**: Client IP is extracted from TCP socket only.
-//!   If behind another proxy, all clients appear to come from the proxy's IP.
+//! - **X-Forwarded-* headers**: Client IP, protocol, and host are forwarded to backends
+//!   via X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host headers (configurable).
+//! - **Via header**: Proxy identity is added to Via header chain for both requests and
+//!   responses (RFC 9110 Section 7.6.3, configurable).
+//! - **Hop-by-hop header removal**: Connection, Keep-Alive, Proxy-Connection, TE,
+//!   Trailer, Transfer-Encoding, Upgrade, Proxy-Authenticate, and Proxy-Authorization
+//!   headers are removed before forwarding (RFC 9110 Section 7.6.1).
+//! - **Cache-Control: no-store security**: Responses marked with `Cache-Control: no-store`
+//!   are NOT cached to prevent sensitive data leakage (RFC 9111).
 //! - **Trusted backend assumption**: No validation of backend responses or protection
 //!   against malicious backends.
 //!

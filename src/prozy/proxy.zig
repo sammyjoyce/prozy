@@ -362,6 +362,7 @@ pub const Proxy = struct {
             _ = connection_group.async(io, handleClientWithFeatures, .{
                 client_stream,
                 io,
+                self.allocator,
                 self.backend_host,
                 self.backend_port,
                 options.connect_timeout,
@@ -499,6 +500,7 @@ pub const Proxy = struct {
     fn handleClientWithFeatures(
         client_stream: net.Stream,
         io: Io,
+        allocator: std.mem.Allocator,
         backend_host: []const u8,
         backend_port: u16,
         connect_timeout: Timeout,
@@ -802,7 +804,14 @@ pub const Proxy = struct {
 
         // Forward any buffered request data from cache check before bidirectional copy
         if (buffered_request_size > 0) {
-            forwardBufferedData(&backend_writer.interface, request_buffer[0..buffered_request_size]) catch |err| {
+            forwardBufferedData(
+                &backend_writer.interface,
+                request_buffer[0..buffered_request_size],
+                http_inspector,
+                client_ip,
+                allocator,
+                options.enable_http_inspection,
+            ) catch |err| {
                 log.err("failed to forward buffered data: {s}", .{@errorName(err)});
                 if (options.enable_stats) {
                     stats.recordError();
@@ -810,6 +819,8 @@ pub const Proxy = struct {
                 return;
             };
             if (options.enable_stats) {
+                // Note: We record the ORIGINAL buffer size, not modified size
+                // The modification (adding headers) is an implementation detail
                 stats.recordBytesClientToBackend(@intCast(buffered_request_size));
             }
         }
@@ -837,20 +848,75 @@ pub const Proxy = struct {
         }
     }
 
-    fn forwardBufferedData(writer: *Writer, buffered_data: []const u8) !void {
+    fn forwardBufferedData(
+        writer: *Writer,
+        buffered_data: []const u8,
+        http_inspector: *const HTTPInspector,
+        client_ip: IpKey,
+        allocator: std.mem.Allocator,
+        enable_header_manipulation: bool,
+    ) !void {
         // Precondition: buffered_data must be non-empty and within bounds
         if (buffered_data.len == 0) return;
         if (buffered_data.len > 8192) return error.BufferTooLarge;
 
-        // Write all buffered data to backend
-        Writer.writeAll(writer, buffered_data) catch |err| {
-            log.warn("failed to forward buffered request data: {s}", .{@errorName(err)});
+        // If header manipulation is disabled or inspector disabled, forward as-is
+        if (!enable_header_manipulation or (!http_inspector.add_forwarded_headers and !http_inspector.add_via_header)) {
+            Writer.writeAll(writer, buffered_data) catch |err| {
+                log.warn("failed to forward buffered request data: {s}", .{@errorName(err)});
+                return err;
+            };
+            Writer.flush(writer) catch |err| {
+                log.warn("failed to flush buffered request data: {s}", .{@errorName(err)});
+                return err;
+            };
+            return;
+        }
+
+        // Manipulate headers: add X-Forwarded-*, Via, remove hop-by-hop headers
+        const client_ip_str = client_ip.toStringAlloc(allocator) catch |err| {
+            log.warn("failed to convert client IP to string: {s}, forwarding without header manipulation", .{@errorName(err)});
+            Writer.writeAll(writer, buffered_data) catch {};
+            Writer.flush(writer) catch {};
+            return err;
+        };
+        defer allocator.free(client_ip_str);
+
+        // Extract Host header for X-Forwarded-Host
+        const host_header = HTTPInspector.findHeader(buffered_data, "Host");
+
+        // Determine protocol (http or https)
+        // For now, assume http (we don't terminate TLS)
+        // TODO: Detect if behind TLS terminator by checking X-Forwarded-Proto from upstream
+        const client_proto = "http";
+
+        const modified_request = http_inspector.manipulateRequestHeaders(
+            allocator,
+            buffered_data,
+            client_ip_str,
+            client_proto,
+            host_header,
+        ) catch |err| {
+            log.warn("failed to manipulate request headers: {s}, forwarding original request", .{@errorName(err)});
+            Writer.writeAll(writer, buffered_data) catch {};
+            Writer.flush(writer) catch {};
+            return err;
+        };
+        defer allocator.free(modified_request);
+
+        if (!builtin.is_test) {
+            log.info("forwarding request with manipulated headers ({} -> {} bytes)", .{ buffered_data.len, modified_request.len });
+        }
+
+        // Write modified request to backend
+        Writer.writeAll(writer, modified_request) catch |err| {
+            log.warn("failed to forward modified request data: {s}", .{@errorName(err)});
             return err;
         };
 
         // Flush to ensure data is sent immediately
         Writer.flush(writer) catch |err| {
-            log.warn("failed to flush buffered request data: {s}", .{@errorName(err)});
+            log.warn("failed to flush modified request data: {s}", .{@errorName(err)});
             return err;
         };
     }
@@ -1444,6 +1510,16 @@ pub const Proxy = struct {
                                 items[i + 2] == '\r' and items[i + 3] == '\n')
                             {
                                 headers_complete = true;
+
+                                // SECURITY: Check for Cache-Control: no-store (RFC 9111)
+                                // Do not cache responses marked as no-store (may contain sensitive data)
+                                if (HTTPInspector.hasCacheControlNoStore(items)) {
+                                    is_cacheable = false;
+                                    if (!builtin.is_test) {
+                                        log.info("response has Cache-Control: no-store, will not cache", .{});
+                                    }
+                                }
+
                                 break;
                             }
                         }

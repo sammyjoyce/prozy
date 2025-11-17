@@ -55,6 +55,33 @@ pub const IpKey = union(enum) {
             .ipv6 => |v6| try writer.print("IPv6:{x}", .{v6}),
         }
     }
+
+    /// Convert IpKey to dotted decimal notation (IPv4) or hex notation (IPv6)
+    /// Suitable for use in HTTP headers like X-Forwarded-For
+    /// Buffer must be at least 46 bytes for IPv6 (45 chars + null terminator)
+    pub fn toStringAlloc(self: IpKey, allocator: std.mem.Allocator) ![]u8 {
+        var buf = std.ArrayList(u8).init(allocator);
+        errdefer buf.deinit();
+
+        switch (self) {
+            .ipv4 => |v4| {
+                // Convert u32 back to bytes
+                const bytes = [4]u8{
+                    @intCast((v4 >> 24) & 0xFF),
+                    @intCast((v4 >> 16) & 0xFF),
+                    @intCast((v4 >> 8) & 0xFF),
+                    @intCast(v4 & 0xFF),
+                };
+                try buf.writer().print("{}.{}.{}.{}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
+            },
+            .ipv6 => |v6| {
+                // Simple hex representation (not compressed)
+                try buf.writer().print("{x:0>32}", .{v6});
+            },
+        }
+
+        return try buf.toOwnedSlice();
+    }
 };
 
 // Context for IpKey HashMap
