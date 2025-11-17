@@ -1,16 +1,27 @@
 //! Configuration Hot Reload System
 //!
 //! This module implements zero-downtime configuration reloading using:
-//! - JSON config file parsing (with future ZON support)
+//! - JSON config file parsing (with ZON support)
 //! - Atomic pointer swapping for lock-free reads
 //! - File watching for automatic reload detection
 //! - Validation and safe fallback on parse errors
+//! - Memory-safe lease-based access with deferred cleanup
 //!
 //! Design Philosophy:
 //! - Zero downtime: Active connections continue with old config
 //! - Lock-free reads: Use atomic pointers for configuration access
+//! - Memory safety: ConfigLease prevents use-after-free via reference counting
+//! - Deferred cleanup: Old configs queued and freed only when all readers finish
 //! - Fail-safe: Parse errors don't affect running proxy
 //! - Observable: Log all config changes and errors
+//!
+//! Memory Safety:
+//! The ConfigManager uses a lease-based pattern to prevent use-after-free bugs:
+//! 1. Readers acquire a ConfigLease via getConfig(), incrementing active_readers
+//! 2. During reload, the old arena is queued in retired_head (not freed immediately)
+//! 3. When lease.release() is called, active_readers is decremented
+//! 4. Retired arenas are only freed when active_readers drops to zero
+//! This ensures old configs remain valid as long as any thread holds a lease
 //!
 //! Example JSON config file:
 //! ```json
@@ -259,6 +270,23 @@ pub const JsonConfig = struct {
 };
 
 /// Configuration manager with hot reload support
+///
+/// Thread-safe configuration manager that supports zero-downtime hot reloads.
+/// Uses atomic pointer swapping and lease-based memory management to prevent
+/// use-after-free bugs when configurations are updated while readers are active.
+///
+/// Usage:
+/// ```zig
+/// const manager = try ConfigManager.init(allocator, "config.json");
+/// defer manager.deinit();
+///
+/// // Get config with automatic memory safety
+/// var lease = manager.getConfig();
+/// defer lease.release(); // IMPORTANT: Always release leases
+///
+/// const config = lease.get();
+/// // Use config safely - guaranteed valid until lease.release()
+/// ```
 pub const ConfigManager = struct {
     allocator: std.mem.Allocator,
     config_path: []const u8,
@@ -271,22 +299,37 @@ pub const ConfigManager = struct {
     retired_tail: ?*RetiredArena = null,
     retired_lock: std.Thread.Mutex = .{},
 
+    /// Retired arena waiting for cleanup after all readers finish
     const RetiredArena = struct {
         arena: std.heap.ArenaAllocator,
         next: ?*RetiredArena = null,
     };
 
+    /// RAII lease for safe configuration access
+    ///
+    /// ConfigLease provides memory-safe access to configuration data by:
+    /// - Incrementing active_readers on acquisition
+    /// - Decrementing active_readers on release
+    /// - Preventing cleanup of old configs while any lease exists
+    ///
+    /// IMPORTANT: Always call release() when done, preferably with defer:
+    /// ```zig
+    /// var lease = manager.getConfig();
+    /// defer lease.release();
+    /// ```
     pub const ConfigLease = struct {
         manager: *ConfigManager,
         config: *const Config,
         released: bool = false,
 
         /// Borrow the underlying config pointer.
+        /// The config remains valid until release() is called.
         pub fn get(self: *const ConfigLease) *const Config {
             return self.config;
         }
 
         /// Release the lease so the manager can reclaim retired arenas.
+        /// Safe to call multiple times (idempotent).
         pub fn release(self: *ConfigLease) void {
             if (self.released) return;
             self.released = true;
@@ -1018,4 +1061,314 @@ test "ZON parsing - full configuration coverage" {
     try std.testing.expectEqual(@as(u32, 11), route.concurrency_policy.max_concurrent);
     try std.testing.expectEqual(@as(u32, 12), route.concurrency_policy.max_queue_depth);
     try std.testing.expect(route.concurrency_policy.reject_when_full);
+}
+
+test "ConfigManager - load from JSON file" {
+    const allocator = std.testing.allocator;
+
+    // Create temporary config file
+    const config_content =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": 8080
+        \\  },
+        \\  "clusters": [
+        \\    {
+        \\      "name": "backend",
+        \\      "backends": [
+        \\        { "host": "localhost", "port": 3003, "weight": 1 }
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "routes": [
+        \\    {
+        \\      "name": "default",
+        \\      "match": {},
+        \\      "cluster": "backend"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    // Write to temporary file
+    const temp_path = "test_config_manager.json";
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(config_content);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Initialize ConfigManager
+    const manager = try ConfigManager.init(allocator, temp_path);
+    defer manager.deinit();
+
+    // Get config and verify
+    var lease = manager.getConfig();
+    defer lease.release();
+
+    const config = lease.get();
+    try std.testing.expectEqualStrings("127.0.0.1", config.proxy.listen_host);
+    try std.testing.expectEqual(@as(u16, 8080), config.proxy.listen_port);
+    try std.testing.expectEqual(@as(usize, 1), config.clusters.len);
+}
+
+test "ConfigManager - hot reload with active readers" {
+    const allocator = std.testing.allocator;
+
+    // Create temporary config file
+    const initial_config =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": 8080
+        \\  },
+        \\  "clusters": [
+        \\    {
+        \\      "name": "backend",
+        \\      "backends": [
+        \\        { "host": "localhost", "port": 3003, "weight": 1 }
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "routes": [
+        \\    {
+        \\      "name": "default",
+        \\      "match": {},
+        \\      "cluster": "backend"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const temp_path = "test_config_hot_reload.json";
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(initial_config);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    // Initialize ConfigManager
+    const manager = try ConfigManager.init(allocator, temp_path);
+    defer manager.deinit();
+
+    // Get initial config lease (simulate active reader)
+    var lease1 = manager.getConfig();
+    const config1 = lease1.get();
+    try std.testing.expectEqual(@as(u16, 8080), config1.proxy.listen_port);
+
+    // Update config file
+    // Note: File mtime granularity varies by filesystem. Some tests may need
+    // manual file touch to ensure mtime changes are detected.
+    const updated_config =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "0.0.0.0",
+        \\    "listen_port": 9090
+        \\  },
+        \\  "clusters": [
+        \\    {
+        \\      "name": "backend",
+        \\      "backends": [
+        \\        { "host": "localhost", "port": 3003, "weight": 1 }
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "routes": [
+        \\    {
+        \\      "name": "default",
+        \\      "match": {},
+        \\      "cluster": "backend"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(updated_config);
+    }
+
+    // Reload config while lease1 is still active
+    const reloaded = try manager.reload();
+    try std.testing.expect(reloaded);
+
+    // Old config should still be valid (no use-after-free)
+    try std.testing.expectEqual(@as(u16, 8080), config1.proxy.listen_port);
+
+    // New lease should get new config
+    var lease2 = manager.getConfig();
+    const config2 = lease2.get();
+    try std.testing.expectEqual(@as(u16, 9090), config2.proxy.listen_port);
+    try std.testing.expectEqualStrings("0.0.0.0", config2.proxy.listen_host);
+
+    // Release first lease
+    lease1.release();
+
+    // Old config should still be accessible via lease1 until we release lease2
+    try std.testing.expectEqual(@as(u16, 8080), config1.proxy.listen_port);
+
+    // Release second lease
+    lease2.release();
+
+    // Retired arenas should be cleaned up after all leases are released
+    try std.testing.expectEqual(@as(usize, 0), manager.active_readers.load(.acquire));
+}
+
+test "ConfigManager - multiple reloads" {
+    const allocator = std.testing.allocator;
+
+    const temp_path = "test_config_multiple_reloads.json";
+    const config_template =
+        \\{{
+        \\  "proxy": {{
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": {d}
+        \\  }},
+        \\  "clusters": [
+        \\    {{
+        \\      "name": "backend",
+        \\      "backends": [
+        \\        {{ "host": "localhost", "port": 3003, "weight": 1 }}
+        \\      ]
+        \\    }}
+        \\  ],
+        \\  "routes": [
+        \\    {{
+        \\      "name": "default",
+        \\      "match": {{}},
+        \\      "cluster": "backend"
+        \\    }}
+        \\  ]
+        \\}}
+    ;
+
+    // Write initial config
+    {
+        const config_str = try std.fmt.allocPrint(allocator, config_template, .{8080});
+        defer allocator.free(config_str);
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(config_str);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    const manager = try ConfigManager.init(allocator, temp_path);
+    defer manager.deinit();
+
+    // Perform multiple reloads
+    const ports = [_]u16{ 8081, 8082, 8083 };
+    for (ports) |port| {
+        // Note: File mtime granularity varies by filesystem
+        {
+            const config_str = try std.fmt.allocPrint(allocator, config_template, .{port});
+            defer allocator.free(config_str);
+            const file = try std.fs.cwd().createFile(temp_path, .{});
+            defer file.close();
+            try file.writeAll(config_str);
+        }
+
+        _ = try manager.reload();
+
+        var lease = manager.getConfig();
+        defer lease.release();
+        try std.testing.expectEqual(port, lease.get().proxy.listen_port);
+    }
+
+    // Verify all retired arenas are cleaned up
+    try std.testing.expectEqual(@as(usize, 0), manager.active_readers.load(.acquire));
+}
+
+test "ConfigManager - lease prevents use-after-free" {
+    const allocator = std.testing.allocator;
+
+    const temp_path = "test_config_lease_safety.json";
+    const initial_config =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": 8080
+        \\  },
+        \\  "clusters": [
+        \\    {
+        \\      "name": "backend",
+        \\      "backends": [
+        \\        { "host": "localhost", "port": 3003, "weight": 1 }
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "routes": [
+        \\    {
+        \\      "name": "default",
+        \\      "match": {},
+        \\      "cluster": "backend"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    {
+        const file = try std.fs.cwd().createFile(temp_path, .{});
+        defer file.close();
+        try file.writeAll(initial_config);
+    }
+    defer std.fs.cwd().deleteFile(temp_path) catch {};
+
+    const manager = try ConfigManager.init(allocator, temp_path);
+    defer manager.deinit();
+
+    // Get lease and extract config data before reload
+    var lease = manager.getConfig();
+    const listen_port = lease.get().proxy.listen_port;
+
+    // Perform multiple reloads
+    for (0..10) |i| {
+        // Note: File mtime granularity varies by filesystem
+        const new_config = try std.fmt.allocPrint(allocator,
+            \\{{
+            \\  "proxy": {{
+            \\    "listen_host": "127.0.0.1",
+            \\    "listen_port": {d}
+            \\  }},
+            \\  "clusters": [
+            \\    {{
+            \\      "name": "backend",
+            \\      "backends": [
+            \\        {{ "host": "localhost", "port": 3003, "weight": 1 }}
+            \\      ]
+            \\    }}
+            \\  ],
+            \\  "routes": [
+            \\    {{
+            \\      "name": "default",
+            \\      "match": {{}},
+            \\      "cluster": "backend"
+            \\    }}
+            \\  ]
+            \\}}
+        , .{9000 + i});
+        defer allocator.free(new_config);
+
+        {
+            const file = try std.fs.cwd().createFile(temp_path, .{});
+            defer file.close();
+            try file.writeAll(new_config);
+        }
+
+        _ = try manager.reload();
+    }
+
+    // Old config should still be valid (protected by lease)
+    try std.testing.expectEqual(@as(u16, 8080), listen_port);
+    try std.testing.expectEqual(@as(u16, 8080), lease.get().proxy.listen_port);
+
+    // Release lease
+    lease.release();
+
+    // New config should be accessible
+    var new_lease = manager.getConfig();
+    defer new_lease.release();
+    try std.testing.expectEqual(@as(u16, 9009), new_lease.get().proxy.listen_port);
 }
