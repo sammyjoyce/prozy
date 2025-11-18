@@ -174,28 +174,401 @@ pub const HTTPInspector = struct {
         return false;
     }
 
-    /// Parse Cache-Control header to check for no-store directive
-    /// Returns true if the response should NOT be cached
-    pub fn hasCacheControlNoStore(headers: []const u8) bool {
-        const cache_control = findHeader(headers, "Cache-Control") orelse return false;
+    /// RFC 9111 Vary header support for content negotiation
+    pub const VaryContext = struct {
+        accept: ?[]const u8 = null,
+        accept_encoding: ?[]const u8 = null,
+        accept_language: ?[]const u8 = null,
+        accept_charset: ?[]const u8 = null,
+        user_agent: ?[]const u8 = null,
 
-        // Look for "no-store" directive (case-insensitive)
+        /// Generate hash for vary context (for cache key)
+        pub fn hash(self: VaryContext) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            if (self.accept) |v| hasher.update(v);
+            if (self.accept_encoding) |v| hasher.update(v);
+            if (self.accept_language) |v| hasher.update(v);
+            if (self.accept_charset) |v| hasher.update(v);
+            if (self.user_agent) |v| hasher.update(v);
+            return hasher.final();
+        }
+
+        /// Check if two vary contexts are equal
+        pub fn eql(self: VaryContext, other: VaryContext) bool {
+            const accept_match = if (self.accept) |a|
+                if (other.accept) |b| std.mem.eql(u8, a, b) else false
+            else
+                other.accept == null;
+
+            const encoding_match = if (self.accept_encoding) |a|
+                if (other.accept_encoding) |b| std.mem.eql(u8, a, b) else false
+            else
+                other.accept_encoding == null;
+
+            const language_match = if (self.accept_language) |a|
+                if (other.accept_language) |b| std.mem.eql(u8, a, b) else false
+            else
+                other.accept_language == null;
+
+            const charset_match = if (self.accept_charset) |a|
+                if (other.accept_charset) |b| std.mem.eql(u8, a, b) else false
+            else
+                other.accept_charset == null;
+
+            const ua_match = if (self.user_agent) |a|
+                if (other.user_agent) |b| std.mem.eql(u8, a, b) else false
+            else
+                other.user_agent == null;
+
+            return accept_match and encoding_match and language_match and charset_match and ua_match;
+        }
+    };
+
+    /// Parse Vary header to extract field names (RFC 9111 Section 4.1)
+    /// Returns null if Vary: * (uncacheable)
+    pub fn parseVaryHeader(allocator: std.mem.Allocator, headers: []const u8) !?[][]const u8 {
+        const vary = findHeader(headers, "Vary") orelse return null;
+
+        // Handle "Vary: *" - uncacheable (RFC 9111 Section 4.1)
+        const trimmed = std.mem.trim(u8, vary, " \t");
+        if (std.mem.eql(u8, trimmed, "*")) {
+            return null; // Signal uncacheable
+        }
+
+        var result = std.ArrayList([]const u8).init(allocator);
+        errdefer {
+            for (result.items) |item| allocator.free(item);
+            result.deinit();
+        }
+
+        var it = std.mem.splitSequence(u8, vary, ",");
+        while (it.next()) |header_name| {
+            const trimmed_name = std.mem.trim(u8, header_name, " \t");
+            if (trimmed_name.len > 0) {
+                try result.append(try allocator.dupe(u8, trimmed_name));
+            }
+        }
+
+        return try result.toOwnedSlice();
+    }
+
+    /// Extract vary context from request headers based on Vary field names
+    pub fn extractVaryContext(allocator: std.mem.Allocator, request_headers: []const u8, vary_headers: [][]const u8) !VaryContext {
+        var context = VaryContext{};
+
+        for (vary_headers) |header_name| {
+            if (std.ascii.eqlIgnoreCase(header_name, "Accept")) {
+                if (findHeader(request_headers, "Accept")) |value| {
+                    context.accept = try allocator.dupe(u8, value);
+                }
+            } else if (std.ascii.eqlIgnoreCase(header_name, "Accept-Encoding")) {
+                if (findHeader(request_headers, "Accept-Encoding")) |value| {
+                    context.accept_encoding = try allocator.dupe(u8, value);
+                }
+            } else if (std.ascii.eqlIgnoreCase(header_name, "Accept-Language")) {
+                if (findHeader(request_headers, "Accept-Language")) |value| {
+                    context.accept_language = try allocator.dupe(u8, value);
+                }
+            } else if (std.ascii.eqlIgnoreCase(header_name, "Accept-Charset")) {
+                if (findHeader(request_headers, "Accept-Charset")) |value| {
+                    context.accept_charset = try allocator.dupe(u8, value);
+                }
+            } else if (std.ascii.eqlIgnoreCase(header_name, "User-Agent")) {
+                if (findHeader(request_headers, "User-Agent")) |value| {
+                    context.user_agent = try allocator.dupe(u8, value);
+                }
+            }
+        }
+
+        return context;
+    }
+
+    /// Free vary context allocated strings
+    pub fn freeVaryContext(allocator: std.mem.Allocator, context: *VaryContext) void {
+        if (context.accept) |v| allocator.free(v);
+        if (context.accept_encoding) |v| allocator.free(v);
+        if (context.accept_language) |v| allocator.free(v);
+        if (context.accept_charset) |v| allocator.free(v);
+        if (context.user_agent) |v| allocator.free(v);
+        context.* = .{};
+    }
+
+    /// RFC 9111 Cache-Control directives
+    pub const CacheControlDirectives = struct {
+        max_age: ?u32 = null, // RFC 9111 Section 5.2.2.1
+        s_maxage: ?u32 = null, // RFC 9111 Section 5.2.2.2 (shared caches)
+        no_cache: bool = false, // RFC 9111 Section 5.2.2.4
+        no_store: bool = false, // RFC 9111 Section 5.2.2.5
+        must_revalidate: bool = false, // RFC 9111 Section 5.2.2.3
+        proxy_revalidate: bool = false, // RFC 9111 Section 5.2.2.7
+        private: bool = false, // RFC 9111 Section 5.2.2.6
+        public: bool = false, // RFC 9111 Section 5.2.2.1
+        no_transform: bool = false, // RFC 9111 Section 5.2.2.8
+        immutable: bool = false, // RFC 8246 (extension)
+
+        /// Check if response is cacheable by proxy (shared cache)
+        pub fn isCacheable(self: CacheControlDirectives) bool {
+            // no-store: MUST NOT be cached (RFC 9111 Section 5.2.2.5)
+            if (self.no_store) return false;
+
+            // private: only cacheable by browser, not proxy (RFC 9111 Section 5.2.2.6)
+            if (self.private) return false;
+
+            return true;
+        }
+
+        /// Get TTL (Time To Live) in seconds for cache entry
+        /// s-maxage takes precedence for shared caches (proxies)
+        pub fn getTTL(self: CacheControlDirectives, default_ttl: u32) u32 {
+            // s-maxage takes precedence for shared caches (RFC 9111 Section 5.2.2.2)
+            if (self.s_maxage) |ttl| return ttl;
+
+            // max-age fallback
+            if (self.max_age) |ttl| return ttl;
+
+            // Use default TTL if no explicit directive
+            return default_ttl;
+        }
+
+        /// Check if response requires revalidation before serving from cache
+        pub fn requiresRevalidation(self: CacheControlDirectives) bool {
+            // no-cache: MUST revalidate before use (RFC 9111 Section 5.2.2.4)
+            if (self.no_cache) return true;
+
+            // must-revalidate: MUST revalidate when stale (RFC 9111 Section 5.2.2.3)
+            if (self.must_revalidate) return true;
+
+            // proxy-revalidate: proxies MUST revalidate when stale (RFC 9111 Section 5.2.2.7)
+            if (self.proxy_revalidate) return true;
+
+            return false;
+        }
+    };
+
+    /// Parse Cache-Control header into structured directives (RFC 9111)
+    pub fn parseCacheControl(headers: []const u8) CacheControlDirectives {
+        var directives = CacheControlDirectives{};
+        const cache_control = findHeader(headers, "Cache-Control") orelse return directives;
+
         // Cache-Control can have multiple directives separated by commas
         var it = std.mem.splitSequence(u8, cache_control, ",");
         while (it.next()) |directive_raw| {
             // Trim whitespace using std.mem.trim
             const directive = std.mem.trim(u8, directive_raw, " \t");
 
-            // Check if this directive is "no-store" (ignore any =value part)
-            const equals_idx = std.mem.indexOf(u8, directive, "=");
-            const directive_name = if (equals_idx) |idx| directive[0..idx] else directive;
+            // Skip empty directives
+            if (directive.len == 0) continue;
 
-            if (std.ascii.eqlIgnoreCase(directive_name, "no-store")) {
-                return true;
+            // Parse directive=value format
+            if (std.mem.indexOf(u8, directive, "=")) |eq_idx| {
+                const name = std.mem.trim(u8, directive[0..eq_idx], " \t");
+                var value = std.mem.trim(u8, directive[eq_idx + 1 ..], " \t");
+
+                // Proper quote handling: remove surrounding quotes if present
+                if (value.len >= 2) {
+                    if ((value[0] == '"' and value[value.len - 1] == '"') or
+                        (value[0] == '\'' and value[value.len - 1] == '\''))
+                    {
+                        value = value[1 .. value.len - 1];
+                    }
+                }
+
+                // SECURITY: Validate that boolean directives don't have values
+                if (std.ascii.eqlIgnoreCase(name, "no-cache") or
+                    std.ascii.eqlIgnoreCase(name, "no-store") or
+                    std.ascii.eqlIgnoreCase(name, "must-revalidate") or
+                    std.ascii.eqlIgnoreCase(name, "proxy-revalidate") or
+                    std.ascii.eqlIgnoreCase(name, "private") or
+                    std.ascii.eqlIgnoreCase(name, "public") or
+                    std.ascii.eqlIgnoreCase(name, "no-transform") or
+                    std.ascii.eqlIgnoreCase(name, "immutable"))
+                {
+                    // Boolean directives should not have values - ignore malformed input
+                    continue;
+                }
+
+                // Parse directives with values and validate bounds
+                if (std.ascii.eqlIgnoreCase(name, "max-age")) {
+                    const parsed = std.fmt.parseInt(u32, value, 10) catch null;
+                    // SECURITY: Validate max-age bounds (0 to 1 year in seconds)
+                    if (parsed) |age| {
+                        if (age <= 31536000) {
+                            directives.max_age = age;
+                        }
+                    }
+                } else if (std.ascii.eqlIgnoreCase(name, "s-maxage")) {
+                    const parsed = std.fmt.parseInt(u32, value, 10) catch null;
+                    // SECURITY: Validate s-maxage bounds (0 to 1 year in seconds)
+                    if (parsed) |age| {
+                        if (age <= 31536000) {
+                            directives.s_maxage = age;
+                        }
+                    }
+                }
+            } else {
+                // Boolean directives (no value) - case insensitive comparison
+                if (std.ascii.eqlIgnoreCase(directive, "no-cache")) {
+                    directives.no_cache = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "no-store")) {
+                    directives.no_store = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "must-revalidate")) {
+                    directives.must_revalidate = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "proxy-revalidate")) {
+                    directives.proxy_revalidate = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "private")) {
+                    directives.private = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "public")) {
+                    directives.public = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "no-transform")) {
+                    directives.no_transform = true;
+                } else if (std.ascii.eqlIgnoreCase(directive, "immutable")) {
+                    directives.immutable = true;
+                }
             }
         }
 
-        return false;
+        return directives;
+    }
+
+    /// Parse Cache-Control header to check for no-store directive (legacy function)
+    /// Returns true if the response should NOT be cached
+    /// NOTE: Use parseCacheControl() for full RFC 9111 compliance
+    pub fn hasCacheControlNoStore(headers: []const u8) bool {
+        const directives = parseCacheControl(headers);
+        return directives.no_store;
+    }
+
+    /// RFC 9111 Phase 4: ETag support
+    pub const ETag = struct {
+        value: []const u8,
+        is_weak: bool,
+
+        /// Parse ETag header value
+        pub fn parse(etag_header: []const u8) ?ETag {
+            const trimmed = std.mem.trim(u8, etag_header, " \t");
+
+            if (std.mem.startsWith(u8, trimmed, "W/")) {
+                // Weak ETag: W/"value"
+                if (trimmed.len < 4) return null;
+                const value_part = trimmed[2..];
+                if (!std.mem.startsWith(u8, value_part, "\"") or
+                    !std.mem.endsWith(u8, value_part, "\"")) return null;
+
+                return ETag{
+                    .value = value_part,
+                    .is_weak = true,
+                };
+            } else if (std.mem.startsWith(u8, trimmed, "\"") and
+                std.mem.endsWith(u8, trimmed, "\""))
+            {
+                // Strong ETag: "value"
+                return ETag{
+                    .value = trimmed,
+                    .is_weak = false,
+                };
+            }
+
+            return null;
+        }
+
+        /// Check if two ETags match (RFC 9110 Section 8.8.3.2)
+        pub fn matches(self: ETag, other: ETag) bool {
+            // Strong comparison: both must be strong and identical
+            if (!self.is_weak and !other.is_weak) {
+                return std.mem.eql(u8, self.value, other.value);
+            }
+
+            // Weak comparison: values must match (ignore W/ prefix)
+            return std.mem.eql(u8, self.value, other.value);
+        }
+    };
+
+    /// RFC 9111 Phase 5: Freshness calculation
+    pub const FreshnessInfo = struct {
+        date: ?i64 = null,
+        age: ?u32 = null,
+        expires: ?i64 = null,
+        cache_control: CacheControlDirectives,
+        response_time: i64,
+        request_time: i64,
+
+        /// Calculate freshness lifetime (RFC 9111 Section 4.2.1)
+        pub fn calculateFreshnessLifetime(self: FreshnessInfo) u32 {
+            // 1. s-maxage takes precedence for shared caches
+            if (self.cache_control.s_maxage) |ttl| return ttl;
+
+            // 2. max-age
+            if (self.cache_control.max_age) |ttl| return ttl;
+
+            // 3. Expires header
+            if (self.expires) |exp_time| {
+                if (self.date) |date_time| {
+                    const lifetime = exp_time - date_time;
+                    return if (lifetime > 0) @intCast(lifetime) else 0;
+                }
+            }
+
+            // 4. Heuristic freshness (RFC 9111 Section 4.2.2)
+            // For proxy, we use a conservative default instead of heuristics
+            return 300; // 5 minutes default
+        }
+
+        /// Calculate current age (RFC 9111 Section 4.2.3)
+        pub fn calculateCurrentAge(self: FreshnessInfo, now: i64) u32 {
+            // apparent_age = max(0, response_time - date)
+            const apparent_age = if (self.date) |date_time|
+                std.math.max(0, self.response_time - date_time)
+            else
+                0;
+
+            // response_delay = response_time - request_time
+            const response_delay = self.response_time - self.request_time;
+
+            // corrected_age = age_value + response_delay
+            const age_value: i64 = if (self.age) |a| @intCast(a) else 0;
+            const corrected_age = age_value + response_delay;
+
+            // corrected_initial_age = max(apparent_age, corrected_age)
+            const corrected_initial_age = std.math.max(apparent_age, corrected_age);
+
+            // resident_time = now - response_time
+            const resident_time = now - self.response_time;
+
+            // current_age = corrected_initial_age + resident_time
+            const current_age = corrected_initial_age + resident_time;
+
+            return if (current_age > 0) @intCast(current_age) else 0;
+        }
+
+        /// Check if response is fresh (RFC 9111 Section 4.2)
+        pub fn isFresh(self: FreshnessInfo, now: i64) bool {
+            const freshness_lifetime = self.calculateFreshnessLifetime();
+            const current_age = self.calculateCurrentAge(now);
+            return current_age < freshness_lifetime;
+        }
+
+        /// Check if response is stale (requires revalidation)
+        pub fn isStale(self: FreshnessInfo, now: i64) bool {
+            return !self.isFresh(now);
+        }
+    };
+
+    /// Parse HTTP date (simplified - RFC 9110 Section 5.6.7)
+    /// Returns Unix timestamp or null if parsing fails
+    pub fn parseHttpDate(date_str: []const u8) ?i64 {
+        // This is a simplified implementation
+        // Full RFC 9110 date parsing would handle multiple formats
+        // For now, we return null to indicate parsing not fully implemented
+        _ = date_str;
+        return null;
+    }
+
+    /// Generate Age header value (RFC 9111 Section 5.1)
+    pub fn generateAgeHeader(allocator: std.mem.Allocator, freshness_info: FreshnessInfo, now: i64) ![]u8 {
+        const current_age = freshness_info.calculateCurrentAge(now);
+        var buffer: [64]u8 = undefined;
+        const age_str = try std.fmt.bufPrint(&buffer, "Age: {}\r\n", .{current_age});
+        return try allocator.dupe(u8, age_str);
     }
 
     /// Check if an IP address string is IPv6 (contains colons)
@@ -565,6 +938,19 @@ pub const HTTPCache = struct {
         access_count: u32,
         prev: ?*CacheNode,
         next: ?*CacheNode,
+
+        // RFC 9111 Phase 4: ETag and Last-Modified validators
+        etag: ?[]u8 = null,
+        last_modified: ?[]u8 = null,
+        is_weak_etag: bool = false,
+
+        // RFC 9111 Phase 5: Freshness tracking
+        date_header: ?i64 = null, // Date header (origin server time)
+        age_header: ?u32 = null, // Age header value
+        expires_header: ?i64 = null, // Expires header
+        request_time: i64 = 0, // When request was sent
+        response_time: i64 = 0, // When response was received
+        cache_control: HTTPInspector.CacheControlDirectives = .{},
     };
 
     allocator: std.mem.Allocator,
@@ -596,6 +982,8 @@ pub const HTTPCache = struct {
             self.allocator.free(node.method);
             self.allocator.free(node.host);
             self.allocator.free(node.path);
+            if (node.etag) |etag| self.allocator.free(etag);
+            if (node.last_modified) |lm| self.allocator.free(lm);
             self.allocator.destroy(node);
         }
         self.cache.deinit();
@@ -798,6 +1186,8 @@ pub const HTTPCache = struct {
         self.allocator.free(node.method);
         self.allocator.free(node.host);
         self.allocator.free(node.path);
+        if (node.etag) |etag| self.allocator.free(etag);
+        if (node.last_modified) |lm| self.allocator.free(lm);
         self.allocator.destroy(node);
     }
 

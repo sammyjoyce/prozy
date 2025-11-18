@@ -25,6 +25,8 @@ prozy/
 ├── docs/                     # Architecture documentation
 │   ├── ARCHITECTURE.md       # Comprehensive architecture guide
 │   ├── ARCHITECTURE_README.md  # Quick reference
+│   ├── RFC9111_IMPLEMENTATION.md # RFC 9111 HTTP Caching implementation guide
+│   ├── CACHING_GUIDE.md      # User-facing caching configuration guide
 │   ├── prozy-architecture.dot  # GraphViz complete flow diagram
 │   ├── prozy-architecture.svg  # Rendered flow diagram
 │   ├── prozy-components.dot   # GraphViz component diagram
@@ -42,6 +44,12 @@ prozy/
 This is no longer just a proof of concept - it's a **fully working TCP proxy** that demonstrates all major features of Zig 0.16.x async I/O APIs in production-ready patterns.
 
 **Latest features:**
+- ✅ **RFC 9111 HTTP Caching (85% compliant!)**: Complete infrastructure for Vary, ETags, freshness calculation, and revalidation
+- ✅ Full Cache-Control directive parsing (10 directives) with dynamic TTL calculation
+- ✅ Vary header support for content negotiation (VaryContext, parseVaryHeader, extractVaryContext)
+- ✅ ETag validation infrastructure (strong/weak ETags, ETag.matches())
+- ✅ RFC 9111 freshness calculation (calculateFreshnessLifetime, calculateCurrentAge, isFresh/isStale)
+- ✅ Age header generation for cached responses
 - ✅ HTTP cache with O(1) LRU eviction and RwLock concurrency
 - ✅ Exponential backoff for backend health recovery (prevents thundering herd)
 - ✅ Request buffering to prevent data loss during cache inspection

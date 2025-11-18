@@ -491,6 +491,7 @@ pub const Proxy = struct {
     fn handleConnectTunnel(
         client_stream: net.Stream,
         io: Io,
+        allocator: std.mem.Allocator,
         backend_host: []const u8,
         backend_port: u16,
         connect_timeout: Timeout,
@@ -555,6 +556,7 @@ pub const Proxy = struct {
         // Reuse client_writer from above (already initialized)
 
         // Start bidirectional copy (raw TCP tunnel)
+        // CONNECT tunnels don't use caching (no HTTP parsing)
         copyBidirectionalWithStats(
             io,
             &client_reader.interface,
@@ -564,6 +566,9 @@ pub const Proxy = struct {
             stats,
             http_inspector,
             options,
+            allocator,
+            null, // no cache for CONNECT tunnels
+            null, // no cache context
         );
 
         if (!builtin.is_test) {
@@ -708,6 +713,7 @@ pub const Proxy = struct {
                     handleConnectTunnel(
                         client_stream,
                         io,
+                        allocator,
                         connect_host,
                         connect_port,
                         connect_timeout,
@@ -824,6 +830,25 @@ pub const Proxy = struct {
             }
         }
 
+        // Prepare cache context for cache population on cache miss
+        // Only create context if caching is enabled and we have a valid GET request with Host header
+        var cache_context: ?CacheContext = null;
+        if (cache_enabled and http_cache != null and parsed_request != null) {
+            if (parsed_request) |request| {
+                if (std.mem.eql(u8, request.method, "GET")) {
+                    if (HTTPInspector.findHeader(request_headers, "Host")) |host| {
+                        // Store cache context for later use in copyBidirectionalWithStats
+                        if (CacheContext.init(allocator, request.method, host, request.path)) |ctx| {
+                            cache_context = ctx;
+                        } else |err| {
+                            log.warn("failed to allocate cache context: {s}", .{@errorName(err)});
+                            // Continue without caching if allocation fails
+                        }
+                    }
+                }
+            }
+        }
+
         // Select backend (use router if configured, otherwise fall back to load balancer)
         var actual_backend_host = backend_host;
         var actual_backend_port = backend_port;
@@ -934,6 +959,7 @@ pub const Proxy = struct {
         }
 
         // Start bidirectional copy with statistics tracking
+        // Enable cache population if we have a cache context (GET with Host header on cache miss)
         copyBidirectionalWithStats(
             io,
             &client_reader.interface,
@@ -943,7 +969,15 @@ pub const Proxy = struct {
             stats,
             http_inspector,
             options,
+            allocator,
+            http_cache,
+            cache_context,
         );
+
+        // Clean up cache context if it was allocated
+        if (cache_context) |*ctx| {
+            ctx.deinit();
+        }
 
         if (options.enable_connection_logging and !builtin.is_test and start_time != null) {
             if (std.time.Instant.now()) |end_time| {
@@ -1237,7 +1271,31 @@ pub const Proxy = struct {
 
         // Configuration constants for cache population
         const default_ttl_seconds: u32 = 300;
-        const max_cacheable_size: usize = 1024 * 1024; // 1MB
+        const max_cacheable_size: usize = 100 * 1024; // 100KB (reduced from 1MB for memory efficiency)
+    };
+
+    /// Cache context for request/response caching
+    /// Note: Contains owned copies of request data to ensure lifetime safety
+    const CacheContext = struct {
+        method: []const u8,
+        host: []const u8,
+        path: []const u8,
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator, method: []const u8, host: []const u8, path: []const u8) !CacheContext {
+            return CacheContext{
+                .method = try allocator.dupe(u8, method),
+                .host = try allocator.dupe(u8, host),
+                .path = try allocator.dupe(u8, path),
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: CacheContext) void {
+            self.allocator.free(self.method);
+            self.allocator.free(self.host);
+            self.allocator.free(self.path);
+        }
     };
 
     fn copyBidirectionalWithStats(
@@ -1249,6 +1307,9 @@ pub const Proxy = struct {
         stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
+        allocator: std.mem.Allocator,
+        http_cache: ?*HTTPCache,
+        cache_context: ?CacheContext,
     ) void {
         const job_c2b = PipeJobWithStats{
             .reader = client_reader,
@@ -1258,32 +1319,89 @@ pub const Proxy = struct {
             .http_inspector = http_inspector,
             .enable_http_inspection = options.enable_http_inspection,
         };
-        const job_b2c = PipeJobWithStats{
-            .reader = backend_reader,
-            .writer = client_writer,
-            .stats = stats,
-            .direction = .backend_to_client,
-            .http_inspector = http_inspector,
-            .enable_http_inspection = options.enable_http_inspection,
-        };
 
-        // Use concurrent copying with statistics
+        // Choose appropriate copy function based on caching configuration
+        // Use caching path for backend->client when all conditions are met:
+        // 1. Caching is enabled in options
+        // 2. http_cache is not null
+        // 3. cache_context is not null (method, host, path available)
+        const use_caching = options.enable_caching and http_cache != null and cache_context != null;
+
+        // Use concurrent copying with statistics (and caching for backend->client if enabled)
         var future_c2b = io.concurrent(copyPipeWithStats, .{job_c2b}) catch |err| switch (err) {
             error.ConcurrencyUnavailable => {
                 sequentialCopyWithStats(job_c2b);
-                sequentialCopyWithStats(job_b2c);
+                if (use_caching) {
+                    const job_b2c_caching_seq = PipeJobWithCaching{
+                        .reader = backend_reader,
+                        .writer = client_writer,
+                        .stats = stats,
+                        .direction = .backend_to_client,
+                        .http_inspector = http_inspector,
+                        .enable_http_inspection = options.enable_http_inspection,
+                        .http_cache = http_cache.?,
+                        .request_method = cache_context.?.method,
+                        .request_host = cache_context.?.host,
+                        .request_path = cache_context.?.path,
+                        .allocator = allocator,
+                    };
+                    sequentialCopyWithCaching(job_b2c_caching_seq);
+                } else {
+                    const job_b2c = PipeJobWithStats{
+                        .reader = backend_reader,
+                        .writer = client_writer,
+                        .stats = stats,
+                        .direction = .backend_to_client,
+                        .http_inspector = http_inspector,
+                        .enable_http_inspection = options.enable_http_inspection,
+                    };
+                    sequentialCopyWithStats(job_b2c);
+                }
                 return;
             },
         };
 
-        var future_b2c = io.concurrent(copyPipeWithStats, .{job_b2c}) catch |err| switch (err) {
-            error.ConcurrencyUnavailable => {
-                future_c2b.cancel(io) catch {};
-                sequentialCopyWithStats(job_c2b);
-                sequentialCopyWithStats(job_b2c);
-                return;
-            },
-        };
+        var future_b2c: @TypeOf(future_c2b) = undefined;
+        if (use_caching) {
+            const job_b2c_caching = PipeJobWithCaching{
+                .reader = backend_reader,
+                .writer = client_writer,
+                .stats = stats,
+                .direction = .backend_to_client,
+                .http_inspector = http_inspector,
+                .enable_http_inspection = options.enable_http_inspection,
+                .http_cache = http_cache.?,
+                .request_method = cache_context.?.method,
+                .request_host = cache_context.?.host,
+                .request_path = cache_context.?.path,
+                .allocator = allocator,
+            };
+            future_b2c = io.concurrent(copyPipeWithCaching, .{job_b2c_caching}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => {
+                    future_c2b.cancel(io) catch {};
+                    sequentialCopyWithStats(job_c2b);
+                    sequentialCopyWithCaching(job_b2c_caching);
+                    return;
+                },
+            };
+        } else {
+            const job_b2c = PipeJobWithStats{
+                .reader = backend_reader,
+                .writer = client_writer,
+                .stats = stats,
+                .direction = .backend_to_client,
+                .http_inspector = http_inspector,
+                .enable_http_inspection = options.enable_http_inspection,
+            };
+            future_b2c = io.concurrent(copyPipeWithStats, .{job_b2c}) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => {
+                    future_c2b.cancel(io) catch {};
+                    sequentialCopyWithStats(job_c2b);
+                    sequentialCopyWithStats(job_b2c);
+                    return;
+                },
+            };
+        }
 
         // Wait for first completion
         const first_completed = io.select(.{
@@ -1562,6 +1680,11 @@ pub const Proxy = struct {
         var is_cacheable = false;
         var is_http_200 = false;
         var headers_complete = false;
+        var cache_control_directives: ?HTTPInspector.CacheControlDirectives = null;
+
+        // Transfer validation state
+        var expected_content_length: ?usize = null;
+        var transfer_complete = false;
 
         // Only allocate buffer for backend->client with GET requests
         if (job.direction == .backend_to_client and std.mem.eql(u8, job.request_method, "GET")) {
@@ -1632,6 +1755,7 @@ pub const Proxy = struct {
                     };
 
                     // Check if headers are complete (look for \r\n\r\n)
+                    // Store Cache-Control directives for TTL calculation
                     if (!headers_complete and response_buffer.?.items.len >= 4) {
                         const items = response_buffer.?.items;
                         for (0..items.len - 3) |i| {
@@ -1640,12 +1764,26 @@ pub const Proxy = struct {
                             {
                                 headers_complete = true;
 
-                                // SECURITY: Check for Cache-Control: no-store (RFC 9111)
-                                // Do not cache responses marked as no-store (may contain sensitive data)
-                                if (HTTPInspector.hasCacheControlNoStore(items)) {
+                                // RFC 9111: Parse full Cache-Control directives
+                                cache_control_directives = HTTPInspector.parseCacheControl(items);
+
+                                // TRANSFER VALIDATION: Parse Content-Length for transfer completion check
+                                if (HTTPInspector.findHeader(items, "Content-Length")) |content_length_str| {
+                                    expected_content_length = std.fmt.parseInt(usize, content_length_str, 10) catch null;
+                                    if (!builtin.is_test and expected_content_length != null) {
+                                        log.info("response has Content-Length: {d} bytes", .{expected_content_length.?});
+                                    }
+                                }
+
+                                // SECURITY: Check cacheability (no-store, private, etc.)
+                                if (!cache_control_directives.?.isCacheable()) {
                                     is_cacheable = false;
                                     if (!builtin.is_test) {
-                                        log.info("response has Cache-Control: no-store, will not cache", .{});
+                                        if (cache_control_directives.?.no_store) {
+                                            log.info("response has Cache-Control: no-store, will not cache", .{});
+                                        } else if (cache_control_directives.?.private) {
+                                            log.info("response has Cache-Control: private, will not cache (shared cache)", .{});
+                                        }
                                     }
                                 }
 
@@ -1677,16 +1815,53 @@ pub const Proxy = struct {
         if (!builtin.is_test) log.info("copyPipeWithCaching: flushing {} total bytes", .{total_bytes});
         try Writer.flush(job.writer);
 
-        // Store in cache if all conditions met
-        if (is_cacheable and is_http_200 and headers_complete and response_buffer != null) {
+        // TRANSFER VALIDATION: Verify response was completely received
+        if (expected_content_length) |content_length| {
+            const headers_size = if (cache_control_directives != null) blk: {
+                // Find where headers end in our buffered response
+                const items = response_buffer.?.items;
+                if (HTTPInspector.findHeadersEnd(items)) |headers_end| {
+                    break :blk headers_end;
+                }
+                break :blk 0;
+            } else 0;
+
+            const body_received = total_bytes - headers_size;
+            transfer_complete = (body_received >= content_length);
+
+            if (!builtin.is_test) {
+                if (transfer_complete) {
+                    log.info("transfer validation: complete (body: {d}/{d} bytes)", .{ body_received, content_length });
+                } else {
+                    log.warn("transfer validation: incomplete (body: {d}/{d} bytes), will not cache", .{ body_received, content_length });
+                    is_cacheable = false;
+                }
+            }
+        } else {
+            // No Content-Length header - assume transfer is complete for HTTP/1.0
+            // or connection-terminated responses
+            transfer_complete = true;
+            if (!builtin.is_test) {
+                log.info("transfer validation: no Content-Length, assuming complete", .{});
+            }
+        }
+
+        // Store in cache if all conditions met AND transfer is complete
+        if (is_cacheable and is_http_200 and headers_complete and transfer_complete and response_buffer != null) {
             const response_data = response_buffer.?.items;
             if (response_data.len > 0 and response_data.len <= PipeJobWithCaching.max_cacheable_size) {
+                // Calculate TTL using Cache-Control directives (respects max-age, s-maxage)
+                const ttl = if (cache_control_directives) |directives|
+                    directives.getTTL(PipeJobWithCaching.default_ttl_seconds)
+                else
+                    PipeJobWithCaching.default_ttl_seconds;
+
                 job.http_cache.put(
                     job.request_method,
                     job.request_host,
                     job.request_path,
                     response_data,
-                    PipeJobWithCaching.default_ttl_seconds,
+                    ttl,
                 ) catch |err| {
                     if (!builtin.is_test) {
                         log.warn("failed to cache response: {s}", .{@errorName(err)});
@@ -1698,7 +1873,7 @@ pub const Proxy = struct {
                         job.request_method,
                         job.request_path,
                         response_data.len,
-                        PipeJobWithCaching.default_ttl_seconds,
+                        ttl,
                     });
                 }
             }
