@@ -356,19 +356,57 @@ pub const HTTPInspector = struct {
             // Trim whitespace using std.mem.trim
             const directive = std.mem.trim(u8, directive_raw, " \t");
 
+            // Skip empty directives
+            if (directive.len == 0) continue;
+
             // Parse directive=value format
             if (std.mem.indexOf(u8, directive, "=")) |eq_idx| {
-                const name = directive[0..eq_idx];
-                const value = std.mem.trim(u8, directive[eq_idx + 1 ..], " \t\""); // Trim quotes too
+                const name = std.mem.trim(u8, directive[0..eq_idx], " \t");
+                var value = std.mem.trim(u8, directive[eq_idx + 1 ..], " \t");
 
-                // Parse directives with values
+                // Proper quote handling: remove surrounding quotes if present
+                if (value.len >= 2) {
+                    if ((value[0] == '"' and value[value.len - 1] == '"') or
+                        (value[0] == '\'' and value[value.len - 1] == '\''))
+                    {
+                        value = value[1 .. value.len - 1];
+                    }
+                }
+
+                // SECURITY: Validate that boolean directives don't have values
+                if (std.ascii.eqlIgnoreCase(name, "no-cache") or
+                    std.ascii.eqlIgnoreCase(name, "no-store") or
+                    std.ascii.eqlIgnoreCase(name, "must-revalidate") or
+                    std.ascii.eqlIgnoreCase(name, "proxy-revalidate") or
+                    std.ascii.eqlIgnoreCase(name, "private") or
+                    std.ascii.eqlIgnoreCase(name, "public") or
+                    std.ascii.eqlIgnoreCase(name, "no-transform") or
+                    std.ascii.eqlIgnoreCase(name, "immutable"))
+                {
+                    // Boolean directives should not have values - ignore malformed input
+                    continue;
+                }
+
+                // Parse directives with values and validate bounds
                 if (std.ascii.eqlIgnoreCase(name, "max-age")) {
-                    directives.max_age = std.fmt.parseInt(u32, value, 10) catch null;
+                    const parsed = std.fmt.parseInt(u32, value, 10) catch null;
+                    // SECURITY: Validate max-age bounds (0 to 1 year in seconds)
+                    if (parsed) |age| {
+                        if (age <= 31536000) {
+                            directives.max_age = age;
+                        }
+                    }
                 } else if (std.ascii.eqlIgnoreCase(name, "s-maxage")) {
-                    directives.s_maxage = std.fmt.parseInt(u32, value, 10) catch null;
+                    const parsed = std.fmt.parseInt(u32, value, 10) catch null;
+                    // SECURITY: Validate s-maxage bounds (0 to 1 year in seconds)
+                    if (parsed) |age| {
+                        if (age <= 31536000) {
+                            directives.s_maxage = age;
+                        }
+                    }
                 }
             } else {
-                // Boolean directives (no value)
+                // Boolean directives (no value) - case insensitive comparison
                 if (std.ascii.eqlIgnoreCase(directive, "no-cache")) {
                     directives.no_cache = true;
                 } else if (std.ascii.eqlIgnoreCase(directive, "no-store")) {

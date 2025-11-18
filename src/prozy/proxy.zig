@@ -838,11 +838,12 @@ pub const Proxy = struct {
                 if (std.mem.eql(u8, request.method, "GET")) {
                     if (HTTPInspector.findHeader(request_headers, "Host")) |host| {
                         // Store cache context for later use in copyBidirectionalWithStats
-                        cache_context = CacheContext{
-                            .method = request.method,
-                            .host = host,
-                            .path = request.path,
-                        };
+                        if (CacheContext.init(allocator, request.method, host, request.path)) |ctx| {
+                            cache_context = ctx;
+                        } else |err| {
+                            log.warn("failed to allocate cache context: {s}", .{@errorName(err)});
+                            // Continue without caching if allocation fails
+                        }
                     }
                 }
             }
@@ -972,6 +973,11 @@ pub const Proxy = struct {
             http_cache,
             cache_context,
         );
+
+        // Clean up cache context if it was allocated
+        if (cache_context) |*ctx| {
+            ctx.deinit();
+        }
 
         if (options.enable_connection_logging and !builtin.is_test and start_time != null) {
             if (std.time.Instant.now()) |end_time| {
@@ -1265,14 +1271,31 @@ pub const Proxy = struct {
 
         // Configuration constants for cache population
         const default_ttl_seconds: u32 = 300;
-        const max_cacheable_size: usize = 1024 * 1024; // 1MB
+        const max_cacheable_size: usize = 100 * 1024; // 100KB (reduced from 1MB for memory efficiency)
     };
 
     /// Cache context for request/response caching
+    /// Note: Contains owned copies of request data to ensure lifetime safety
     const CacheContext = struct {
         method: []const u8,
         host: []const u8,
         path: []const u8,
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator, method: []const u8, host: []const u8, path: []const u8) !CacheContext {
+            return CacheContext{
+                .method = try allocator.dupe(u8, method),
+                .host = try allocator.dupe(u8, host),
+                .path = try allocator.dupe(u8, path),
+                .allocator = allocator,
+            };
+        }
+
+        pub fn deinit(self: CacheContext) void {
+            self.allocator.free(self.method);
+            self.allocator.free(self.host);
+            self.allocator.free(self.path);
+        }
     };
 
     fn copyBidirectionalWithStats(
@@ -1309,7 +1332,7 @@ pub const Proxy = struct {
             error.ConcurrencyUnavailable => {
                 sequentialCopyWithStats(job_c2b);
                 if (use_caching) {
-                    const job_b2c_caching = PipeJobWithCaching{
+                    const job_b2c_caching_seq = PipeJobWithCaching{
                         .reader = backend_reader,
                         .writer = client_writer,
                         .stats = stats,
@@ -1322,7 +1345,7 @@ pub const Proxy = struct {
                         .request_path = cache_context.?.path,
                         .allocator = allocator,
                     };
-                    sequentialCopyWithCaching(job_b2c_caching);
+                    sequentialCopyWithCaching(job_b2c_caching_seq);
                 } else {
                     const job_b2c = PipeJobWithStats{
                         .reader = backend_reader,
@@ -1659,6 +1682,10 @@ pub const Proxy = struct {
         var headers_complete = false;
         var cache_control_directives: ?HTTPInspector.CacheControlDirectives = null;
 
+        // Transfer validation state
+        var expected_content_length: ?usize = null;
+        var transfer_complete = false;
+
         // Only allocate buffer for backend->client with GET requests
         if (job.direction == .backend_to_client and std.mem.eql(u8, job.request_method, "GET")) {
             response_buffer = .{};
@@ -1740,6 +1767,14 @@ pub const Proxy = struct {
                                 // RFC 9111: Parse full Cache-Control directives
                                 cache_control_directives = HTTPInspector.parseCacheControl(items);
 
+                                // TRANSFER VALIDATION: Parse Content-Length for transfer completion check
+                                if (HTTPInspector.findHeader(items, "Content-Length")) |content_length_str| {
+                                    expected_content_length = std.fmt.parseInt(usize, content_length_str, 10) catch null;
+                                    if (!builtin.is_test and expected_content_length != null) {
+                                        log.info("response has Content-Length: {d} bytes", .{expected_content_length.?});
+                                    }
+                                }
+
                                 // SECURITY: Check cacheability (no-store, private, etc.)
                                 if (!cache_control_directives.?.isCacheable()) {
                                     is_cacheable = false;
@@ -1780,8 +1815,39 @@ pub const Proxy = struct {
         if (!builtin.is_test) log.info("copyPipeWithCaching: flushing {} total bytes", .{total_bytes});
         try Writer.flush(job.writer);
 
-        // Store in cache if all conditions met
-        if (is_cacheable and is_http_200 and headers_complete and response_buffer != null) {
+        // TRANSFER VALIDATION: Verify response was completely received
+        if (expected_content_length) |content_length| {
+            const headers_size = if (cache_control_directives != null) blk: {
+                // Find where headers end in our buffered response
+                const items = response_buffer.?.items;
+                if (HTTPInspector.findHeadersEnd(items)) |headers_end| {
+                    break :blk headers_end;
+                }
+                break :blk 0;
+            } else 0;
+
+            const body_received = total_bytes - headers_size;
+            transfer_complete = (body_received >= content_length);
+
+            if (!builtin.is_test) {
+                if (transfer_complete) {
+                    log.info("transfer validation: complete (body: {d}/{d} bytes)", .{ body_received, content_length });
+                } else {
+                    log.warn("transfer validation: incomplete (body: {d}/{d} bytes), will not cache", .{ body_received, content_length });
+                    is_cacheable = false;
+                }
+            }
+        } else {
+            // No Content-Length header - assume transfer is complete for HTTP/1.0
+            // or connection-terminated responses
+            transfer_complete = true;
+            if (!builtin.is_test) {
+                log.info("transfer validation: no Content-Length, assuming complete", .{});
+            }
+        }
+
+        // Store in cache if all conditions met AND transfer is complete
+        if (is_cacheable and is_http_200 and headers_complete and transfer_complete and response_buffer != null) {
             const response_data = response_buffer.?.items;
             if (response_data.len > 0 and response_data.len <= PipeJobWithCaching.max_cacheable_size) {
                 // Calculate TTL using Cache-Control directives (respects max-age, s-maxage)
