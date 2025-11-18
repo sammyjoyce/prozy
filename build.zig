@@ -266,6 +266,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(auth_proxy);
 
+    const warming_proxy = b.addExecutable(.{
+        .name = "warming_proxy",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/configs/warming_proxy.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(warming_proxy);
+
     const config_hot_reload_demo = b.addExecutable(.{
         .name = "config_hot_reload_demo",
         .root_module = b.createModule(.{
@@ -336,6 +349,10 @@ pub fn build(b: *std.Build) void {
     const run_auth_proxy = b.addRunArtifact(auth_proxy);
     const auth_proxy_step = b.step("auth_proxy", "Run authentication proxy example");
     auth_proxy_step.dependOn(&run_auth_proxy.step);
+
+    const run_warming_proxy = b.addRunArtifact(warming_proxy);
+    const warming_proxy_step = b.step("warming_proxy", "Run cache warming proxy example");
+    warming_proxy_step.dependOn(&run_warming_proxy.step);
 
     // E2E test executable
     const e2e_test = b.addExecutable(.{

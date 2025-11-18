@@ -2254,3 +2254,102 @@ test "Proxy authentication password verification and session tracking" {
     stats = auth.getStats();
     try testing.expectEqual(@as(u64, 0), stats.active_sessions);
 }
+
+// ============================================================================
+// Cache Warming Tests
+// ============================================================================
+
+test "HTTPCache: WarmupStats initialization" {
+    const stats = HTTPCache.WarmupStats{};
+    try testing.expectEqual(@as(usize, 0), stats.total_urls);
+    try testing.expectEqual(@as(usize, 0), stats.successful);
+    try testing.expectEqual(@as(usize, 0), stats.failed);
+    try testing.expectEqual(@as(usize, 0), stats.cached_bytes);
+    try testing.expectEqual(@as(u64, 0), stats.duration_ms);
+    try testing.expectEqual(@as(f64, 0.0), stats.successRate());
+}
+
+test "HTTPCache: WarmupStats success rate calculation" {
+    var stats = HTTPCache.WarmupStats{
+        .total_urls = 10,
+        .successful = 7,
+        .failed = 3,
+    };
+
+    // 7/10 = 70%
+    const rate = stats.successRate();
+    try testing.expect(rate >= 69.9 and rate <= 70.1);
+
+    // Test 100% success
+    stats.successful = 10;
+    stats.failed = 0;
+    try testing.expectEqual(@as(f64, 100.0), stats.successRate());
+
+    // Test 0% success
+    stats.successful = 0;
+    stats.failed = 10;
+    try testing.expectEqual(@as(f64, 0.0), stats.successRate());
+}
+
+test "HTTPCache: WarmupUrl structure" {
+    const url1 = HTTPCache.WarmupUrl{
+        .host = "example.com",
+        .path = "/api/data",
+        .port = 8080,
+    };
+
+    try testing.expectEqualStrings("GET", url1.method);
+    try testing.expectEqualStrings("example.com", url1.host);
+    try testing.expectEqualStrings("/api/data", url1.path);
+    try testing.expectEqual(@as(u16, 8080), url1.port);
+
+    // Test defaults
+    const url2 = HTTPCache.WarmupUrl{
+        .host = "test.com",
+        .path = "/",
+    };
+
+    try testing.expectEqualStrings("GET", url2.method);
+    try testing.expectEqual(@as(u16, 80), url2.port);
+}
+
+test "Proxy: warmupCache error when caching not enabled" {
+    const allocator = testing.allocator;
+
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    var proxy = Proxy.init(allocator, 9090, "127.0.0.1", 3003);
+    defer proxy.deinit();
+
+    // Don't enable caching - should return error
+    const urls = [_]HTTPCache.WarmupUrl{
+        .{ .host = "127.0.0.1", .path = "/", .port = 3003 },
+    };
+
+    const result = proxy.warmupCache(io, &urls, .none);
+    try testing.expectError(error.CachingNotEnabled, result);
+}
+
+test "Proxy: warmupCache API with empty URL list" {
+    const allocator = testing.allocator;
+
+    var threaded_io = std.Io.Threaded.init(allocator);
+    defer threaded_io.deinit();
+    const io = threaded_io.io();
+
+    var proxy = Proxy.init(allocator, 9090, "127.0.0.1", 3003);
+    defer proxy.deinit();
+
+    // Enable caching
+    proxy.enableCaching(10 * 1024 * 1024);
+
+    // Warm with empty URL list
+    const urls = [_]HTTPCache.WarmupUrl{};
+    const stats = try proxy.warmupCache(io, &urls, .none);
+
+    try testing.expectEqual(@as(usize, 0), stats.total_urls);
+    try testing.expectEqual(@as(usize, 0), stats.successful);
+    try testing.expectEqual(@as(usize, 0), stats.failed);
+}

@@ -243,6 +243,35 @@ pub const Proxy = struct {
         return null;
     }
 
+    /// Warm up the cache by pre-fetching URLs
+    ///
+    /// This method pre-populates the cache with responses from a list of URLs.
+    /// It should be called after enableCaching() and before runWithIoOptions().
+    ///
+    /// Example:
+    /// ```zig
+    /// proxy.enableCaching(100 * 1024 * 1024); // 100 MB cache
+    ///
+    /// const warmup_urls = [_]HTTPCache.WarmupUrl{
+    ///     .{ .host = "127.0.0.1", .path = "/api/popular", .port = 3003 },
+    ///     .{ .host = "127.0.0.1", .path = "/api/trending", .port = 3003 },
+    /// };
+    ///
+    /// const stats = try proxy.warmupCache(io, &warmup_urls, .none);
+    /// log.info("cache warmed: {}/{} URLs", .{ stats.successful, stats.total_urls });
+    /// ```
+    pub fn warmupCache(
+        self: *Self,
+        io: Io,
+        urls: []const HTTPCache.WarmupUrl,
+        connect_timeout: Timeout,
+    ) !HTTPCache.WarmupStats {
+        if (self.http_cache) |*cache| {
+            return cache.warmupFromUrls(self.allocator, io, urls, connect_timeout);
+        }
+        return error.CachingNotEnabled;
+    }
+
     /// Print statistics to stdout
     pub fn printStats(self: *const Self) void {
         const stats = self.getStats();

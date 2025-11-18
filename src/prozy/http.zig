@@ -1214,4 +1214,259 @@ pub const HTTPCache = struct {
             return @as(f64, @floatFromInt(self.hits)) / @as(f64, @floatFromInt(total)) * 100.0;
         }
     };
+
+    /// Configuration for cache warming from URL list
+    pub const WarmupUrl = struct {
+        method: []const u8 = "GET",
+        host: []const u8,
+        path: []const u8,
+        port: u16 = 80,
+    };
+
+    /// Statistics for cache warming operation
+    pub const WarmupStats = struct {
+        total_urls: usize = 0,
+        successful: usize = 0,
+        failed: usize = 0,
+        cached_bytes: usize = 0,
+        duration_ms: u64 = 0,
+
+        pub fn successRate(self: WarmupStats) f64 {
+            if (self.total_urls == 0) return 0.0;
+            return @as(f64, @floatFromInt(self.successful)) / @as(f64, @floatFromInt(self.total_urls)) * 100.0;
+        }
+    };
+
+    /// Warm up the cache by pre-fetching a list of URLs from the backend
+    ///
+    /// This function issues HTTP GET requests to the specified URLs and populates
+    /// the cache with the responses. This is useful for "cache warming" scenarios
+    /// where you want to pre-populate the cache before accepting client traffic.
+    ///
+    /// The warming process:
+    /// 1. Issues GET requests to each URL in the list
+    /// 2. Reads the complete response from the backend
+    /// 3. Stores cacheable responses (HTTP 200, respects Cache-Control)
+    /// 4. Returns statistics about the warming operation
+    ///
+    /// Example usage:
+    /// ```zig
+    /// const warmup_urls = [_]HTTPCache.WarmupUrl{
+    ///     .{ .host = "example.com", .path = "/", .port = 80 },
+    ///     .{ .host = "example.com", .path = "/api/data", .port = 80 },
+    /// };
+    ///
+    /// const stats = try cache.warmupFromUrls(
+    ///     allocator,
+    ///     io,
+    ///     &warmup_urls,
+    ///     .{ .connect_timeout = .{ .duration = .{ .raw = std.Io.Duration.fromSeconds(5), .clock = .awake } } },
+    /// );
+    ///
+    /// log.info("cache warmed: {}/{} URLs, {} bytes", .{
+    ///     stats.successful,
+    ///     stats.total_urls,
+    ///     stats.cached_bytes,
+    /// });
+    /// ```
+    ///
+    /// Parameters:
+    /// - allocator: Memory allocator for temporary buffers
+    /// - io: Io executor for network operations
+    /// - urls: List of URLs to fetch and cache
+    /// - connect_timeout: Timeout for backend connections
+    ///
+    /// Returns:
+    /// - WarmupStats with success/failure counts and total bytes cached
+    ///
+    /// Note: This function blocks until all URLs have been fetched or failed.
+    /// For large URL lists, consider batching or using a background task.
+    pub fn warmupFromUrls(
+        self: *HTTPCache,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        urls: []const WarmupUrl,
+        connect_timeout: std.Io.Timeout,
+    ) !WarmupStats {
+        const start_time = std.time.milliTimestamp();
+        var stats = WarmupStats{
+            .total_urls = urls.len,
+        };
+
+        log.info("cache warming: starting for {} URLs", .{urls.len});
+
+        for (urls, 0..) |url, i| {
+            if (!std.mem.eql(u8, url.method, "GET")) {
+                log.warn("cache warming: skipping non-GET request [{}/{}]: {s} {s}", .{
+                    i + 1,
+                    urls.len,
+                    url.method,
+                    url.path,
+                });
+                stats.failed += 1;
+                continue;
+            }
+
+            log.info("cache warming [{}/{}]: GET {s}:{} {s}", .{
+                i + 1,
+                urls.len,
+                url.host,
+                url.port,
+                url.path,
+            });
+
+            // Connect to backend
+            const backend_addr = std.Io.net.Address.parse(url.host, url.port) catch |err| {
+                log.err("cache warming: failed to parse address {s}:{}: {s}", .{
+                    url.host,
+                    url.port,
+                    @errorName(err),
+                });
+                stats.failed += 1;
+                continue;
+            };
+
+            const backend_stream = backend_addr.connect(io, connect_timeout) catch |err| {
+                log.err("cache warming: failed to connect to {s}:{}: {s}", .{
+                    url.host,
+                    url.port,
+                    @errorName(err),
+                });
+                stats.failed += 1;
+                continue;
+            };
+            defer backend_stream.close(io);
+
+            // Build HTTP GET request
+            var request_buffer: [2048]u8 = undefined;
+            const request = std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n", .{
+                url.path,
+                url.host,
+            }) catch |err| {
+                log.err("cache warming: failed to format request: {s}", .{@errorName(err)});
+                stats.failed += 1;
+                continue;
+            };
+
+            // Send request
+            var write_buf: [4096]u8 = undefined;
+            var writer = backend_stream.writer(io, &write_buf);
+            std.Io.Writer.writeAll(&writer.interface, request) catch |err| {
+                log.err("cache warming: failed to send request: {s}", .{@errorName(err)});
+                stats.failed += 1;
+                continue;
+            };
+            std.Io.Writer.flush(&writer.interface) catch |err| {
+                log.err("cache warming: failed to flush request: {s}", .{@errorName(err)});
+                stats.failed += 1;
+                continue;
+            };
+
+            // Read response into buffer (with size limit)
+            const max_response_size = 1024 * 1024; // 1 MB per response
+            var response = std.ArrayList(u8).init(allocator);
+            defer response.deinit();
+
+            var read_buf: [8192]u8 = undefined;
+            var reader = backend_stream.reader(io, &read_buf);
+
+            var total_read: usize = 0;
+            while (true) {
+                var slices = [_][]u8{read_buf[0..]};
+                const n = reader.interface.readVec(&slices) catch |err| switch (err) {
+                    error.EndOfStream => break,
+                    error.ReadFailed => {
+                        log.err("cache warming: read failed after {} bytes", .{total_read});
+                        break;
+                    },
+                };
+
+                if (n == 0) continue;
+                total_read += n;
+
+                if (total_read > max_response_size) {
+                    log.warn("cache warming: response too large (>{} bytes), truncating", .{max_response_size});
+                    break;
+                }
+
+                response.appendSlice(read_buf[0..n]) catch |err| {
+                    log.err("cache warming: failed to buffer response: {s}", .{@errorName(err)});
+                    stats.failed += 1;
+                    continue;
+                };
+            }
+
+            // Validate response has content
+            if (response.items.len == 0) {
+                log.warn("cache warming: empty response from {s}:{}{s}", .{
+                    url.host,
+                    url.port,
+                    url.path,
+                });
+                stats.failed += 1;
+                continue;
+            }
+
+            // Parse response to check status code
+            const response_data = response.items;
+            const is_http_200 = response_data.len >= 12 and
+                (std.mem.startsWith(u8, response_data, "HTTP/1.1 200") or
+                std.mem.startsWith(u8, response_data, "HTTP/1.0 200"));
+
+            if (!is_http_200) {
+                log.warn("cache warming: non-200 response from {s}:{}{s}, skipping cache", .{
+                    url.host,
+                    url.port,
+                    url.path,
+                });
+                stats.failed += 1;
+                continue;
+            }
+
+            // Check Cache-Control directives
+            const cache_control = parseCacheControl(response_data);
+            if (!cache_control.isCacheable()) {
+                log.warn("cache warming: response not cacheable (no-store/private): {s}:{}{s}", .{
+                    url.host,
+                    url.port,
+                    url.path,
+                });
+                stats.failed += 1;
+                continue;
+            }
+
+            // Calculate TTL from Cache-Control
+            const default_ttl: u32 = 300; // 5 minutes default
+            const ttl = cache_control.getTTL(default_ttl);
+
+            // Store in cache
+            self.put(url.method, url.host, url.path, response_data, ttl) catch |err| {
+                log.err("cache warming: failed to cache response: {s}", .{@errorName(err)});
+                stats.failed += 1;
+                continue;
+            };
+
+            stats.successful += 1;
+            stats.cached_bytes += response_data.len;
+
+            log.info("cache warming [{}/{}]: SUCCESS - cached {} bytes (TTL={}s)", .{
+                i + 1,
+                urls.len,
+                response_data.len,
+                ttl,
+            });
+        }
+
+        const end_time = std.time.milliTimestamp();
+        stats.duration_ms = @intCast(end_time - start_time);
+
+        log.info("cache warming: COMPLETE - {}/{} URLs successful, {} bytes cached in {}ms", .{
+            stats.successful,
+            stats.total_urls,
+            stats.cached_bytes,
+            stats.duration_ms,
+        });
+
+        return stats;
+    }
 };
