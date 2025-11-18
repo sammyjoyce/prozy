@@ -553,14 +553,234 @@ pub const HTTPInspector = struct {
         }
     };
 
-    /// Parse HTTP date (simplified - RFC 9110 Section 5.6.7)
+    /// Parse HTTP date (RFC 9110 Section 5.6.7)
+    /// Supports three formats:
+    /// 1. IMF-fixdate (preferred): "Sun, 06 Nov 1994 08:49:37 GMT"
+    /// 2. RFC 850 (obsolete): "Sunday, 06-Nov-94 08:49:37 GMT"
+    /// 3. asctime: "Sun Nov  6 08:49:37 1994"
     /// Returns Unix timestamp or null if parsing fails
     pub fn parseHttpDate(date_str: []const u8) ?i64 {
-        // This is a simplified implementation
-        // Full RFC 9110 date parsing would handle multiple formats
-        // For now, we return null to indicate parsing not fully implemented
-        _ = date_str;
+        // Try IMF-fixdate first (most common)
+        if (parseIMFFixdate(date_str)) |timestamp| return timestamp;
+
+        // Try RFC 850 format
+        if (parseRFC850(date_str)) |timestamp| return timestamp;
+
+        // Try asctime format
+        if (parseAsctime(date_str)) |timestamp| return timestamp;
+
         return null;
+    }
+
+    /// Parse IMF-fixdate format: "Sun, 06 Nov 1994 08:49:37 GMT"
+    fn parseIMFFixdate(date_str: []const u8) ?i64 {
+        // Format: day-name "," SP date1 SP time-of-day SP GMT
+        // Example: Sun, 06 Nov 1994 08:49:37 GMT
+        if (date_str.len < 29) return null; // Minimum valid length
+
+        // Find comma after day name
+        const comma_idx = std.mem.indexOfScalar(u8, date_str, ',') orelse return null;
+        if (comma_idx > 9) return null; // Day name too long
+
+        // Skip "day-name, "
+        var idx: usize = comma_idx + 1;
+        while (idx < date_str.len and date_str[idx] == ' ') : (idx += 1) {}
+        if (idx + 20 > date_str.len) return null;
+
+        // Parse day (2 digits)
+        const day = std.fmt.parseInt(u8, date_str[idx .. idx + 2], 10) catch return null;
+        if (day < 1 or day > 31) return null;
+        idx += 3; // Skip day and space
+
+        // Parse month (3 letters)
+        if (idx + 3 > date_str.len) return null;
+        const month = parseMonth(date_str[idx .. idx + 3]) orelse return null;
+        idx += 4; // Skip month and space
+
+        // Parse year (4 digits)
+        if (idx + 4 > date_str.len) return null;
+        const year = std.fmt.parseInt(u16, date_str[idx .. idx + 4], 10) catch return null;
+        if (year < 1970 or year > 9999) return null;
+        idx += 5; // Skip year and space
+
+        // Parse time HH:MM:SS
+        if (idx + 8 > date_str.len) return null;
+        const hour = std.fmt.parseInt(u8, date_str[idx .. idx + 2], 10) catch return null;
+        if (hour > 23) return null;
+        const minute = std.fmt.parseInt(u8, date_str[idx + 3 .. idx + 5], 10) catch return null;
+        if (minute > 59) return null;
+        const second = std.fmt.parseInt(u8, date_str[idx + 6 .. idx + 8], 10) catch return null;
+        if (second > 60) return null; // Allow leap second
+
+        // Convert to Unix timestamp
+        return dateTimeToTimestamp(year, month, day, hour, minute, second);
+    }
+
+    /// Parse RFC 850 format: "Sunday, 06-Nov-94 08:49:37 GMT"
+    fn parseRFC850(date_str: []const u8) ?i64 {
+        // Format: day-name-l "," SP date2 SP time-of-day SP GMT
+        // Example: Sunday, 06-Nov-94 08:49:37 GMT
+        if (date_str.len < 30) return null;
+
+        // Find comma after day name
+        const comma_idx = std.mem.indexOfScalar(u8, date_str, ',') orelse return null;
+        if (comma_idx > 9) return null;
+
+        // Skip "day-name, "
+        var idx: usize = comma_idx + 1;
+        while (idx < date_str.len and date_str[idx] == ' ') : (idx += 1) {}
+        if (idx + 18 > date_str.len) return null;
+
+        // Parse day (2 digits)
+        const day = std.fmt.parseInt(u8, date_str[idx .. idx + 2], 10) catch return null;
+        if (day < 1 or day > 31) return null;
+        idx += 3; // Skip day and "-"
+
+        // Parse month (3 letters)
+        if (idx + 3 > date_str.len) return null;
+        const month = parseMonth(date_str[idx .. idx + 3]) orelse return null;
+        idx += 4; // Skip month and "-"
+
+        // Parse year (2 digits) - interpret as 1900+ or 2000+
+        if (idx + 2 > date_str.len) return null;
+        var year = std.fmt.parseInt(u16, date_str[idx .. idx + 2], 10) catch return null;
+        // RFC 2616: 2-digit year >= 00 is 2000+, but we assume < 70 is 2000+, >= 70 is 1900+
+        year = if (year >= 70) year + 1900 else year + 2000;
+        idx += 3; // Skip year and space
+
+        // Parse time HH:MM:SS
+        if (idx + 8 > date_str.len) return null;
+        const hour = std.fmt.parseInt(u8, date_str[idx .. idx + 2], 10) catch return null;
+        if (hour > 23) return null;
+        const minute = std.fmt.parseInt(u8, date_str[idx + 3 .. idx + 5], 10) catch return null;
+        if (minute > 59) return null;
+        const second = std.fmt.parseInt(u8, date_str[idx + 6 .. idx + 8], 10) catch return null;
+        if (second > 60) return null;
+
+        return dateTimeToTimestamp(year, month, day, hour, minute, second);
+    }
+
+    /// Parse asctime format: "Sun Nov  6 08:49:37 1994"
+    fn parseAsctime(date_str: []const u8) ?i64 {
+        // Format: day-name SP date3 SP time-of-day SP year
+        // Example: Sun Nov  6 08:49:37 1994
+        if (date_str.len < 24) return null;
+
+        // Skip day name and space
+        const first_space = std.mem.indexOfScalar(u8, date_str, ' ') orelse return null;
+        if (first_space > 9) return null;
+        var idx = first_space + 1;
+        while (idx < date_str.len and date_str[idx] == ' ') : (idx += 1) {}
+
+        // Parse month (3 letters)
+        if (idx + 3 > date_str.len) return null;
+        const month = parseMonth(date_str[idx .. idx + 3]) orelse return null;
+        idx += 3;
+
+        // Skip spaces before day
+        while (idx < date_str.len and date_str[idx] == ' ') : (idx += 1) {}
+
+        // Parse day (1 or 2 digits)
+        const day_start = idx;
+        while (idx < date_str.len and date_str[idx] >= '0' and date_str[idx] <= '9') : (idx += 1) {}
+        if (idx == day_start) return null;
+        const day = std.fmt.parseInt(u8, date_str[day_start..idx], 10) catch return null;
+        if (day < 1 or day > 31) return null;
+
+        // Skip space before time
+        while (idx < date_str.len and date_str[idx] == ' ') : (idx += 1) {}
+
+        // Parse time HH:MM:SS
+        if (idx + 8 > date_str.len) return null;
+        const hour = std.fmt.parseInt(u8, date_str[idx .. idx + 2], 10) catch return null;
+        if (hour > 23) return null;
+        const minute = std.fmt.parseInt(u8, date_str[idx + 3 .. idx + 5], 10) catch return null;
+        if (minute > 59) return null;
+        const second = std.fmt.parseInt(u8, date_str[idx + 6 .. idx + 8], 10) catch return null;
+        if (second > 60) return null;
+        idx += 8;
+
+        // Skip space before year
+        while (idx < date_str.len and date_str[idx] == ' ') : (idx += 1) {}
+
+        // Parse year (4 digits)
+        if (idx + 4 > date_str.len) return null;
+        const year = std.fmt.parseInt(u16, date_str[idx .. idx + 4], 10) catch return null;
+        if (year < 1970 or year > 9999) return null;
+
+        return dateTimeToTimestamp(year, month, day, hour, minute, second);
+    }
+
+    /// Parse month name to month number (1-12)
+    fn parseMonth(month_str: []const u8) ?u8 {
+        if (month_str.len != 3) return null;
+
+        // Compare case-insensitively
+        var lower: [3]u8 = undefined;
+        for (month_str, 0..) |c, i| {
+            lower[i] = if (c >= 'A' and c <= 'Z') c + 32 else c;
+        }
+
+        if (std.mem.eql(u8, &lower, "jan")) return 1;
+        if (std.mem.eql(u8, &lower, "feb")) return 2;
+        if (std.mem.eql(u8, &lower, "mar")) return 3;
+        if (std.mem.eql(u8, &lower, "apr")) return 4;
+        if (std.mem.eql(u8, &lower, "may")) return 5;
+        if (std.mem.eql(u8, &lower, "jun")) return 6;
+        if (std.mem.eql(u8, &lower, "jul")) return 7;
+        if (std.mem.eql(u8, &lower, "aug")) return 8;
+        if (std.mem.eql(u8, &lower, "sep")) return 9;
+        if (std.mem.eql(u8, &lower, "oct")) return 10;
+        if (std.mem.eql(u8, &lower, "nov")) return 11;
+        if (std.mem.eql(u8, &lower, "dec")) return 12;
+
+        return null;
+    }
+
+    /// Convert date/time components to Unix timestamp
+    /// Uses simplified calculation (doesn't account for all leap years perfectly)
+    fn dateTimeToTimestamp(year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8) ?i64 {
+        if (year < 1970) return null;
+        if (month < 1 or month > 12) return null;
+        if (day < 1 or day > 31) return null;
+
+        // Days in each month (non-leap year)
+        const days_in_month = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+
+        // Calculate days since Unix epoch (Jan 1, 1970)
+        var days: i64 = 0;
+
+        // Add days for complete years
+        var y: u16 = 1970;
+        while (y < year) : (y += 1) {
+            days += if (isLeapYear(y)) 365 + 1 else 365;
+        }
+
+        // Add days for complete months in current year
+        var m: u8 = 1;
+        while (m < month) : (m += 1) {
+            days += days_in_month[m - 1];
+            // Add extra day for February in leap year
+            if (m == 2 and isLeapYear(year)) {
+                days += 1;
+            }
+        }
+
+        // Add remaining days
+        days += day - 1;
+
+        // Convert to seconds
+        const timestamp = days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + second;
+
+        return timestamp;
+    }
+
+    /// Check if year is a leap year
+    fn isLeapYear(year: u16) bool {
+        if (year % 400 == 0) return true;
+        if (year % 100 == 0) return false;
+        if (year % 4 == 0) return true;
+        return false;
     }
 
     /// Generate Age header value (RFC 9111 Section 5.1)
@@ -926,6 +1146,19 @@ pub fn getTimestamp() i64 {
 /// Requests without Host headers MUST NOT be cached to prevent pollution
 /// across different virtual hosts/APIs.
 pub const HTTPCache = struct {
+    /// Metadata for caching a response (RFC 9111 Phase 5)
+    pub const CacheMetadata = struct {
+        date_header: ?i64 = null,
+        age_header: ?u32 = null,
+        expires_header: ?i64 = null,
+        request_time: i64 = 0,
+        response_time: i64 = 0,
+        cache_control: HTTPInspector.CacheControlDirectives = .{},
+        etag: ?[]const u8 = null,
+        last_modified: ?[]const u8 = null,
+        is_weak_etag: bool = false,
+    };
+
     const CacheNode = struct {
         key: u64,
         response: []u8,
@@ -1008,18 +1241,29 @@ pub const HTTPCache = struct {
         defer self.rwlock.unlockShared();
 
         if (self.cache.get(key)) |node| {
-            // Check if expired (read-only check)
+            // RFC 9111 Phase 5: Use freshness calculation instead of simple TTL
             const now = getTimestamp();
-            const elapsed = now - node.created_at;
-            // Cast ttl to i64 to avoid signed/unsigned comparison issues
-            // Also guard against negative elapsed time (clock adjustments)
-            if (elapsed >= 0 and elapsed > @as(i64, node.ttl)) {
-                // Don't evict here, just return null
-                // Eviction will happen on next put() or during periodic cleanup
+
+            // Build FreshnessInfo from cached metadata
+            const freshness_info = HTTPInspector.FreshnessInfo{
+                .date = node.date_header,
+                .age = node.age_header,
+                .expires = node.expires_header,
+                .cache_control = node.cache_control,
+                .response_time = node.response_time,
+                .request_time = node.request_time,
+            };
+
+            // Check freshness using RFC 9111 algorithm
+            if (freshness_info.isStale(now)) {
+                // Entry is stale according to RFC 9111
+                // For now, treat as cache miss
+                // TODO Phase E: Implement revalidation for stale entries
                 _ = self.misses.fetchAdd(1, .monotonic);
                 return null;
             }
 
+            // Entry is fresh - serve from cache
             // Don't update LRU order (read-only path for concurrency)
             // Access count is not updated to avoid write contention
             _ = self.hits.fetchAdd(1, .monotonic);
@@ -1029,7 +1273,7 @@ pub const HTTPCache = struct {
             // could evict this entry and free the buffer. Return an owned copy.
             const response_copy = self.allocator.alloc(u8, node.response.len) catch {
                 // Allocation failed, treat as cache miss
-                // Only decrement hits (incremented at line 252)
+                // Only decrement hits (incremented above)
                 // Don't decrement misses (never incremented in this path)
                 _ = self.hits.fetchSub(1, .monotonic);
                 return null;
@@ -1042,7 +1286,15 @@ pub const HTTPCache = struct {
         return null;
     }
 
-    pub fn put(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8, response: []const u8, ttl: u32) !void {
+    pub fn put(
+        self: *HTTPCache,
+        method: []const u8,
+        host: []const u8,
+        path: []const u8,
+        response: []const u8,
+        ttl: u32,
+        metadata: ?CacheMetadata,
+    ) !void {
         const key = hashKey(method, host, path);
 
         // Don't cache if response is too large
@@ -1082,6 +1334,21 @@ pub const HTTPCache = struct {
         errdefer self.allocator.free(path_copy);
         @memcpy(path_copy, path);
 
+        // Copy optional metadata strings (ETag, Last-Modified)
+        var etag_copy: ?[]u8 = null;
+        var last_modified_copy: ?[]u8 = null;
+
+        if (metadata) |meta| {
+            if (meta.etag) |etag_str| {
+                etag_copy = try self.allocator.alloc(u8, etag_str.len);
+                @memcpy(etag_copy.?, etag_str);
+            }
+            if (meta.last_modified) |lm_str| {
+                last_modified_copy = try self.allocator.alloc(u8, lm_str.len);
+                @memcpy(last_modified_copy.?, lm_str);
+            }
+        }
+
         // Create new node
         const node = try self.allocator.create(CacheNode);
         errdefer {
@@ -1089,6 +1356,8 @@ pub const HTTPCache = struct {
             self.allocator.free(method_copy);
             self.allocator.free(host_copy);
             self.allocator.free(path_copy);
+            if (etag_copy) |etag| self.allocator.free(etag);
+            if (last_modified_copy) |lm| self.allocator.free(lm);
             self.allocator.destroy(node);
         }
 
@@ -1104,6 +1373,17 @@ pub const HTTPCache = struct {
             .access_count = 0,
             .prev = null,
             .next = null,
+            // RFC 9111 Phase 5: Store freshness metadata
+            .date_header = if (metadata) |m| m.date_header else null,
+            .age_header = if (metadata) |m| m.age_header else null,
+            .expires_header = if (metadata) |m| m.expires_header else null,
+            .request_time = if (metadata) |m| m.request_time else 0,
+            .response_time = if (metadata) |m| m.response_time else getTimestamp(),
+            .cache_control = if (metadata) |m| m.cache_control else .{},
+            // RFC 9111 Phase 4: Store validator metadata
+            .etag = etag_copy,
+            .last_modified = last_modified_copy,
+            .is_weak_etag = if (metadata) |m| m.is_weak_etag else false,
         };
 
         // Add to cache map (errdefer above handles cleanup on failure)

@@ -1686,6 +1686,12 @@ pub const Proxy = struct {
         var expected_content_length: ?usize = null;
         var transfer_complete = false;
 
+        // RFC 9111 Phase 5: Freshness metadata (extracted from response headers)
+        var date_header: ?i64 = null;
+        var age_header: ?u32 = null;
+        var expires_header: ?i64 = null;
+        const request_time = HTTPInspector.getTimestamp(); // Track when request was sent
+
         // Only allocate buffer for backend->client with GET requests
         if (job.direction == .backend_to_client and std.mem.eql(u8, job.request_method, "GET")) {
             response_buffer = .{};
@@ -1775,6 +1781,35 @@ pub const Proxy = struct {
                                     }
                                 }
 
+                                // RFC 9111 Phase 5: Extract freshness metadata headers
+                                // This is implemented here in copyPipeWithCaching to capture the actual
+                                // request/response timestamps and parse HTTP date headers for accurate
+                                // freshness calculation as per RFC 9111 Section 4.2
+                                if (HTTPInspector.findHeader(items, "Date")) |date_str| {
+                                    date_header = HTTPInspector.parseHttpDate(date_str);
+                                    if (!builtin.is_test and date_header != null) {
+                                        log.info("parsed Date header: {} ({})", .{ date_header.?, date_str });
+                                    } else if (!builtin.is_test and date_header == null) {
+                                        log.warn("failed to parse Date header: {s}", .{date_str});
+                                    }
+                                }
+
+                                if (HTTPInspector.findHeader(items, "Age")) |age_str| {
+                                    age_header = std.fmt.parseInt(u32, age_str, 10) catch null;
+                                    if (!builtin.is_test and age_header != null) {
+                                        log.info("parsed Age header: {} seconds", .{age_header.?});
+                                    }
+                                }
+
+                                if (HTTPInspector.findHeader(items, "Expires")) |expires_str| {
+                                    expires_header = HTTPInspector.parseHttpDate(expires_str);
+                                    if (!builtin.is_test and expires_header != null) {
+                                        log.info("parsed Expires header: {} ({})", .{ expires_header.?, expires_str });
+                                    } else if (!builtin.is_test and expires_header == null) {
+                                        log.warn("failed to parse Expires header: {s}", .{expires_str});
+                                    }
+                                }
+
                                 // SECURITY: Check cacheability (no-store, private, etc.)
                                 if (!cache_control_directives.?.isCacheable()) {
                                     is_cacheable = false;
@@ -1856,12 +1891,28 @@ pub const Proxy = struct {
                 else
                     PipeJobWithCaching.default_ttl_seconds;
 
+                // RFC 9111 Phase 5: Build cache metadata with freshness info
+                const response_time = HTTPInspector.getTimestamp();
+                const metadata = HTTPInspector.HTTPCache.CacheMetadata{
+                    .date_header = date_header,
+                    .age_header = age_header,
+                    .expires_header = expires_header,
+                    .request_time = request_time,
+                    .response_time = response_time,
+                    .cache_control = cache_control_directives orelse .{},
+                    // Phase 4 fields (ETags) will be populated later
+                    .etag = null,
+                    .last_modified = null,
+                    .is_weak_etag = false,
+                };
+
                 job.http_cache.put(
                     job.request_method,
                     job.request_host,
                     job.request_path,
                     response_data,
                     ttl,
+                    metadata,
                 ) catch |err| {
                     if (!builtin.is_test) {
                         log.warn("failed to cache response: {s}", .{@errorName(err)});
@@ -1869,11 +1920,14 @@ pub const Proxy = struct {
                 };
 
                 if (!builtin.is_test) {
-                    log.info("cached response for {s} {s} ({} bytes, TTL={}s)", .{
+                    log.info("cached response for {s} {s} ({} bytes, TTL={}s, Date={?}, Age={?}, Expires={?})", .{
                         job.request_method,
                         job.request_path,
                         response_data.len,
                         ttl,
+                        date_header,
+                        age_header,
+                        expires_header,
                     });
                 }
             }
