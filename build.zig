@@ -164,6 +164,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(test_time);
 
+    const benchmark = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(benchmark);
+
     const hash_password = b.addExecutable(.{
         .name = "hash_password",
         .root_module = b.createModule(.{
@@ -300,6 +313,13 @@ pub fn build(b: *std.Build) void {
     const run_test_time = b.addRunArtifact(test_time);
     const test_time_step = b.step("test_time", "Run time utility");
     test_time_step.dependOn(&run_test_time.step);
+
+    const run_benchmark = b.addRunArtifact(benchmark);
+    if (b.args) |args| {
+        run_benchmark.addArgs(args);
+    }
+    const benchmark_step = b.step("benchmark", "Run benchmark tool");
+    benchmark_step.dependOn(&run_benchmark.step);
 
     const run_full_features = b.addRunArtifact(full_features_demo);
     const full_features_step = b.step("full_features", "Run full features demonstration");
