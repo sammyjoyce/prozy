@@ -94,6 +94,7 @@ const extractClientIp = @import("transport.zig").extractClientIp;
 const Router = @import("router.zig").Router;
 const HttpMode = @import("routing.zig").HttpMode;
 const RoutingDecision = @import("routing.zig").RoutingDecision;
+const Config = @import("config.zig").Config;
 
 pub const RunOptions = struct {
     /// Host/interface to bind the proxy listener to. Default is loopback.
@@ -137,8 +138,6 @@ pub const Proxy = struct {
 
     allocator: std.mem.Allocator,
     proxy_port: u16,
-    backend_host: []const u8,
-    backend_port: u16,
 
     // Core proxy features
     stats: ProxyStats,
@@ -150,19 +149,195 @@ pub const Proxy = struct {
     proxy_auth: ?ProxyAuth = null,
 
     // Phase 3: Routing and lifecycle
-    router: ?*Router = null,
+    router: *Router,
+    router_arena: std.heap.ArenaAllocator,
     mode: HttpMode = .reverse_proxy,
     shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    pub fn init(allocator: std.mem.Allocator, proxy_port: u16, backend_host: []const u8, backend_port: u16) Self {
+    pub fn init(allocator: std.mem.Allocator, proxy_port: u16, backend_host: []const u8, backend_port: u16) !Self {
+        // Create arena for router
+        var router_arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer router_arena.deinit();
+        const arena = router_arena.allocator();
+
+        const routing = @import("routing.zig");
+
+        // Create default backend
+        const host_copy = try arena.dupe(u8, backend_host);
+        const backend = Backend.init(host_copy, backend_port, 1);
+
+        // Create backends slice
+        const backends = try arena.alloc(Backend, 1);
+        backends[0] = backend;
+
+        // Create cluster
+        const cluster_name = try arena.dupe(u8, "default");
+        const clusters = try arena.alloc(routing.Cluster, 1);
+        clusters[0] = routing.Cluster.init(
+            cluster_name,
+            backends,
+            .round_robin,
+            10000,
+        );
+
+        // Create default route
+        const route_name = try arena.dupe(u8, "default");
+        const routes = try arena.alloc(routing.Route, 1);
+        routes[0] = .{
+            .name = route_name,
+            .match = .{},
+            .cluster = .{ .name = cluster_name },
+        };
+
+        // Create router
+        const router = try arena.create(Router);
+        router.* = Router.init(arena, .reverse_proxy, routes, clusters);
+        router.default_route = &routes[0];
+
         return Self{
             .allocator = allocator,
             .proxy_port = proxy_port,
-            .backend_host = backend_host,
-            .backend_port = backend_port,
             .stats = ProxyStats.init(),
             .http_inspector = HTTPInspector.init(true, true, "Prozy/1.0"),
+            .router = router,
+            .router_arena = router_arena,
         };
+    }
+
+    /// Initialize proxy from configuration
+    pub fn initFromConfig(allocator: std.mem.Allocator, config: *const Config) !Self {
+        var proxy = Self{
+            .allocator = allocator,
+            .proxy_port = config.proxy.listen_port,
+            .stats = ProxyStats.init(),
+            .http_inspector = HTTPInspector.init(true, true, "Prozy/1.0"),
+            .router = undefined, // Will be set by setupRouter
+            .router_arena = undefined, // Will be set by setupRouter
+            .mode = config.mode,
+        };
+
+        // Enable features
+        if (config.cache.enabled) {
+            proxy.enableCaching(config.cache.max_size);
+        }
+
+        if (config.rate_limit.enabled) {
+            proxy.enableRateLimiting(config.rate_limit.max_per_ip, config.rate_limit.max_global);
+        }
+
+        if (config.access_control.enabled) {
+            try proxy.enableAccessControl(config.access_control.default_policy);
+            if (proxy.access_control) |*acl| {
+                for (config.access_control.allow_list) |ip_str| {
+                    if (net.Ip4Address.parse(ip_str, 0) catch null) |ip4| {
+                        const addr = net.IpAddress{ .ip4 = ip4 };
+                        const ip_key = extractClientIp(addr);
+                        try acl.addToAllowList(ip_key);
+                    } else {
+                        if (net.Ip6Address.parse(ip_str, 0) catch null) |ip6| {
+                            const addr = net.IpAddress{ .ip6 = ip6 };
+                            const ip_key = extractClientIp(addr);
+                            try acl.addToAllowList(ip_key);
+                        }
+                    }
+                }
+                for (config.access_control.deny_list) |ip_str| {
+                    if (net.Ip4Address.parse(ip_str, 0) catch null) |ip4| {
+                        const addr = net.IpAddress{ .ip4 = ip4 };
+                        const ip_key = extractClientIp(addr);
+                        try acl.addToDenyList(ip_key);
+                    } else {
+                        if (net.Ip6Address.parse(ip_str, 0) catch null) |ip6| {
+                            const addr = net.IpAddress{ .ip6 = ip6 };
+                            const ip_key = extractClientIp(addr);
+                            try acl.addToDenyList(ip_key);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Setup Router
+        if (config.routes.len > 0) {
+            try proxy.setupRouter(config);
+        } else {
+            // Create empty router if no routes (should fail validation but safe fallback)
+            // Or create default?
+            // Let's assume valid config.
+            // But we need to initialize router/arena.
+            // Create arena for router data
+            proxy.router_arena = std.heap.ArenaAllocator.init(allocator);
+            const arena = proxy.router_arena.allocator();
+            const router = try arena.create(Router);
+            router.* = Router.init(arena, config.mode, &.{}, &.{});
+            proxy.router = router;
+        }
+
+        return proxy;
+    }
+
+    fn setupRouter(self: *Self, config: *const Config) !void {
+        // Create arena for router data
+        self.router_arena = std.heap.ArenaAllocator.init(self.allocator);
+        const arena = self.router_arena.allocator();
+
+        const routing = @import("routing.zig");
+
+        // Allocate clusters
+        const clusters = try arena.alloc(routing.Cluster, config.clusters.len);
+
+        for (config.clusters, 0..) |conf_cluster, i| {
+            const backends = try arena.alloc(Backend, conf_cluster.backends.len);
+
+            for (conf_cluster.backends, 0..) |conf_backend, j| {
+                const host = try arena.dupe(u8, conf_backend.host);
+                backends[j] = Backend.init(host, conf_backend.port, conf_backend.weight);
+            }
+
+            const name = try arena.dupe(u8, conf_cluster.name);
+
+            clusters[i] = routing.Cluster.init(
+                name,
+                backends,
+                conf_cluster.strategy,
+                conf_cluster.max_concurrent,
+            );
+        }
+
+        // Allocate routes
+        const routes = try arena.alloc(routing.Route, config.routes.len);
+
+        for (config.routes, 0..) |conf_route, i| {
+            const name = try arena.dupe(u8, conf_route.name);
+            const cluster_name = try arena.dupe(u8, conf_route.cluster);
+
+            const host = if (conf_route.match.host) |h| try arena.dupe(u8, h) else null;
+            const path_prefix = if (conf_route.match.path_prefix) |p| try arena.dupe(u8, p) else null;
+
+            const methods = try arena.alloc([]const u8, conf_route.match.methods.len);
+            for (conf_route.match.methods, 0..) |m, j| {
+                methods[j] = try arena.dupe(u8, m);
+            }
+
+            routes[i] = .{
+                .name = name,
+                .match = .{
+                    .host = host,
+                    .path_prefix = path_prefix,
+                    .methods = methods,
+                },
+                .cluster = .{ .name = cluster_name },
+                .cache_policy = conf_route.cache_policy,
+                .timeout_policy = conf_route.timeout_policy,
+                .transform_policy = .{},
+                .concurrency_policy = conf_route.concurrency_policy,
+            };
+        }
+
+        // Create Router in arena
+        const router_ptr = try arena.create(Router);
+        router_ptr.* = Router.init(arena, config.mode, routes, clusters);
+        self.router = router_ptr;
     }
 
     pub fn deinit(self: *Self) void {
@@ -178,6 +353,7 @@ pub const Proxy = struct {
         if (self.proxy_auth) |*auth| {
             auth.deinit();
         }
+        self.router_arena.deinit();
     }
 
     /// Enable access control with default policy
@@ -337,7 +513,7 @@ pub const Proxy = struct {
         defer server.deinit(io);
 
         log.info("proxy listening on {any}", .{server.socket.address});
-        log.info("backend target: {s}:{}", .{ self.backend_host, self.backend_port });
+        // Backend target is determined by router
         log.info("waiting to accept connections (limit: {})", .{configured_limit});
 
         if (options.enable_stats) {
@@ -360,9 +536,8 @@ pub const Proxy = struct {
                 log.info("load balancing: ENABLED ({d} backends, strategy: {any})", .{ lb.backends.len, lb.strategy });
             }
         }
-        if (self.router) |router| {
-            log.info("routing mode: {any} ({d} routes, {d} clusters)", .{ router.mode, router.routes.len, router.clusters.len });
-        }
+        log.info("routing mode: {any} ({d} routes, {d} clusters)", .{ self.router.mode, self.router.routes.len, self.router.clusters.len });
+
         if (options.enable_proxy_authentication) {
             var schemes_buffer: [64]u8 = undefined;
             var schemes_len: usize = 0;
@@ -400,34 +575,8 @@ pub const Proxy = struct {
                 continue;
             };
 
-            // Extract client IP for access control and rate limiting
-            const client_ip = extractClientIp(client_stream.socket.address);
-
-            // Check access control
-            if (options.enable_access_control) {
-                if (self.access_control) |acl| {
-                    if (!acl.isAllowed(client_ip)) {
-                        log.warn("connection from {any} denied by access control", .{client_ip});
-                        client_stream.close(io);
-                        continue;
-                    }
-                }
-            }
-
-            // Check rate limiting
-            if (options.enable_rate_limiting) {
-                if (self.rate_limiter) |*limiter| {
-                    if (!limiter.tryAcquire(client_ip)) {
-                        log.warn("connection from {any} denied by rate limiter", .{client_ip});
-                        client_stream.close(io);
-                        continue;
-                    }
-                }
-            }
-
-            // Only increment accepted counter after all validation passes
             accepted += 1;
-            log.info("accepted connection #{} from {any}", .{ accepted, client_ip });
+            log.info("accepted connection #{} from {any}", .{ accepted, client_stream.socket.address });
 
             if (options.enable_stats) {
                 self.stats.recordConnection();
@@ -437,18 +586,15 @@ pub const Proxy = struct {
                 client_stream,
                 io,
                 self.allocator,
-                self.backend_host,
-                self.backend_port,
                 options.connect_timeout,
                 @as(*ProxyStats, @constCast(&self.stats)),
                 &self.http_inspector,
                 options,
-                client_ip,
                 if (self.rate_limiter) |*limiter| limiter else null,
-                if (self.load_balancer) |*lb| lb else null,
                 if (self.http_cache) |*cache| cache else null,
                 if (self.proxy_auth) |*auth| auth else null, // RFC 7235 Proxy Authentication
                 self.router, // Phase 3: Pass router for advanced routing
+                self.access_control,
             });
         }
 
@@ -464,7 +610,8 @@ pub const Proxy = struct {
         std.debug.print("Prozy TCP Proxy Architecture:\n", .{});
         std.debug.print("==============================\n", .{});
         std.debug.print("Proxy port: {}\n", .{self.proxy_port});
-        std.debug.print("Backend target: {s}:{}\n", .{ self.backend_host, self.backend_port });
+        // Backend target is now determined dynamically by router
+        std.debug.print("Routing: {} routes, {} clusters\n", .{ self.router.routes.len, self.router.clusters.len });
 
         std.debug.print("\nCore Implementation Patterns:\n", .{});
         std.debug.print("1. Server listener: accept incoming connections\n", .{});
@@ -581,19 +728,40 @@ pub const Proxy = struct {
         client_stream: net.Stream,
         io: Io,
         allocator: std.mem.Allocator,
-        backend_host: []const u8,
-        backend_port: u16,
         connect_timeout: Timeout,
         stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
-        client_ip: IpKey,
         rate_limiter: ?*RateLimiter,
-        load_balancer: ?*LoadBalancer,
         http_cache: ?*HTTPCache,
         proxy_auth: ?*ProxyAuth, // RFC 7235 Proxy Authentication
-        router: ?*Router, // Phase 3: Optional router for advanced routing
+        router: *Router, // Phase 3: Router for advanced routing
+        access_control: ?AccessControl,
     ) void {
+        // Extract client IP for access control and rate limiting
+        const client_ip = extractClientIp(client_stream.socket.address);
+
+        // Check access control
+        if (options.enable_access_control) {
+            if (access_control) |acl| {
+                if (!acl.isAllowed(client_ip)) {
+                    log.warn("connection from {any} denied by access control", .{client_ip});
+                    client_stream.close(io);
+                    return;
+                }
+            }
+        }
+
+        // Check rate limiting
+        if (options.enable_rate_limiting) {
+            if (rate_limiter) |limiter| {
+                if (!limiter.tryAcquire(client_ip)) {
+                    log.warn("connection from {any} denied by rate limiter", .{client_ip});
+                    client_stream.close(io);
+                    return;
+                }
+            }
+        }
         const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
         var selected_backend: ?*Backend = null;
         var routing_decision: ?RoutingDecision = null; // Phase 3: Track routing decision for cleanup
@@ -630,7 +798,8 @@ pub const Proxy = struct {
         var parsed_request: ?HTTPInspector.HTTPRequest = null;
         var request_headers: []const u8 = &[_]u8{};
 
-        if (router != null or options.enable_caching or options.enable_http_inspection or options.enable_proxy_authentication) {
+        // Always buffer initial request for router/inspection
+        if (true) {
             // Buffer initial request for inspection/routing/authentication
             var client_read_buf: [4096]u8 = undefined;
             var client_reader = client_stream.reader(io, &client_read_buf);
@@ -682,8 +851,8 @@ pub const Proxy = struct {
         }
 
         // Phase 3: If router is configured, use it for routing decision
-        if (router) |rtr| {
-            if (parsed_request) |req| {
+        // (Router is always configured now)
+        if (parsed_request) |req| {
                 // Check for CONNECT method - delegate to tunnel handler
                 if (std.mem.eql(u8, req.method, "CONNECT")) {
                     // Parse target from path (format: "host:port")
@@ -726,7 +895,7 @@ pub const Proxy = struct {
                 }
 
                 // Route the request using the router
-                const decision = rtr.routeRequest(&req, request_headers, client_ip) catch |err| {
+                const decision = router.routeRequest(&req, request_headers, client_ip) catch |err| {
                     log.err("routing failed: {s}", .{@errorName(err)});
                     if (options.enable_stats) {
                         stats.recordError();
@@ -771,7 +940,6 @@ pub const Proxy = struct {
                 }
                 return;
             }
-        }
 
         // Try to use HTTP cache if enabled (and not using router, or router allows caching)
         const cache_enabled = if (routing_decision) |decision|
@@ -850,9 +1018,9 @@ pub const Proxy = struct {
             }
         }
 
-        // Select backend (use router if configured, otherwise fall back to load balancer)
-        var actual_backend_host = backend_host;
-        var actual_backend_port = backend_port;
+        // Select backend using routing decision
+        var actual_backend_host: []const u8 = undefined;
+        var actual_backend_port: u16 = 0;
         var actual_connect_timeout = connect_timeout;
 
         // Phase 3: If router selected a backend, use it
@@ -873,26 +1041,12 @@ pub const Proxy = struct {
             if (!builtin.is_test) {
                 log.info("using router-selected backend with timeout {}ms", .{timeout_ms});
             }
-        } else if (options.enable_load_balancing) {
-            // Fall back to load balancer if no router
-            if (load_balancer) |lb| {
-                if (lb.selectBackend(client_ip)) |backend| {
-                    selected_backend = backend;
-                    actual_backend_host = backend.host;
-                    actual_backend_port = backend.port;
-                    backend.incrementConnections();
-                    if (!builtin.is_test) {
-                        log.info("selected backend: {s}:{}", .{ actual_backend_host, actual_backend_port });
-                    }
-                } else {
-                    log.err("no healthy backend available", .{});
-                    if (options.enable_stats) {
-                        stats.recordBackendFailure();
-                        stats.recordError();
-                    }
-                    return;
-                }
+        } else {
+            // Should have returned earlier if routing failed, but double check
+            if (!builtin.is_test) {
+                log.err("no routing decision available", .{});
             }
+            return;
         }
 
         // Connect to backend
@@ -1361,6 +1515,7 @@ pub const Proxy = struct {
                 return;
             },
         };
+        defer future_c2b.cancel(io) catch {};
 
         var future_b2c: @TypeOf(future_c2b) = undefined;
         if (use_caching) {
@@ -1379,7 +1534,7 @@ pub const Proxy = struct {
             };
             future_b2c = io.concurrent(copyPipeWithCaching, .{job_b2c_caching}) catch |err| switch (err) {
                 error.ConcurrencyUnavailable => {
-                    future_c2b.cancel(io) catch {};
+                    // future_c2b deferred cancel will handle cleanup
                     sequentialCopyWithStats(job_c2b);
                     sequentialCopyWithCaching(job_b2c_caching);
                     return;
@@ -1396,13 +1551,14 @@ pub const Proxy = struct {
             };
             future_b2c = io.concurrent(copyPipeWithStats, .{job_b2c}) catch |err| switch (err) {
                 error.ConcurrencyUnavailable => {
-                    future_c2b.cancel(io) catch {};
+                    // future_c2b deferred cancel will handle cleanup
                     sequentialCopyWithStats(job_c2b);
                     sequentialCopyWithStats(job_b2c);
                     return;
                 },
             };
         }
+        defer future_b2c.cancel(io) catch {};
 
         // Wait for first completion
         const first_completed = io.select(.{
@@ -1413,8 +1569,6 @@ pub const Proxy = struct {
             if (options.enable_stats) {
                 stats.recordError();
             }
-            future_c2b.cancel(io) catch {};
-            future_b2c.cancel(io) catch {};
             return;
         };
 
@@ -1447,7 +1601,6 @@ pub const Proxy = struct {
                                 .backend_to_client = &future_b2c,
                             }) catch |err2| {
                                 log.err("second io.select failed: {s}, canceling backend->client", .{@errorName(err2)});
-                                future_b2c.cancel(io) catch {};
                                 if (options.enable_stats) {
                                     stats.recordError();
                                 }
@@ -1459,14 +1612,13 @@ pub const Proxy = struct {
                             return;
                         },
                     };
+                    defer timeout_future.cancel(io);
 
                     const second = io.select(.{
                         .backend_to_client = &future_b2c,
                         .timeout = &timeout_future,
                     }) catch |err| {
-                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
-                        future_b2c.cancel(io) catch {};
-                        timeout_future.cancel(io);
+                        log.err("second io.select failed: {s}", .{@errorName(err)});
                         if (options.enable_stats) {
                             stats.recordError();
                         }
@@ -1475,12 +1627,10 @@ pub const Proxy = struct {
 
                     switch (second) {
                         .backend_to_client => |r| {
-                            timeout_future.cancel(io);
                             handleCopyResult("backend->client", r);
                         },
                         .timeout => {
-                            log.warn("backend->client timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
-                            future_b2c.cancel(io) catch {};
+                            log.warn("backend->client timeout after {d}s", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
                             if (options.enable_stats) {
                                 stats.recordError();
                             }
@@ -1488,9 +1638,9 @@ pub const Proxy = struct {
                     }
                 } else |err| {
                     // Error in client->backend: cancel backend->client immediately
-                    log.err("client->backend failed: {s}, canceling backend->client", .{@errorName(err)});
+                    // (Deferred cancel will handle this)
+                    log.err("client->backend failed: {s}", .{@errorName(err)});
                     handleCopyResult("client->backend", result);
-                    future_b2c.cancel(io) catch {};
                     if (options.enable_stats) {
                         stats.recordError();
                     }
@@ -1510,7 +1660,6 @@ pub const Proxy = struct {
                                 .client_to_backend = &future_c2b,
                             }) catch |err2| {
                                 log.err("second io.select failed: {s}, canceling client->backend", .{@errorName(err2)});
-                                future_c2b.cancel(io) catch {};
                                 if (options.enable_stats) {
                                     stats.recordError();
                                 }
@@ -1522,14 +1671,13 @@ pub const Proxy = struct {
                             return;
                         },
                     };
+                    defer timeout_future.cancel(io);
 
                     const second = io.select(.{
                         .client_to_backend = &future_c2b,
                         .timeout = &timeout_future,
                     }) catch |err| {
-                        log.err("second io.select failed: {s}, canceling both futures", .{@errorName(err)});
-                        future_c2b.cancel(io) catch {};
-                        timeout_future.cancel(io);
+                        log.err("second io.select failed: {s}", .{@errorName(err)});
                         if (options.enable_stats) {
                             stats.recordError();
                         }
@@ -1538,12 +1686,10 @@ pub const Proxy = struct {
 
                     switch (second) {
                         .client_to_backend => |r| {
-                            timeout_future.cancel(io);
                             handleCopyResult("client->backend", r);
                         },
                         .timeout => {
-                            log.warn("client->backend timeout after {d}s, canceling", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
-                            future_c2b.cancel(io) catch {};
+                            log.warn("client->backend timeout after {d}s", .{BIDIRECTIONAL_TIMEOUT_SECONDS});
                             if (options.enable_stats) {
                                 stats.recordError();
                             }
@@ -1551,9 +1697,9 @@ pub const Proxy = struct {
                     }
                 } else |err| {
                     // Error in backend->client: cancel client->backend immediately
-                    log.err("backend->client failed: {s}, canceling client->backend", .{@errorName(err)});
+                    // (Deferred cancel will handle this)
+                    log.err("backend->client failed: {s}", .{@errorName(err)});
                     handleCopyResult("backend->client", result);
-                    future_c2b.cancel(io) catch {};
                     if (options.enable_stats) {
                         stats.recordError();
                     }
@@ -1978,7 +2124,7 @@ pub fn runProxyWithIo(
     backend_host: []const u8,
     backend_port: u16,
 ) !void {
-    var proxy = Proxy.init(allocator, proxy_port, backend_host, backend_port);
+    var proxy = try Proxy.init(allocator, proxy_port, backend_host, backend_port);
     defer proxy.deinit();
     try proxy.runWithIoOptions(io, .{});
 }
