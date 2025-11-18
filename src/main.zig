@@ -32,10 +32,6 @@ pub fn main() !void {
     std.debug.print("🚀 Starting Prozy TCP Proxy with Zig's new async I/O\n", .{});
     std.debug.print("📄 Loading configuration from {s}\n", .{config_path.value});
 
-    var threaded_io = Io.Threaded.init(gpa);
-    defer threaded_io.deinit();
-    const io = threaded_io.io();
-
     var config_manager = try prozy.ConfigManager.init(gpa, config_path.value);
     defer config_manager.deinit();
 
@@ -50,7 +46,7 @@ pub fn main() !void {
     const backend_host = try gpa.dupe(u8, derived.backend.host);
     defer gpa.free(backend_host);
 
-    var proxy = prozy.Proxy.init(gpa, derived.listen_port, backend_host, derived.backend.port);
+    var proxy = try prozy.Proxy.init(gpa, derived.listen_port, backend_host, derived.backend.port);
     defer proxy.deinit();
 
     try configureProxyFeatures(&proxy, cfg);
@@ -68,7 +64,15 @@ pub fn main() !void {
 
     const run_options = buildRunOptions(cfg, listen_host);
 
-    try proxy.runWithIoOptions(io, run_options);
+    var threaded_io = setupIo(gpa);
+    defer threaded_io.deinit();
+
+    try proxy.runWithIoOptions(threaded_io.io(), run_options);
+}
+
+/// Setup the IO runtime. Currently defaults to Threaded due to upstream issues with Evented.
+fn setupIo(allocator: std.mem.Allocator) Io.Threaded {
+    return Io.Threaded.init(allocator);
 }
 
 fn resolveConfigPath(allocator: std.mem.Allocator) !ConfigPath {
