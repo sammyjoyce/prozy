@@ -82,6 +82,7 @@ const AccessControl = @import("access.zig").AccessControl;
 const RateLimiter = @import("access.zig").RateLimiter;
 const HTTPInspector = @import("http.zig").HTTPInspector;
 const HTTPCache = @import("http.zig").HTTPCache;
+const getTimestamp = @import("http.zig").getTimestamp;
 const Backend = @import("backend.zig").Backend;
 const LoadBalancer = @import("backend.zig").LoadBalancer;
 const ProxyAuth = @import("auth.zig").ProxyAuth;
@@ -356,11 +357,11 @@ pub const Proxy = struct {
         }
         if (options.enable_load_balancing) {
             if (self.load_balancer) |*lb| {
-                log.info("load balancing: ENABLED ({} backends, strategy: {})", .{ lb.backends.len, lb.strategy });
+                log.info("load balancing: ENABLED ({d} backends, strategy: {any})", .{ lb.backends.len, lb.strategy });
             }
         }
         if (self.router) |router| {
-            log.info("routing mode: {} ({} routes, {} clusters)", .{ router.mode, router.routes.len, router.clusters.len });
+            log.info("routing mode: {any} ({d} routes, {d} clusters)", .{ router.mode, router.routes.len, router.clusters.len });
         }
         if (options.enable_proxy_authentication) {
             var schemes_buffer: [64]u8 = undefined;
@@ -791,7 +792,7 @@ pub const Proxy = struct {
                 if (std.mem.eql(u8, request.method, "GET")) {
                     if (maybe_host) |host| {
                         // Host header present - check cache
-                        if (http_cache.?.get(request.method, host, request.path)) |cached_response| {
+                        if (http_cache.?.get(request.method, host, request.path, null)) |cached_response| {
                             // IMPORTANT: get() returns an owned copy that we must free
                             defer http_cache.?.allocator.free(cached_response);
 
@@ -1690,7 +1691,7 @@ pub const Proxy = struct {
         var date_header: ?i64 = null;
         var age_header: ?u32 = null;
         var expires_header: ?i64 = null;
-        const request_time = HTTPInspector.getTimestamp(); // Track when request was sent
+        const request_time = getTimestamp(); // Track when request was sent
 
         // Only allocate buffer for backend->client with GET requests
         if (job.direction == .backend_to_client and std.mem.eql(u8, job.request_method, "GET")) {
@@ -1788,7 +1789,7 @@ pub const Proxy = struct {
                                 if (HTTPInspector.findHeader(items, "Date")) |date_str| {
                                     date_header = HTTPInspector.parseHttpDate(date_str);
                                     if (!builtin.is_test and date_header != null) {
-                                        log.info("parsed Date header: {} ({})", .{ date_header.?, date_str });
+                                        log.info("parsed Date header: {d} ({s})", .{ date_header.?, date_str });
                                     } else if (!builtin.is_test and date_header == null) {
                                         log.warn("failed to parse Date header: {s}", .{date_str});
                                     }
@@ -1804,7 +1805,7 @@ pub const Proxy = struct {
                                 if (HTTPInspector.findHeader(items, "Expires")) |expires_str| {
                                     expires_header = HTTPInspector.parseHttpDate(expires_str);
                                     if (!builtin.is_test and expires_header != null) {
-                                        log.info("parsed Expires header: {} ({})", .{ expires_header.?, expires_str });
+                                        log.info("parsed Expires header: {d} ({s})", .{ expires_header.?, expires_str });
                                     } else if (!builtin.is_test and expires_header == null) {
                                         log.warn("failed to parse Expires header: {s}", .{expires_str});
                                     }
@@ -1892,8 +1893,8 @@ pub const Proxy = struct {
                     PipeJobWithCaching.default_ttl_seconds;
 
                 // RFC 9111 Phase 5: Build cache metadata with freshness info
-                const response_time = HTTPInspector.getTimestamp();
-                const metadata = HTTPInspector.HTTPCache.CacheMetadata{
+                const response_time = getTimestamp();
+                const metadata = HTTPCache.CacheMetadata{
                     .date_header = date_header,
                     .age_header = age_header,
                     .expires_header = expires_header,
@@ -1913,6 +1914,7 @@ pub const Proxy = struct {
                     response_data,
                     ttl,
                     metadata,
+                    null,
                 ) catch |err| {
                     if (!builtin.is_test) {
                         log.warn("failed to cache response: {s}", .{@errorName(err)});

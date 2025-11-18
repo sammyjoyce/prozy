@@ -106,11 +106,11 @@ pub fn main() !void {
                 std.debug.print("  ✓ Status code {d} is cacheable\n", .{parsed.status_code});
 
                 // Step 4: Populate cache (including host for multi-tenant isolation)
-                try cache.put(cache_key_method, cache_key_host, cache_key_path, cache_response, 3600);
+                try cache.put(cache_key_method, cache_key_host, cache_key_path, cache_response, 3600, null, null);
                 std.debug.print("  ✓ Cached response for {s} {s}{s}\n", .{ cache_key_method, cache_key_host, cache_key_path });
 
                 // Step 5: Retrieve from cache
-                if (cache.get(cache_key_method, cache_key_host, cache_key_path)) |cached| {
+                if (cache.get(cache_key_method, cache_key_host, cache_key_path, null)) |cached| {
                     std.debug.print("  ✓ Retrieved from cache: {d} bytes\n", .{cached.len});
                     const stats = cache.getStats();
                     std.debug.print("  ✓ Hit rate: {d:.2}%\n", .{stats.hitRate() * 100});
