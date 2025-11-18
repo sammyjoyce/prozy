@@ -907,12 +907,12 @@ pub const HTTPCache = struct {
         is_weak_etag: bool = false,
 
         // RFC 9111 Phase 5: Freshness tracking
-        date_header: ?i64 = null,        // Date header (origin server time)
-        age_header: ?u32 = null,         // Age header value
-        expires_header: ?i64 = null,     // Expires header
-        request_time: i64 = 0,           // When request was sent
-        response_time: i64 = 0,          // When response was received
-        cache_control: CacheControlDirectives = .{},
+        date_header: ?i64 = null, // Date header (origin server time)
+        age_header: ?u32 = null, // Age header value
+        expires_header: ?i64 = null, // Expires header
+        request_time: i64 = 0, // When request was sent
+        response_time: i64 = 0, // When response was received
+        cache_control: HTTPInspector.CacheControlDirectives = .{},
     };
 
     allocator: std.mem.Allocator,

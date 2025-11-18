@@ -1338,7 +1338,7 @@ pub const Proxy = struct {
             },
         };
 
-        var future_b2c: io.ConcurrentFuture(void) = undefined;
+        var future_b2c: @TypeOf(future_c2b) = undefined;
         if (use_caching) {
             const job_b2c_caching = PipeJobWithCaching{
                 .reader = backend_reader,
