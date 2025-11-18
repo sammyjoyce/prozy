@@ -1157,6 +1157,9 @@ pub const HTTPCache = struct {
         etag: ?[]const u8 = null,
         last_modified: ?[]const u8 = null,
         is_weak_etag: bool = false,
+        // RFC 9111 Phase 3: Vary header support
+        vary_headers: ?[][]const u8 = null,
+        vary_context: ?HTTPInspector.VaryContext = null,
     };
 
     const CacheNode = struct {
@@ -1184,6 +1187,10 @@ pub const HTTPCache = struct {
         request_time: i64 = 0, // When request was sent
         response_time: i64 = 0, // When response was received
         cache_control: HTTPInspector.CacheControlDirectives = .{},
+
+        // RFC 9111 Phase 3: Vary header support
+        vary_headers: ?[][]const u8 = null, // List of header names from Vary header
+        vary_context: ?HTTPInspector.VaryContext = null, // Actual values from request
     };
 
     allocator: std.mem.Allocator,
@@ -1217,6 +1224,20 @@ pub const HTTPCache = struct {
             self.allocator.free(node.path);
             if (node.etag) |etag| self.allocator.free(etag);
             if (node.last_modified) |lm| self.allocator.free(lm);
+
+            // RFC 9111 Phase 3: Free vary data
+            if (node.vary_headers) |headers| {
+                for (headers) |h| self.allocator.free(h);
+                self.allocator.free(headers);
+            }
+            if (node.vary_context) |*ctx| {
+                if (ctx.accept) |v| self.allocator.free(v);
+                if (ctx.accept_encoding) |v| self.allocator.free(v);
+                if (ctx.accept_language) |v| self.allocator.free(v);
+                if (ctx.accept_charset) |v| self.allocator.free(v);
+                if (ctx.user_agent) |v| self.allocator.free(v);
+            }
+
             self.allocator.destroy(node);
         }
         self.cache.deinit();
@@ -1233,8 +1254,16 @@ pub const HTTPCache = struct {
     ///
     /// This design prioritizes safety and read performance over zero-copy efficiency.
     /// The copy overhead is acceptable for cached responses since we avoid network I/O.
-    pub fn get(self: *HTTPCache, method: []const u8, host: []const u8, path: []const u8) ?[]u8 {
-        const key = hashKey(method, host, path);
+    /// Get cached response for method, host, path, and optional vary context
+    /// RFC 9111 Phase 3: Vary support enables multiple variants for same URL
+    pub fn get(
+        self: *HTTPCache,
+        method: []const u8,
+        host: []const u8,
+        path: []const u8,
+        vary_context: ?HTTPInspector.VaryContext,
+    ) ?[]u8 {
+        const key = hashKey(method, host, path, vary_context);
 
         // Use shared (read) lock for concurrent reads
         self.rwlock.lockShared();
@@ -1294,8 +1323,9 @@ pub const HTTPCache = struct {
         response: []const u8,
         ttl: u32,
         metadata: ?CacheMetadata,
+        vary_context: ?HTTPInspector.VaryContext,
     ) !void {
-        const key = hashKey(method, host, path);
+        const key = hashKey(method, host, path, vary_context);
 
         // Don't cache if response is too large
         if (response.len > self.max_size / 2) {
@@ -1349,6 +1379,29 @@ pub const HTTPCache = struct {
             }
         }
 
+        // RFC 9111 Phase 3: Copy vary headers and context
+        var vary_headers_copy: ?[][]u8 = null;
+        var vary_context_copy: ?HTTPInspector.VaryContext = null;
+
+        if (metadata) |meta| {
+            if (meta.vary_headers) |headers| {
+                vary_headers_copy = try self.allocator.alloc([]u8, headers.len);
+                for (headers, 0..) |header, i| {
+                    vary_headers_copy.?[i] = try self.allocator.dupe(u8, header);
+                }
+            }
+            if (meta.vary_context) |ctx| {
+                // Deep copy VaryContext strings
+                vary_context_copy = .{
+                    .accept = if (ctx.accept) |v| try self.allocator.dupe(u8, v) else null,
+                    .accept_encoding = if (ctx.accept_encoding) |v| try self.allocator.dupe(u8, v) else null,
+                    .accept_language = if (ctx.accept_language) |v| try self.allocator.dupe(u8, v) else null,
+                    .accept_charset = if (ctx.accept_charset) |v| try self.allocator.dupe(u8, v) else null,
+                    .user_agent = if (ctx.user_agent) |v| try self.allocator.dupe(u8, v) else null,
+                };
+            }
+        }
+
         // Create new node
         const node = try self.allocator.create(CacheNode);
         errdefer {
@@ -1358,6 +1411,18 @@ pub const HTTPCache = struct {
             self.allocator.free(path_copy);
             if (etag_copy) |etag| self.allocator.free(etag);
             if (last_modified_copy) |lm| self.allocator.free(lm);
+            // Clean up vary data
+            if (vary_headers_copy) |headers| {
+                for (headers) |h| self.allocator.free(h);
+                self.allocator.free(headers);
+            }
+            if (vary_context_copy) |*ctx| {
+                if (ctx.accept) |v| self.allocator.free(v);
+                if (ctx.accept_encoding) |v| self.allocator.free(v);
+                if (ctx.accept_language) |v| self.allocator.free(v);
+                if (ctx.accept_charset) |v| self.allocator.free(v);
+                if (ctx.user_agent) |v| self.allocator.free(v);
+            }
             self.allocator.destroy(node);
         }
 
@@ -1384,6 +1449,9 @@ pub const HTTPCache = struct {
             .etag = etag_copy,
             .last_modified = last_modified_copy,
             .is_weak_etag = if (metadata) |m| m.is_weak_etag else false,
+            // RFC 9111 Phase 3: Store vary headers and context
+            .vary_headers = vary_headers_copy,
+            .vary_context = vary_context_copy,
         };
 
         // Add to cache map (errdefer above handles cleanup on failure)
@@ -1394,11 +1462,20 @@ pub const HTTPCache = struct {
         _ = self.current_size.fetchAdd(node.size, .monotonic);
     }
 
-    fn hashKey(method: []const u8, host: []const u8, path: []const u8) u64 {
+    /// Generate cache key including method, host, path, and optional vary context
+    /// RFC 9111 Phase 3: Vary support for content negotiation
+    fn hashKey(method: []const u8, host: []const u8, path: []const u8, vary_context: ?HTTPInspector.VaryContext) u64 {
         var hasher = std.hash.Wyhash.init(0);
         hasher.update(method);
         hasher.update(host);
         hasher.update(path);
+
+        // Include vary context in key to support multiple variants for same URL
+        if (vary_context) |ctx| {
+            const ctx_hash = ctx.hash();
+            hasher.update(std.mem.asBytes(&ctx_hash));
+        }
+
         return hasher.final();
     }
 
@@ -1468,6 +1545,20 @@ pub const HTTPCache = struct {
         self.allocator.free(node.path);
         if (node.etag) |etag| self.allocator.free(etag);
         if (node.last_modified) |lm| self.allocator.free(lm);
+
+        // RFC 9111 Phase 3: Free vary data
+        if (node.vary_headers) |headers| {
+            for (headers) |h| self.allocator.free(h);
+            self.allocator.free(headers);
+        }
+        if (node.vary_context) |*ctx| {
+            if (ctx.accept) |v| self.allocator.free(v);
+            if (ctx.accept_encoding) |v| self.allocator.free(v);
+            if (ctx.accept_language) |v| self.allocator.free(v);
+            if (ctx.accept_charset) |v| self.allocator.free(v);
+            if (ctx.user_agent) |v| self.allocator.free(v);
+        }
+
         self.allocator.destroy(node);
     }
 
