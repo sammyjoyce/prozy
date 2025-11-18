@@ -622,6 +622,299 @@ test "HTTPInspector: isCompleteResponse with incomplete headers" {
     try testing.expect(!HTTPInspector.isCompleteResponse(response));
 }
 
+// ============= HTTP Date Parsing Tests (RFC 9110 Section 5.6.7) =============
+
+test "HTTPInspector: parseHttpDate with IMF-fixdate format" {
+    // Sun, 06 Nov 1994 08:49:37 GMT
+    const date1 = "Sun, 06 Nov 1994 08:49:37 GMT";
+    const timestamp1 = HTTPInspector.parseHttpDate(date1);
+    try testing.expect(timestamp1 != null);
+    try testing.expectEqual(timestamp1.?, 784111777);
+
+    // Mon, 01 Jan 2024 00:00:00 GMT
+    const date2 = "Mon, 01 Jan 2024 00:00:00 GMT";
+    const timestamp2 = HTTPInspector.parseHttpDate(date2);
+    try testing.expect(timestamp2 != null);
+    try testing.expectEqual(timestamp2.?, 1704067200);
+
+    // Fri, 31 Dec 1999 23:59:59 GMT
+    const date3 = "Fri, 31 Dec 1999 23:59:59 GMT";
+    const timestamp3 = HTTPInspector.parseHttpDate(date3);
+    try testing.expect(timestamp3 != null);
+    try testing.expectEqual(timestamp3.?, 946684799);
+}
+
+test "HTTPInspector: parseHttpDate with RFC 850 format" {
+    // Sunday, 06-Nov-94 08:49:37 GMT
+    const date1 = "Sunday, 06-Nov-94 08:49:37 GMT";
+    const timestamp1 = HTTPInspector.parseHttpDate(date1);
+    try testing.expect(timestamp1 != null);
+    try testing.expectEqual(timestamp1.?, 784111777);
+
+    // Monday, 01-Jan-24 00:00:00 GMT
+    const date2 = "Monday, 01-Jan-24 00:00:00 GMT";
+    const timestamp2 = HTTPInspector.parseHttpDate(date2);
+    try testing.expect(timestamp2 != null);
+    try testing.expectEqual(timestamp2.?, 1704067200);
+
+    // Friday, 31-Dec-99 23:59:59 GMT
+    const date3 = "Friday, 31-Dec-99 23:59:59 GMT";
+    const timestamp3 = HTTPInspector.parseHttpDate(date3);
+    try testing.expect(timestamp3 != null);
+    try testing.expectEqual(timestamp3.?, 946684799);
+}
+
+test "HTTPInspector: parseHttpDate with asctime format" {
+    // Sun Nov  6 08:49:37 1994
+    const date1 = "Sun Nov  6 08:49:37 1994";
+    const timestamp1 = HTTPInspector.parseHttpDate(date1);
+    try testing.expect(timestamp1 != null);
+    try testing.expectEqual(timestamp1.?, 784111777);
+
+    // Mon Jan  1 00:00:00 2024
+    const date2 = "Mon Jan  1 00:00:00 2024";
+    const timestamp2 = HTTPInspector.parseHttpDate(date2);
+    try testing.expect(timestamp2 != null);
+    try testing.expectEqual(timestamp2.?, 1704067200);
+
+    // Fri Dec 31 23:59:59 1999
+    const date3 = "Fri Dec 31 23:59:59 1999";
+    const timestamp3 = HTTPInspector.parseHttpDate(date3);
+    try testing.expect(timestamp3 != null);
+    try testing.expectEqual(timestamp3.?, 946684799);
+}
+
+test "HTTPInspector: parseHttpDate with all twelve months (IMF-fixdate)" {
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Thu, 01 Feb 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Fri, 01 Mar 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Apr 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Wed, 01 May 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Sat, 01 Jun 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jul 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Thu, 01 Aug 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Sun, 01 Sep 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Tue, 01 Oct 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Fri, 01 Nov 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Sun, 01 Dec 2024 00:00:00 GMT") != null);
+}
+
+test "HTTPInspector: parseHttpDate with case-insensitive month names" {
+    // Lowercase
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 jan 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 JAN 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 JaN 2024 00:00:00 GMT") != null);
+}
+
+test "HTTPInspector: parseHttpDate with leap year" {
+    // Feb 29, 2024 is valid (2024 is divisible by 4)
+    // Feb 29, 2024 12:00:00 GMT = 1709208000
+    const leap_date = "Thu, 29 Feb 2024 12:00:00 GMT";
+    const timestamp = HTTPInspector.parseHttpDate(leap_date);
+    try testing.expect(timestamp != null);
+    try testing.expectEqual(timestamp.?, 1709208000);
+
+    // Feb 29, 2000 is valid (divisible by 400)
+    // Feb 29, 2000 12:00:00 GMT = 951825600
+    const leap_2000 = "Tue, 29 Feb 2000 12:00:00 GMT";
+    const ts_2000 = HTTPInspector.parseHttpDate(leap_2000);
+    try testing.expect(ts_2000 != null);
+    try testing.expectEqual(ts_2000.?, 951825600);
+}
+
+test "HTTPInspector: parseHttpDate with leap second" {
+    // Leap second (60 seconds is allowed)
+    // Dec 31, 2016 23:59:60 GMT = 1483228800 (same as Jan 1, 2017 00:00:00)
+    const leap_second = "Sat, 31 Dec 2016 23:59:60 GMT";
+    const timestamp = HTTPInspector.parseHttpDate(leap_second);
+    try testing.expect(timestamp != null);
+    try testing.expectEqual(timestamp.?, 1483228800);
+}
+
+test "HTTPInspector: parseHttpDate with Unix epoch" {
+    // Thu, 01 Jan 1970 00:00:00 GMT (Unix epoch)
+    const epoch = "Thu, 01 Jan 1970 00:00:00 GMT";
+    const timestamp = HTTPInspector.parseHttpDate(epoch);
+    try testing.expect(timestamp != null);
+    try testing.expectEqual(timestamp.?, 0);
+}
+
+test "HTTPInspector: parseHttpDate with maximum valid year" {
+    // Far future date
+    const future = "Fri, 31 Dec 9999 23:59:59 GMT";
+    const timestamp = HTTPInspector.parseHttpDate(future);
+    try testing.expect(timestamp != null);
+}
+
+test "HTTPInspector: parseHttpDate rejects invalid dates" {
+    // Invalid day (0)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 00 Jan 2024 00:00:00 GMT") == null);
+
+    // Invalid day (32)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 32 Jan 2024 00:00:00 GMT") == null);
+
+    // Invalid month
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Xxx 2024 00:00:00 GMT") == null);
+
+    // Invalid year (before 1970)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 1969 00:00:00 GMT") == null);
+
+    // Invalid hour (24)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 2024 24:00:00 GMT") == null);
+
+    // Invalid minute (60)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 2024 00:60:00 GMT") == null);
+
+    // Invalid second (61)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 2024 00:00:61 GMT") == null);
+}
+
+test "HTTPInspector: parseHttpDate rejects invalid day-of-month for each month" {
+    // January (31 days) - reject 32
+    try testing.expect(HTTPInspector.parseHttpDate("Wed, 32 Jan 2024 00:00:00 GMT") == null);
+
+    // February non-leap year (28 days) - reject 29 and 30
+    try testing.expect(HTTPInspector.parseHttpDate("Thu, 29 Feb 2023 00:00:00 GMT") == null);
+    try testing.expect(HTTPInspector.parseHttpDate("Thu, 30 Feb 2023 00:00:00 GMT") == null);
+
+    // February leap year (29 days) - accept 29, reject 30
+    try testing.expect(HTTPInspector.parseHttpDate("Thu, 29 Feb 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Fri, 30 Feb 2024 00:00:00 GMT") == null);
+
+    // March (31 days) - reject 32
+    try testing.expect(HTTPInspector.parseHttpDate("Sun, 32 Mar 2024 00:00:00 GMT") == null);
+
+    // April (30 days) - reject 31
+    try testing.expect(HTTPInspector.parseHttpDate("Tue, 31 Apr 2024 00:00:00 GMT") == null);
+
+    // May (31 days) - reject 32
+    try testing.expect(HTTPInspector.parseHttpDate("Fri, 32 May 2024 00:00:00 GMT") == null);
+
+    // June (30 days) - reject 31
+    try testing.expect(HTTPInspector.parseHttpDate("Sun, 31 Jun 2024 00:00:00 GMT") == null);
+
+    // July (31 days) - reject 32
+    try testing.expect(HTTPInspector.parseHttpDate("Wed, 32 Jul 2024 00:00:00 GMT") == null);
+
+    // August (31 days) - reject 32
+    try testing.expect(HTTPInspector.parseHttpDate("Sat, 32 Aug 2024 00:00:00 GMT") == null);
+
+    // September (30 days) - reject 31
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 31 Sep 2024 00:00:00 GMT") == null);
+
+    // October (31 days) - reject 32
+    try testing.expect(HTTPInspector.parseHttpDate("Thu, 32 Oct 2024 00:00:00 GMT") == null);
+
+    // November (30 days) - reject 31
+    try testing.expect(HTTPInspector.parseHttpDate("Sat, 31 Nov 2024 00:00:00 GMT") == null);
+
+    // December (31 days) - reject 32
+    try testing.expect(HTTPInspector.parseHttpDate("Tue, 32 Dec 2024 00:00:00 GMT") == null);
+}
+
+test "HTTPInspector: parseHttpDate rejects malformed input" {
+    // Too short
+    try testing.expect(HTTPInspector.parseHttpDate("") == null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon") == null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan") == null);
+
+    // Missing comma
+    try testing.expect(HTTPInspector.parseHttpDate("Mon 01 Jan 2024 00:00:00 GMT") == null);
+
+    // Wrong delimiter
+    try testing.expect(HTTPInspector.parseHttpDate("Mon. 01 Jan 2024 00:00:00 GMT") == null);
+
+    // Invalid time format
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 2024 12:00 GMT") == null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 2024 12h00m00s GMT") == null);
+}
+
+test "HTTPInspector: parseHttpDate with edge case timestamps" {
+    // Test known timestamps for correctness
+    // Jan 1, 2000 00:00:00 = 946684800
+    const y2k = "Sat, 01 Jan 2000 00:00:00 GMT";
+    const ts_y2k = HTTPInspector.parseHttpDate(y2k);
+    try testing.expect(ts_y2k != null);
+    try testing.expectEqual(ts_y2k.?, 946684800);
+
+    // Dec 31, 2000 23:59:59 = 978307199
+    const end_2000 = "Sun, 31 Dec 2000 23:59:59 GMT";
+    const ts_end = HTTPInspector.parseHttpDate(end_2000);
+    try testing.expect(ts_end != null);
+    try testing.expectEqual(ts_end.?, 978307199);
+}
+
+test "HTTPInspector: parseHttpDate with RFC 850 two-digit year interpretation" {
+    // Year 70-99 should map to 1970-1999
+    const year_70 = "Thursday, 01-Jan-70 00:00:00 GMT";
+    const ts_70 = HTTPInspector.parseHttpDate(year_70);
+    try testing.expect(ts_70 != null);
+    try testing.expectEqual(ts_70.?, 0); // Jan 1, 1970
+
+    // Year 00-69 should map to 2000-2069
+    const year_00 = "Saturday, 01-Jan-00 00:00:00 GMT";
+    const ts_00 = HTTPInspector.parseHttpDate(year_00);
+    try testing.expect(ts_00 != null);
+    try testing.expectEqual(ts_00.?, 946684800); // Jan 1, 2000
+
+    const year_69 = "Monday, 01-Jan-69 00:00:00 GMT";
+    const ts_69 = HTTPInspector.parseHttpDate(year_69);
+    try testing.expect(ts_69 != null);
+    // Should be 2069, not 1969 - Jan 1, 2069 00:00:00 GMT = 3124224000
+    try testing.expectEqual(ts_69.?, 3124224000);
+}
+
+test "HTTPInspector: parseHttpDate with whitespace variations" {
+    // Single space (normal)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon, 01 Jan 2024 00:00:00 GMT") != null);
+
+    // Multiple spaces in asctime format (valid)
+    try testing.expect(HTTPInspector.parseHttpDate("Mon Jan  1 00:00:00 2024") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Mon Jan 10 00:00:00 2024") != null);
+}
+
+test "HTTPInspector: parseHttpDate month ordering correctness" {
+    // Verify month calculations by checking sequential months
+    const jan = HTTPInspector.parseHttpDate("Sat, 01 Jan 2000 00:00:00 GMT").?;
+    const feb = HTTPInspector.parseHttpDate("Tue, 01 Feb 2000 00:00:00 GMT").?;
+    const mar = HTTPInspector.parseHttpDate("Wed, 01 Mar 2000 00:00:00 GMT").?;
+
+    // Jan→Feb should be 31 days (2678400 seconds)
+    try testing.expectEqual(feb - jan, 31 * 86400);
+
+    // Feb→Mar should be 29 days in 2000 (leap year)
+    try testing.expectEqual(mar - feb, 29 * 86400);
+}
+
+test "HTTPInspector: parseHttpDate leap year calculation" {
+    // Test leap year detection
+    // 2000 is a leap year (divisible by 400)
+    const feb28_2000 = HTTPInspector.parseHttpDate("Mon, 28 Feb 2000 00:00:00 GMT").?;
+    const feb29_2000 = HTTPInspector.parseHttpDate("Tue, 29 Feb 2000 00:00:00 GMT").?;
+    const mar01_2000 = HTTPInspector.parseHttpDate("Wed, 01 Mar 2000 00:00:00 GMT").?;
+
+    try testing.expectEqual(feb29_2000 - feb28_2000, 86400);
+    try testing.expectEqual(mar01_2000 - feb29_2000, 86400);
+
+    // 1900 is NOT a leap year (divisible by 100 but not 400)
+    // (but we can't test this since year must be >= 1970)
+
+    // 2024 is a leap year (divisible by 4)
+    const feb28_2024 = HTTPInspector.parseHttpDate("Wed, 28 Feb 2024 00:00:00 GMT").?;
+    const feb29_2024 = HTTPInspector.parseHttpDate("Thu, 29 Feb 2024 00:00:00 GMT").?;
+    const mar01_2024 = HTTPInspector.parseHttpDate("Fri, 01 Mar 2024 00:00:00 GMT").?;
+
+    try testing.expectEqual(feb29_2024 - feb28_2024, 86400);
+    try testing.expectEqual(mar01_2024 - feb29_2024, 86400);
+}
+
+test "HTTPInspector: parseHttpDate handles different day names" {
+    // Day names are parsed but not validated (any valid format accepted)
+    try testing.expect(HTTPInspector.parseHttpDate("Sun, 01 Jan 2024 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Monday, 01-Jan-24 00:00:00 GMT") != null);
+    try testing.expect(HTTPInspector.parseHttpDate("Tue Jan  2 00:00:00 2024") != null);
+}
+
 test "Proxy: with statistics enabled" {
     const allocator = testing.allocator;
 
@@ -693,15 +986,15 @@ test "HTTPCache: basic caching" {
     defer cache.deinit();
 
     // Cache miss
-    const result1 = cache.get("GET", "example.com", "/api/users");
+    const result1 = cache.get("GET", "example.com", "/api/users", null);
     try testing.expect(result1 == null);
 
     // Store response
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
-    try cache.put("GET", "example.com", "/api/users", response, 300);
+    try cache.put("GET", "example.com", "/api/users", response, 300, null, null);
 
     // Cache hit
-    const result2 = cache.get("GET", "example.com", "/api/users");
+    const result2 = cache.get("GET", "example.com", "/api/users", null);
     defer if (result2) |data| allocator.free(data);
     try testing.expect(result2 != null);
     if (result2) |data| {
@@ -722,11 +1015,11 @@ test "HTTPCache: LRU eviction" {
     defer cache.deinit();
 
     // Fill cache
-    try cache.put("GET", "test.com", "/1", "response1response1response1", 300);
-    try cache.put("GET", "test.com", "/2", "response2response2response2", 300);
+    try cache.put("GET", "test.com", "/1", "response1response1response1", 300, null, null);
+    try cache.put("GET", "test.com", "/2", "response2response2response2", 300, null, null);
 
     // This should evict the least recently used entry
-    try cache.put("GET", "test.com", "/3", "response3response3response3", 300);
+    try cache.put("GET", "test.com", "/3", "response3response3response3", 300, null, null);
 
     const stats = cache.getStats();
     try testing.expect(stats.entry_count <= 2);
@@ -739,11 +1032,11 @@ test "HTTPCache: TTL expiration" {
     defer cache.deinit();
 
     // Store with 0 TTL (should expire immediately)
-    try cache.put("GET", "test.com", "/expire", "data", 0);
+    try cache.put("GET", "test.com", "/expire", "data", 0, null, null);
 
     // Wait a bit (in real scenario, time would pass)
     // For testing, we rely on the timestamp check
-    const result = cache.get("GET", "test.com", "/expire");
+    const result = cache.get("GET", "test.com", "/expire", null);
     defer if (result) |data| allocator.free(data);
 
     // May or may not be expired depending on timing (verified via defer)
@@ -1124,10 +1417,10 @@ test "HTTPCache Integration: cache only successful GET requests with 200 OK" {
 
         // Simulate caching the response
         const test_host = "api.example.com";
-        try cache.put(request.method, test_host, request.path, ok_response, 300);
+        try cache.put(request.method, test_host, request.path, ok_response, 300, null, null);
 
         // Verify it was cached
-        const cached = cache.get(request.method, test_host, request.path);
+        const cached = cache.get(request.method, test_host, request.path, null);
         defer if (cached) |data| allocator.free(data);
         try testing.expect(cached != null);
         if (cached) |data| {
@@ -1178,7 +1471,7 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
         const host = maybe_host.?;
 
         // Check cache (should be miss)
-        const cached = cache.get(request.method, host, request.path);
+        const cached = cache.get(request.method, host, request.path, null);
         try testing.expect(cached == null);
 
         // Verify cache miss was recorded
@@ -1193,10 +1486,10 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
         const backend_response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndata";
 
         // After receiving backend response, cache it for future requests
-        try cache.put(request.method, host, request.path, backend_response, 300);
+        try cache.put(request.method, host, request.path, backend_response, 300, null, null);
 
         // Verify subsequent request gets cached response
-        const cached_after = cache.get(request.method, host, request.path);
+        const cached_after = cache.get(request.method, host, request.path, null);
         defer if (cached_after) |data| allocator.free(data);
         try testing.expect(cached_after != null);
         if (cached_after) |data| {
@@ -1224,19 +1517,19 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     const host = "example.com";
 
     // Cache with very short TTL (0 seconds - immediate expiration)
-    try cache.put(method, host, path, response, 0);
+    try cache.put(method, host, path, response, 0, null, null);
 
     // Immediate lookup might hit or miss depending on timing
     // The key is that the TTL mechanism is tested
-    const cached1 = cache.get(method, host, path);
+    const cached1 = cache.get(method, host, path, null);
     defer if (cached1) |data| allocator.free(data);
 
     // Regardless of first lookup, we verify TTL behavior:
     // Put a new entry with longer TTL
-    try cache.put(method, host, path, response, 300);
+    try cache.put(method, host, path, response, 300, null, null);
 
     // This should definitely hit
-    const cached2 = cache.get(method, host, path);
+    const cached2 = cache.get(method, host, path, null);
     defer if (cached2) |data| allocator.free(data);
     try testing.expect(cached2 != null);
 
@@ -1245,9 +1538,9 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     try testing.expect(stats.entry_count == 1);
 
     // Test another path with 0 TTL to verify expiration logic
-    try cache.put("GET", host, "/api/expired", "data", 0);
+    try cache.put("GET", host, "/api/expired", "data", 0, null, null);
     // The entry may expire immediately, demonstrating TTL functionality
-    const expired = cache.get("GET", host, "/api/expired");
+    const expired = cache.get("GET", host, "/api/expired", null);
     defer if (expired) |data| allocator.free(data);
 
     // cached1 and expired may or may not be null (verified via defer)
@@ -1271,7 +1564,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
 
     for (paths) |path| {
         const response = "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ntest";
-        try cache.put("GET", host, path, response, 300);
+        try cache.put("GET", host, path, response, 300, null, null);
     }
 
     // Simulate concurrent access (sequential in test, but tests lock correctness)
@@ -1281,7 +1574,7 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     // Multiple "concurrent" readers
     for (0..10) |i| {
         const path = paths[i % paths.len];
-        const cached = cache.get("GET", host, path);
+        const cached = cache.get("GET", host, path, null);
         defer if (cached) |data| allocator.free(data);
 
         if (cached) |_| {
@@ -1302,13 +1595,13 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     // Test concurrent writes (LRU updates via get())
     // Note: get() no longer updates LRU order due to shared lock optimization
     for (paths) |path| {
-        const result = cache.get("GET", host, path);
+        const result = cache.get("GET", host, path, null);
         defer if (result) |data| allocator.free(data);
     }
 
     // Verify all entries still accessible
     for (paths) |path| {
-        const cached = cache.get("GET", host, path);
+        const cached = cache.get("GET", host, path, null);
         defer if (cached) |data| allocator.free(data);
         try testing.expect(cached != null);
     }
@@ -1330,10 +1623,10 @@ test "HTTPCache Integration: cache size limits and LRU eviction behavior" {
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345"; // 50 bytes
 
     // Add entries until cache is full
-    try cache.put("GET", host, "/path0001", response, 300);
-    try cache.put("GET", host, "/path0002", response, 300);
-    try cache.put("GET", host, "/path0003", response, 300);
-    try cache.put("GET", host, "/path0004", response, 300);
+    try cache.put("GET", host, "/path0001", response, 300, null, null);
+    try cache.put("GET", host, "/path0002", response, 300, null, null);
+    try cache.put("GET", host, "/path0003", response, 300, null, null);
+    try cache.put("GET", host, "/path0004", response, 300, null, null);
 
     var stats = cache.getStats();
     const entries_after_fill = stats.entry_count;
@@ -1342,15 +1635,15 @@ test "HTTPCache Integration: cache size limits and LRU eviction behavior" {
     try testing.expect(entries_after_fill <= 4);
 
     // Add 5th entry - should evict LRU (path0001)
-    try cache.put("GET", host, "/path0005", response, 300);
+    try cache.put("GET", host, "/path0005", response, 300, null, null);
 
     // Verify LRU eviction occurred
-    const evicted = cache.get("GET", host, "/path0001");
+    const evicted = cache.get("GET", host, "/path0001", null);
     defer if (evicted) |data| allocator.free(data);
     try testing.expect(evicted == null); // Should be evicted
 
     // Verify newest entry is present
-    const newest = cache.get("GET", host, "/path0005");
+    const newest = cache.get("GET", host, "/path0005", null);
     defer if (newest) |data| allocator.free(data);
     try testing.expect(newest != null);
 
@@ -1584,7 +1877,7 @@ test "HTTPCache Integration: verify correct size accounting in put operations" {
     const response = "HTTP/1.1 200 OK\r\n\r\nHello"; // 25 bytes
     // Total: 3 + 8 + 5 + 25 = 41 bytes
 
-    try cache.put(method, host, path, response, 300);
+    try cache.put(method, host, path, response, 300, null, null);
 
     const stats = cache.getStats();
 
@@ -1595,7 +1888,7 @@ test "HTTPCache Integration: verify correct size accounting in put operations" {
     try testing.expectEqual(@as(u64, 1), stats.entry_count);
 
     // Verify entry is retrievable
-    const cached = cache.get(method, host, path);
+    const cached = cache.get(method, host, path, null);
     defer if (cached) |data| allocator.free(data);
     try testing.expect(cached != null);
 }
@@ -1633,10 +1926,10 @@ test "HTTPCache Integration: skip caching for missing Host header (security)" {
 
         // This SHOULD be cacheable
         const response = "HTTP/1.1 200 OK\r\n\r\nresponse-data";
-        try cache.put(request.method, host, request.path, response, 300);
+        try cache.put(request.method, host, request.path, response, 300, null, null);
 
         // Verify it was cached
-        const cached = cache.get(request.method, host, request.path);
+        const cached = cache.get(request.method, host, request.path, null);
         try testing.expect(cached != null);
         defer if (cached) |data| allocator.free(data);
 
@@ -1660,16 +1953,16 @@ test "HTTPCache Integration: prevent cache pollution across different hosts" {
     const response1 = "HTTP/1.1 200 OK\r\n\r\nhost1-response";
     const response2 = "HTTP/1.1 200 OK\r\n\r\nhost2-response";
 
-    try cache.put("GET", "api1.example.com", "/api/users", response1, 300);
-    try cache.put("GET", "api2.example.com", "/api/users", response2, 300);
+    try cache.put("GET", "api1.example.com", "/api/users", response1, 300, null, null);
+    try cache.put("GET", "api2.example.com", "/api/users", response2, 300, null, null);
 
     // Verify each host gets its own cached response
-    const cached1 = cache.get("GET", "api1.example.com", "/api/users");
+    const cached1 = cache.get("GET", "api1.example.com", "/api/users", null);
     try testing.expect(cached1 != null);
     try testing.expect(std.mem.indexOf(u8, cached1.?, "host1-response") != null);
     defer allocator.free(cached1.?);
 
-    const cached2 = cache.get("GET", "api2.example.com", "/api/users");
+    const cached2 = cache.get("GET", "api2.example.com", "/api/users", null);
     try testing.expect(cached2 != null);
     try testing.expect(std.mem.indexOf(u8, cached2.?, "host2-response") != null);
     defer allocator.free(cached2.?);
