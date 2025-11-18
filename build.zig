@@ -337,11 +337,10 @@ pub fn build(b: *std.Build) void {
     const auth_proxy_step = b.step("auth_proxy", "Run authentication proxy example");
     auth_proxy_step.dependOn(&run_auth_proxy.step);
 
-    // E2E test executable
-    const e2e_test = b.addExecutable(.{
-        .name = "e2e_test",
+    const config_driven_proxy = b.addExecutable(.{
+        .name = "config_driven_proxy",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tests/e2e_test.zig"),
+            .root_source_file = b.path("examples/config_driven_proxy.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
@@ -349,12 +348,32 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(e2e_test);
+    b.installArtifact(config_driven_proxy);
 
-    // E2E test run step
-    const run_e2e_test = b.addRunArtifact(e2e_test);
-    const e2e_test_step = b.step("test_e2e", "Run end-to-end proxy tests");
-    e2e_test_step.dependOn(&run_e2e_test.step);
+    const run_config_driven_proxy = b.addRunArtifact(config_driven_proxy);
+    if (b.args) |args| {
+        run_config_driven_proxy.addArgs(args);
+    }
+    const config_driven_proxy_step = b.step("config_driven_proxy", "Run config driven proxy example");
+    config_driven_proxy_step.dependOn(&run_config_driven_proxy.step);
+
+    // E2E config test executable
+    const e2e_config_test = b.addExecutable(.{
+        .name = "e2e_config_test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/e2e_config_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "prozy", .module = mod },
+            },
+        }),
+    });
+    b.installArtifact(e2e_config_test);
+
+    const run_e2e_config_test = b.addRunArtifact(e2e_config_test);
+    const e2e_test_step = b.step("test_e2e", "Run end-to-end config proxy tests");
+    e2e_test_step.dependOn(&run_e2e_config_test.step);
 
     // Just like flags, top level steps are also listed in the `--help` menu.
     //

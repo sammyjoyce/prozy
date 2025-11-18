@@ -508,7 +508,7 @@ Prozy implements various HTTP standards and specifications to different degrees.
 - **Tunneling (50%)**: Full CONNECT method implementation for HTTPS tunneling with bidirectional raw TCP forwarding, proper 200 responses, and statistics tracking. Missing WebSocket upgrade and protocol switching capabilities.
 - **HTTP Core (43%)**: Solid HTTP/1.1 message parsing with request/response line handling, basic header extraction, and status code validation. Missing URI parsing, content negotiation, conditional requests, and comprehensive header semantics.
 - **Content Adaptation (30%)**: Basic HTTP header manipulation and transformation hook framework. Missing ICAP protocol, external service integration, virus scanning, and DLP capabilities.
-- **Declarative Config (30%)**: Excellent hot reload with atomic pointer swapping, memory-safe lease-based access, JSON/ZON support, and rich configuration schema. Missing Kubernetes Gateway API and Envoy xDS protocol integration.
+- **Declarative Config (90%)**: Excellent hot reload with atomic pointer swapping, memory-safe lease-based access, JSON/ZON support, and rich configuration schema. See [Configuration Guide](docs/CONFIGURATION_GUIDE.md). Missing Kubernetes Gateway API and Envoy xDS protocol integration.
 - **Observability (20%)**: Basic atomic metrics collection, HTTP admin endpoints (/metrics, /health, /backends, /auth/stats), and structured logging. Missing OpenTelemetry SDK, distributed tracing, OTLP export, and standard metrics formats.
 - **Caching (10%)**: O(1) LRU cache with doubly-linked list, RwLock concurrency, TTL expiration, and Host header isolation. Missing most RFC 9111 features: Cache-Control directives, Vary header, ETag validation, freshness calculation, and revalidation.
 

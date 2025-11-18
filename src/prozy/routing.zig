@@ -202,44 +202,81 @@ pub const Cluster = struct {
     pub fn release(self: *Cluster) void {
         self.semaphore.release();
     }
+
+    /// Acquire a connection slot, waiting if necessary
+    pub fn acquire(self: *Cluster, timeout_ms: u64) bool {
+        return self.semaphore.acquire(timeout_ms);
+    }
 };
 
-/// Simple semaphore for concurrency control
+/// Semaphore for concurrency control with timeout support
 pub const Semaphore = struct {
     max: u32,
-    current: std.atomic.Value(u32),
+    current: u32,
+    mutex: std.Thread.Mutex,
+    cond: std.Thread.Condition,
 
     pub fn init(max: u32) Semaphore {
         return .{
             .max = max,
-            .current = std.atomic.Value(u32).init(0),
+            .current = 0,
+            .mutex = .{},
+            .cond = .{},
         };
     }
 
     pub fn tryAcquire(self: *Semaphore) bool {
-        while (true) {
-            const current = self.current.load(.monotonic);
-            if (current >= self.max) return false;
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
-            // Try to increment atomically
-            if (self.current.cmpxchgWeak(
-                current,
-                current + 1,
-                .monotonic,
-                .monotonic,
-            ) == null) {
-                return true;
-            }
+        if (self.current < self.max) {
+            self.current += 1;
+            return true;
         }
+        return false;
+    }
+
+    pub fn acquire(self: *Semaphore, timeout_ms: u64) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const timeout_ns = timeout_ms * std.time.ns_per_ms;
+        var timer = std.time.Timer.start() catch return false;
+
+        while (self.current >= self.max) {
+            const elapsed = timer.read();
+            if (elapsed >= timeout_ns) return false;
+
+            const remaining = timeout_ns - elapsed;
+
+            // timedWait returns error on timeout or spurious wakeups?
+            // In Zig std, timedWait usually returns void and we check condition.
+            // Or it returns error.Timeout.
+            // Let's assume standard pattern: wait and re-check condition.
+            self.cond.timedWait(&self.mutex, remaining) catch |err| {
+                if (err == error.Timeout) return false;
+                // Other errors (spurious?) -> loop again
+            };
+        }
+
+        self.current += 1;
+        return true;
     }
 
     pub fn release(self: *Semaphore) void {
-        _ = self.current.fetchSub(1, .monotonic);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.current > 0) {
+            self.current -= 1;
+            self.cond.signal();
+        }
     }
 
-    pub fn available(self: *const Semaphore) u32 {
-        const current = self.current.load(.monotonic);
-        return if (current < self.max) self.max - current else 0;
+    pub fn available(self: *Semaphore) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return if (self.current < self.max) self.max - self.current else 0;
     }
 };
 
