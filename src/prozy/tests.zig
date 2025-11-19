@@ -982,7 +982,7 @@ test "HTTPCache: basic caching" {
     defer cache.deinit();
 
     // Cache miss
-    const result1 = cache.get("GET", "example.com", "/api/users", null);
+    const result1 = cache.get("GET", "example.com", "/api/users", null, false);
     try testing.expect(result1 == null);
 
     // Store response
@@ -990,11 +990,11 @@ test "HTTPCache: basic caching" {
     try cache.put("GET", "example.com", "/api/users", response, 300, null, null);
 
     // Cache hit
-    const result2 = cache.get("GET", "example.com", "/api/users", null);
-    defer if (result2) |data| allocator.free(data);
+    const result2 = cache.get("GET", "example.com", "/api/users", null, false);
+    defer if (result2) |res| allocator.free(res.response);
     try testing.expect(result2 != null);
-    if (result2) |data| {
-        try testing.expectEqualStrings(response, data);
+    if (result2) |res| {
+        try testing.expectEqualStrings(response, res.response);
     }
 
     // Stats
@@ -1032,8 +1032,8 @@ test "HTTPCache: TTL expiration" {
 
     // Wait a bit (in real scenario, time would pass)
     // For testing, we rely on the timestamp check
-    const result = cache.get("GET", "test.com", "/expire", null);
-    defer if (result) |data| allocator.free(data);
+    const result = cache.get("GET", "test.com", "/expire", null, false);
+    defer if (result) |res| allocator.free(res.response);
 
     // May or may not be expired depending on timing (verified via defer)
 }
@@ -1416,11 +1416,11 @@ test "HTTPCache Integration: cache only successful GET requests with 200 OK" {
         try cache.put(request.method, test_host, request.path, ok_response, 300, null, null);
 
         // Verify it was cached
-        const cached = cache.get(request.method, test_host, request.path, null);
-        defer if (cached) |data| allocator.free(data);
+        const cached = cache.get(request.method, test_host, request.path, null, false);
+        defer if (cached) |res| allocator.free(res.response);
         try testing.expect(cached != null);
-        if (cached) |data| {
-            try testing.expectEqualStrings(ok_response, data);
+        if (cached) |res| {
+            try testing.expectEqualStrings(ok_response, res.response);
         }
     }
 
@@ -1467,7 +1467,7 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
         const host = maybe_host.?;
 
         // Check cache (should be miss)
-        const cached = cache.get(request.method, host, request.path, null);
+        const cached = cache.get(request.method, host, request.path, null, false);
         try testing.expect(cached == null);
 
         // Verify cache miss was recorded
@@ -1485,11 +1485,11 @@ test "HTTPCache Integration: request buffering and forwarding after cache miss" 
         try cache.put(request.method, host, request.path, backend_response, 300, null, null);
 
         // Verify subsequent request gets cached response
-        const cached_after = cache.get(request.method, host, request.path, null);
-        defer if (cached_after) |data| allocator.free(data);
+        const cached_after = cache.get(request.method, host, request.path, null, false);
+        defer if (cached_after) |res| allocator.free(res.response);
         try testing.expect(cached_after != null);
-        if (cached_after) |data| {
-            try testing.expectEqualStrings(backend_response, data);
+        if (cached_after) |res| {
+            try testing.expectEqualStrings(backend_response, res.response);
         }
 
         // Verify statistics
@@ -1517,16 +1517,16 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
 
     // Immediate lookup might hit or miss depending on timing
     // The key is that the TTL mechanism is tested
-    const cached1 = cache.get(method, host, path, null);
-    defer if (cached1) |data| allocator.free(data);
+    const cached1 = cache.get(method, host, path, null, false);
+    defer if (cached1) |res| allocator.free(res.response);
 
     // Regardless of first lookup, we verify TTL behavior:
     // Put a new entry with longer TTL
     try cache.put(method, host, path, response, 300, null, null);
 
     // This should definitely hit
-    const cached2 = cache.get(method, host, path, null);
-    defer if (cached2) |data| allocator.free(data);
+    const cached2 = cache.get(method, host, path, null, false);
+    defer if (cached2) |res| allocator.free(res.response);
     try testing.expect(cached2 != null);
 
     // Verify cache is working
@@ -1536,8 +1536,8 @@ test "HTTPCache Integration: TTL expiration and re-caching" {
     // Test another path with 0 TTL to verify expiration logic
     try cache.put("GET", host, "/api/expired", "data", 0, null, null);
     // The entry may expire immediately, demonstrating TTL functionality
-    const expired = cache.get("GET", host, "/api/expired", null);
-    defer if (expired) |data| allocator.free(data);
+    const expired = cache.get("GET", host, "/api/expired", null, false);
+    defer if (expired) |res| allocator.free(res.response);
 
     // cached1 and expired may or may not be null (verified via defer)
 }
@@ -1570,8 +1570,8 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     // Multiple "concurrent" readers
     for (0..10) |i| {
         const path = paths[i % paths.len];
-        const cached = cache.get("GET", host, path, null);
-        defer if (cached) |data| allocator.free(data);
+        const cached = cache.get("GET", host, path, null, false);
+        defer if (cached) |res| allocator.free(res.response);
 
         if (cached) |_| {
             hits += 1;
@@ -1591,14 +1591,14 @@ test "HTTPCache Integration: concurrent access with new lock pattern" {
     // Test concurrent writes (LRU updates via get())
     // Note: get() no longer updates LRU order due to shared lock optimization
     for (paths) |path| {
-        const result = cache.get("GET", host, path, null);
-        defer if (result) |data| allocator.free(data);
+        const result = cache.get("GET", host, path, null, false);
+        defer if (result) |res| allocator.free(res.response);
     }
 
     // Verify all entries still accessible
     for (paths) |path| {
-        const cached = cache.get("GET", host, path, null);
-        defer if (cached) |data| allocator.free(data);
+        const cached = cache.get("GET", host, path, null, false);
+        defer if (cached) |res| allocator.free(res.response);
         try testing.expect(cached != null);
     }
 }
@@ -1634,13 +1634,13 @@ test "HTTPCache Integration: cache size limits and LRU eviction behavior" {
     try cache.put("GET", host, "/path0005", response, 300, null, null);
 
     // Verify LRU eviction occurred
-    const evicted = cache.get("GET", host, "/path0001", null);
-    defer if (evicted) |data| allocator.free(data);
+    const evicted = cache.get("GET", host, "/path0001", null, false);
+    defer if (evicted) |res| allocator.free(res.response);
     try testing.expect(evicted == null); // Should be evicted
 
     // Verify newest entry is present
-    const newest = cache.get("GET", host, "/path0005", null);
-    defer if (newest) |data| allocator.free(data);
+    const newest = cache.get("GET", host, "/path0005", null, false);
+    defer if (newest) |res| allocator.free(res.response);
     try testing.expect(newest != null);
 
     // Verify cache size accounting is correct
@@ -1884,8 +1884,8 @@ test "HTTPCache Integration: verify correct size accounting in put operations" {
     try testing.expectEqual(@as(u64, 1), stats.entry_count);
 
     // Verify entry is retrievable
-    const cached = cache.get(method, host, path, null);
-    defer if (cached) |data| allocator.free(data);
+    const cached = cache.get(method, host, path, null, false);
+    defer if (cached) |res| allocator.free(res.response);
     try testing.expect(cached != null);
 }
 
@@ -1925,12 +1925,14 @@ test "HTTPCache Integration: skip caching for missing Host header (security)" {
         try cache.put(request.method, host, request.path, response, 300, null, null);
 
         // Verify it was cached
-        const cached = cache.get(request.method, host, request.path, null);
+        const cached = cache.get(request.method, host, request.path, null, false);
         try testing.expect(cached != null);
-        defer if (cached) |data| allocator.free(data);
+        defer if (cached) |res| allocator.free(res.response);
 
         // Verify correct response
-        try testing.expect(std.mem.indexOf(u8, cached.?, "response-data") != null);
+        if (cached) |res| {
+            try testing.expect(std.mem.indexOf(u8, res.response, "response-data") != null);
+        }
     }
 
     // Verify cache has exactly one entry (only the request with Host header)
@@ -1953,23 +1955,41 @@ test "HTTPCache Integration: prevent cache pollution across different hosts" {
     try cache.put("GET", "api2.example.com", "/api/users", response2, 300, null, null);
 
     // Verify each host gets its own cached response
-    const cached1 = cache.get("GET", "api1.example.com", "/api/users", null);
+    const cached1 = cache.get("GET", "api1.example.com", "/api/users", null, false);
     try testing.expect(cached1 != null);
-    try testing.expect(std.mem.indexOf(u8, cached1.?, "host1-response") != null);
-    defer allocator.free(cached1.?);
+    if (cached1) |res| {
+        try testing.expect(std.mem.indexOf(u8, res.response, "host1-response") != null);
+        allocator.free(res.response);
+    }
 
-    const cached2 = cache.get("GET", "api2.example.com", "/api/users", null);
+    const cached2 = cache.get("GET", "api2.example.com", "/api/users", null, false);
     try testing.expect(cached2 != null);
-    try testing.expect(std.mem.indexOf(u8, cached2.?, "host2-response") != null);
-    defer allocator.free(cached2.?);
+    if (cached2) |res| {
+        try testing.expect(std.mem.indexOf(u8, res.response, "host2-response") != null);
+        allocator.free(res.response);
+    }
 
+    // Note: We can't compare them directly now because we freed them. 
+    // The test logic above verifies they are correct individually.
+    // If we want to compare, we need to keep them.
+    
+    // Re-fetch to compare
+    const c1 = cache.get("GET", "api1.example.com", "/api/users", null, false);
+    const c2 = cache.get("GET", "api2.example.com", "/api/users", null, false);
+    defer if (c1) |res| allocator.free(res.response);
+    defer if (c2) |res| allocator.free(res.response);
+    
     // Verify they're different responses (multi-tenant isolation)
-    try testing.expect(!std.mem.eql(u8, cached1.?, cached2.?));
+    if (c1) |r1| {
+        if (c2) |r2| {
+            try testing.expect(!std.mem.eql(u8, r1.response, r2.response));
+        }
+    }
 
     // Verify cache has two separate entries
     const stats = cache.getStats();
     try testing.expectEqual(@as(u64, 2), stats.entry_count);
-    try testing.expectEqual(@as(u64, 2), stats.hits);
+    try testing.expectEqual(@as(u64, 4), stats.hits);
 }
 
 test "Proxy runWithIoOptions API with explicit Io executor" {

@@ -1,9 +1,9 @@
-//! Health Checker: Proactive backend health monitoring
+//! Health Monitor: Proactive backend health monitoring
 //!
 //! Provides periodic health checks for backends using:
 //! - Background async task
 //! - TCP connection probes
-//! - Exponential backoff respect
+//! - Proactive failure detection
 //! - Graceful shutdown support
 
 const std = @import("std");
@@ -18,21 +18,21 @@ const Duration = Io.Duration;
 const Backend = @import("backend.zig").Backend;
 const connectToBackend = @import("transport.zig").connectToBackend;
 
-pub const HealthChecker = struct {
+pub const HealthMonitor = struct {
     allocator: mem.Allocator,
-    backends: []Backend,
+    backends: []*Backend,
     check_interval_ms: u64,
     connect_timeout_ms: u64,
     shutdown_requested: *std.atomic.Value(bool),
 
-    /// Initialize health checker
+    /// Initialize health monitor
     pub fn init(
         allocator: mem.Allocator,
-        backends: []Backend,
+        backends: []*Backend,
         check_interval_ms: u64,
         connect_timeout_ms: u64,
         shutdown_requested: *std.atomic.Value(bool),
-    ) HealthChecker {
+    ) HealthMonitor {
         return .{
             .allocator = allocator,
             .backends = backends,
@@ -42,37 +42,40 @@ pub const HealthChecker = struct {
         };
     }
 
+    /// Start the health monitor in a background task
+    /// Returns the future for the running task
+    pub fn start(self: *HealthMonitor, io: Io, group: *Io.Group) !void {
+        _ = group.async(io, run, .{self, io});
+    }
+
     /// Run health check loop (blocks until shutdown)
-    pub fn run(self: *HealthChecker, io: Io) !void {
+    pub fn run(self: *HealthMonitor, io: Io) void {
         if (!builtin.is_test) {
-            log.info("health checker started (interval: {}ms)", .{self.check_interval_ms});
+            log.info("health monitor started (interval: {}ms, backends: {})", .{ self.check_interval_ms, self.backends.len });
         }
 
         while (!self.shutdown_requested.load(.monotonic)) {
+            // Check all backends
+            for (self.backends) |backend| {
+                self.checkBackend(io, backend);
+                
+                // Yield to allow other tasks to run (prevent starvation in tight loops)
+                // Io.yield(io) would be nice, but sleep is implicit yield.
+            }
+
             // Sleep for check interval
+            // We sleep after checking all to space out checks
             const sleep_duration = Duration.fromMilliseconds(@intCast(self.check_interval_ms));
             Io.sleep(io, sleep_duration, .awake) catch {};
-
-            // Check if shutdown was requested during sleep
-            if (self.shutdown_requested.load(.monotonic)) {
-                break;
-            }
-
-            // Check all backends that need retry
-            for (self.backends) |*backend| {
-                if (backend.shouldRetry()) {
-                    self.checkBackend(io, backend);
-                }
-            }
         }
 
         if (!builtin.is_test) {
-            log.info("health checker stopped", .{});
+            log.info("health monitor stopped", .{});
         }
     }
 
     /// Check a single backend's health
-    fn checkBackend(self: *HealthChecker, io: Io, backend: *Backend) void {
+    fn checkBackend(self: *HealthMonitor, io: Io, backend: *Backend) void {
         const timeout: Timeout = .{
             .duration = .{
                 .raw = Duration.fromMilliseconds(@intCast(self.connect_timeout_ms)),
@@ -81,50 +84,44 @@ pub const HealthChecker = struct {
         };
 
         // Attempt TCP connection
+        // TODO: In Phase 5 (TLS), this should do a TLS handshake if configured
         const stream = connectToBackend(io, backend.host, backend.port, timeout) catch |err| {
-            // Connection failed - backend still unhealthy
-            if (!builtin.is_test) {
-                log.debug("health check failed for {s}:{} - {s}", .{
-                    backend.host,
-                    backend.port,
-                    @errorName(err),
+            // Connection failed
+            const was_healthy = backend.isHealthy();
+            backend.markHealthy(false);
+            
+            if (was_healthy and !builtin.is_test) {
+                log.warn("health check failed for {s}:{} - marked DOWN ({s})", .{
+                    backend.host, backend.port, @errorName(err)
                 });
             }
             return;
         };
         defer stream.close(io);
 
-        // Connection succeeded - mark healthy and reset retry count
+        // Connection succeeded
+        const was_unhealthy = !backend.isHealthy();
         backend.markHealthy(true);
 
-        if (!builtin.is_test) {
-            log.info("health check succeeded for {s}:{} - backend marked healthy", .{
-                backend.host,
-                backend.port,
+        if (was_unhealthy and !builtin.is_test) {
+            log.info("health check succeeded for {s}:{} - marked UP", .{
+                backend.host, backend.port
             });
-        }
-    }
-
-    /// Perform a one-time health check on all backends
-    pub fn checkAll(self: *HealthChecker, io: Io) void {
-        for (self.backends) |*backend| {
-            self.checkBackend(io, backend);
         }
     }
 };
 
 // Tests
-test "HealthChecker initialization" {
+test "HealthMonitor initialization" {
     const allocator = std.testing.allocator;
 
-    var backends = [_]Backend{
-        Backend.init("127.0.0.1", 3003, 1),
-        Backend.init("127.0.0.1", 3004, 1),
-    };
+    var b1 = Backend.init("127.0.0.1", 3003, 1);
+    var b2 = Backend.init("127.0.0.1", 3004, 1);
+    var backends = [_]*Backend{ &b1, &b2 };
 
     var shutdown_flag = std.atomic.Value(bool).init(false);
 
-    const checker = HealthChecker.init(
+    const monitor = HealthMonitor.init(
         allocator,
         backends[0..],
         5000, // 5 second interval
@@ -132,21 +129,20 @@ test "HealthChecker initialization" {
         &shutdown_flag,
     );
 
-    try std.testing.expectEqual(@as(u64, 5000), checker.check_interval_ms);
-    try std.testing.expectEqual(@as(u64, 1000), checker.connect_timeout_ms);
-    try std.testing.expectEqual(@as(usize, 2), checker.backends.len);
+    try std.testing.expectEqual(@as(u64, 5000), monitor.check_interval_ms);
+    try std.testing.expectEqual(@as(u64, 1000), monitor.connect_timeout_ms);
+    try std.testing.expectEqual(@as(usize, 2), monitor.backends.len);
 }
 
-test "HealthChecker respects shutdown flag" {
+test "HealthMonitor respects shutdown flag" {
     const allocator = std.testing.allocator;
 
-    var backends = [_]Backend{
-        Backend.init("127.0.0.1", 3003, 1),
-    };
+    var b1 = Backend.init("127.0.0.1", 3003, 1);
+    var backends = [_]*Backend{ &b1 };
 
     var shutdown_flag = std.atomic.Value(bool).init(true); // Already shutdown
 
-    var checker = HealthChecker.init(
+    var monitor = HealthMonitor.init(
         allocator,
         backends[0..],
         5000,
@@ -160,35 +156,5 @@ test "HealthChecker respects shutdown flag" {
     const io = threaded_io.io();
 
     // Should exit immediately because shutdown_requested is true
-    try checker.run(io);
-    // If we get here, the test passed (didn't hang)
-}
-
-test "HealthChecker marks backend healthy on successful connection" {
-    const allocator = std.testing.allocator;
-
-    var backends = [_]Backend{
-        Backend.init("127.0.0.1", 3003, 1),
-    };
-
-    // Mark backend as unhealthy
-    backends[0].markHealthy(false);
-    try std.testing.expect(!backends[0].isHealthy());
-
-    var shutdown_flag = std.atomic.Value(bool).init(false);
-
-    var checker = HealthChecker.init(
-        allocator,
-        backends[0..],
-        5000,
-        1000,
-        &shutdown_flag,
-    );
-
-    // Note: This test would require a real backend running on 3003
-    // For unit testing, we just verify the structure is correct
-    try std.testing.expectEqual(@as(usize, 1), checker.backends.len);
-
-    // Verify backend is still unhealthy (no connection made in test)
-    try std.testing.expect(!backends[0].isHealthy());
+    monitor.run(io);
 }
