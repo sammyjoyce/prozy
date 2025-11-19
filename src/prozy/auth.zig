@@ -1070,6 +1070,17 @@ pub const DigestCredentials = struct {
             return result;
         }
 
+        // Clean up partial result on failure
+        if (has_username) allocator.free(result.username);
+        if (has_realm) allocator.free(result.realm);
+        if (has_nonce) allocator.free(result.nonce);
+        if (has_uri) allocator.free(result.uri);
+        if (has_response) allocator.free(result.response);
+        if (result.algorithm) |s| allocator.free(s);
+        if (result.cnonce) |s| allocator.free(s);
+        if (result.nc) |s| allocator.free(s);
+        if (result.qop) |s| allocator.free(s);
+
         return null;
     }
 };

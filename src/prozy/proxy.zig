@@ -1001,35 +1001,55 @@ pub const Proxy = struct {
 
                                 // Check if stale entry supports stale-while-revalidate
                                 if (entry.metadata.cache_control.stale_while_revalidate) |swr_duration| {
-                                    if (!builtin.is_test) {
-                                        log.debug("stale-while-revalidate available for {d} seconds", .{swr_duration});
-                                    }
+                                    // Calculate freshness to see if we are within SWR window
+                                    const freshness_info = HTTPInspector.FreshnessInfo{
+                                        .date = entry.metadata.date_header,
+                                        .age = entry.metadata.age_header,
+                                        .expires = entry.metadata.expires_header,
+                                        .cache_control = entry.metadata.cache_control,
+                                        .response_time = entry.metadata.response_time,
+                                        .request_time = entry.metadata.request_time,
+                                    };
 
-                                    // Create context for revalidation
-                                    // Note: context.init performs deep copies of metadata strings
-                                    if (HTTPCache.RevalidationContext.init(allocator, http_cache.?, parsed_request.method, host, parsed_request.path, entry.metadata, decision.backend.host, decision.backend.port, connect_timeout)) |context| {
-                                        // Spawn background revalidation task
-                                        // Use connection_group.async to spawn detached task
-                                        _ = connection_group.async(io, HTTPCache.revalidateStaleEntry, .{ io, context });
+                                    const now = getTimestamp();
+                                    const current_age = freshness_info.calculateCurrentAge(now);
+                                    const freshness_lifetime = freshness_info.calculateFreshnessLifetime();
+                                    const swr_limit = freshness_lifetime + swr_duration;
 
-                                        // Serve stale content immediately
-                                        defer http_cache.?.allocator.free(entry.response);
-                                        _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
-                                            break;
-                                        };
-                                        _ = Writer.flush(&client_writer.interface) catch {
-                                            break;
-                                        };
-                                        if (options.enable_stats) {
-                                            stats.recordBytesBackendToClient(@intCast(entry.response.len));
+                                    if (current_age <= swr_limit) {
+                                        if (!builtin.is_test) {
+                                            log.debug("stale-while-revalidate applicable (age={d}, limit={d})", .{ current_age, swr_limit });
                                         }
 
-                                        cache_hit = true;
-                                        decision.cluster.release();
-                                        // Clean up cached_entry reference since we served it
-                                        cached_entry = null;
-                                    } else |_| {
-                                        log.warn("failed to create revalidation context", .{});
+                                        // Create context for revalidation
+                                        // Note: context.init performs deep copies of metadata strings
+                                        if (HTTPCache.RevalidationContext.init(allocator, http_cache.?, parsed_request.method, host, parsed_request.path, entry.metadata, decision.backend.host, decision.backend.port, connect_timeout)) |context| {
+                                            // Spawn background revalidation task
+                                            // Use connection_group.async to spawn detached task
+                                            _ = connection_group.async(io, HTTPCache.revalidateStaleEntry, .{ io, context });
+
+                                            // Serve stale content immediately
+                                            defer http_cache.?.allocator.free(entry.response);
+                                            if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                                            if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
+
+                                            _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
+                                                break;
+                                            };
+                                            _ = Writer.flush(&client_writer.interface) catch {
+                                                break;
+                                            };
+                                            if (options.enable_stats) {
+                                                stats.recordBytesBackendToClient(@intCast(entry.response.len));
+                                            }
+
+                                            cache_hit = true;
+                                            decision.cluster.release();
+                                            // Clean up cached_entry reference since we served it
+                                            cached_entry = null;
+                                        } else |err| {
+                                            log.warn("failed to create revalidation context: {s}", .{@errorName(err)});
+                                        }
                                     }
                                 }
 
@@ -1055,10 +1075,12 @@ pub const Proxy = struct {
                 // If we have a stale entry, serve it as fallback (stale-if-error behavior)
                 if (cached_entry) |entry| {
                     defer http_cache.?.allocator.free(entry.response);
+                    if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                    if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
+
                     log.warn("backend connection failed, serving stale content", .{});
                     _ = Writer.writeAll(&client_writer.interface, entry.response) catch {};
                     _ = Writer.flush(&client_writer.interface) catch {};
-                    decision.backend.decrementConnections();
                     continue;
                 }
 
@@ -1169,6 +1191,9 @@ pub const Proxy = struct {
                     }
 
                     defer http_cache.?.allocator.free(entry.response);
+                    if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                    if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
+
                     // Return cached response (using handle304 helper if we wanted, but direct write is fine)
                     _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
                         break;
@@ -1184,6 +1209,8 @@ pub const Proxy = struct {
                     // 200 OK or other code -> New content or error
                     // Free the stale entry since we won't use it
                     http_cache.?.allocator.free(entry.response);
+                    if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                    if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
                     cached_entry = null;
                 }
             }
@@ -1242,7 +1269,7 @@ pub const Proxy = struct {
                     streamed = true;
 
                     // If complete and within size, store in cache
-                    if (response_buffer.items.len <= tee_writer.max_size) {
+                    if (!tee_writer.was_truncated and response_buffer.items.len > 0) {
                         const ttl = cache_control.getTTL(300);
 
                         // Extract validators
@@ -1276,6 +1303,9 @@ pub const Proxy = struct {
                     break;
                 };
             }
+
+            decision.backend.decrementConnections();
+            decision.cluster.release();
 
             // End of Loop Iteration
         }
@@ -1384,11 +1414,16 @@ pub const Proxy = struct {
             buffer: *std.ArrayListUnmanaged(u8),
             max_size: usize,
             allocator: std.mem.Allocator,
+            was_truncated: bool = false,
 
             pub fn writeAll(self: *TeeSelf, bytes: []const u8) !void {
                 try self.child_writer.writeAll(bytes);
+                if (self.was_truncated) return;
+
                 if (self.buffer.items.len + bytes.len <= self.max_size) {
                     try self.buffer.appendSlice(self.allocator, bytes);
+                } else {
+                    self.was_truncated = true;
                 }
             }
 
@@ -2372,11 +2407,49 @@ pub const Proxy = struct {
             // If size 0, this is the last chunk
             if (chunk_size == 0) {
                 // Read/Write trailers until empty line
-                while (true) {
-                    const trailer_len = try readHeaders(reader, &header_buffer); // Reuse readHeaders logic for trailers
-                    try writer.writeAll(header_buffer[0..trailer_len]);
-                    if (trailer_len == 2) break; // \r\n
+                // State machine to detect empty line (\r\n at start of line)
+                var trailer_state: u8 = 0; // 0: start of line, 1: saw \r at start, 2: mid-line, 3: saw \r mid-line
+
+                trailers: while (true) {
+                    var byte: [1]u8 = undefined;
+                    var slices = [_][]u8{&byte};
+                    const n = try reader.readVec(&slices);
+                    if (n == 0) return error.UnexpectedEOF;
+
+                    try writer.writeAll(&byte);
+                    const c = byte[0];
+
+                    switch (trailer_state) {
+                        0 => { // Start of line
+                            if (c == '\r') {
+                                trailer_state = 1;
+                            } else {
+                                trailer_state = 2;
+                            }
+                        },
+                        1 => { // Saw \r at start
+                            if (c == '\n') {
+                                break :trailers;
+                            } else {
+                                trailer_state = 2;
+                            }
+                        },
+                        2 => { // Mid-line
+                            if (c == '\r') {
+                                trailer_state = 3;
+                            }
+                        },
+                        3 => { // Saw \r mid-line
+                            if (c == '\n') {
+                                trailer_state = 0;
+                            } else {
+                                trailer_state = 2;
+                            }
+                        },
+                        else => unreachable,
+                    }
                 }
+
                 if (@hasDecl(@TypeOf(writer.*), "flush")) {
                     try writer.flush();
                 }

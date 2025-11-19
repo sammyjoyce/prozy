@@ -1658,10 +1658,17 @@ pub const HTTPCache = struct {
 
             // Copy metadata
             var etag_copy: ?[]const u8 = null;
-            if (node.metadata.etag) |e| etag_copy = self.allocator.dupe(u8, e) catch null;
+            if (node.metadata.etag) |e| etag_copy = self.allocator.dupe(u8, e) catch {
+                self.allocator.free(response_copy);
+                return null;
+            };
 
             var last_modified_copy: ?[]const u8 = null;
-            if (node.metadata.last_modified) |l| last_modified_copy = self.allocator.dupe(u8, l) catch null;
+            if (node.metadata.last_modified) |l| last_modified_copy = self.allocator.dupe(u8, l) catch {
+                if (etag_copy) |e| self.allocator.free(e);
+                self.allocator.free(response_copy);
+                return null;
+            };
 
             const metadata = CacheMetadata{
                 .date_header = node.metadata.date_header,
