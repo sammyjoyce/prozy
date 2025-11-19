@@ -3145,7 +3145,6 @@ test "Router: cluster capacity handling" {
         .match = .{},
         .cluster = .{ .name = "small-cluster" },
         .concurrency_policy = .{
-            .max_concurrent = 10,
             .reject_when_full = true,
         },
     };

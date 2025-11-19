@@ -62,7 +62,7 @@ pub fn main() !void {
         var temp_io = Io.Threaded.init(gpa);
         defer temp_io.deinit();
 
-        if (addr_any.connect(temp_io.io(), .{ .mode = .stream }) catch null) |conn| {
+        if (addr_any.connect(temp_io.io(), .{ .mode = .stream, .timeout = Io.Timeout.none }) catch null) |conn| {
             conn.close(temp_io.io());
             backend_running = true;
             std.debug.print("   • Backend already running on port 3003 (skipping spawn)\n", .{});
@@ -201,7 +201,7 @@ pub fn main() !void {
         // so it can check the shutdown flag and exit.
         if (net.Ip4Address.parse("127.0.0.1", port) catch null) |wake_addr4| {
             const wake_addr = net.IpAddress{ .ip4 = wake_addr4 };
-            if (wake_addr.connect(io, .{ .mode = .stream }) catch null) |wake_conn| {
+            if (wake_addr.connect(io, .{ .mode = .stream, .timeout = Io.Timeout.none }) catch null) |wake_conn| {
                 wake_conn.close(io);
             } else {
                 std.debug.print("   (Failed to connect for shutdown - proxy might already be stopped)\n", .{});
@@ -230,10 +230,8 @@ fn clientTask(io: Io, addr: net.IpAddress, running: *std.atomic.Value(bool), req
     while (running.load(.monotonic)) {
         doRequest(io, addr, request, &buf) catch {
             _ = errors.fetchAdd(1, .monotonic);
-            // Don't tight loop on error
-            // std.time.sleep(1 * std.time.ms_per_s);
-            // Can't sleep in async easily without io.sleep, but we are in a task
-            // But we don't have access to sleep here unless we use io.concurrent(sleep)
+            // Prevent tight-looping on connection errors.
+            io.sleep(std.Io.Duration.fromMilliseconds(100), .awake) catch {};
             continue;
         };
         _ = requests.fetchAdd(1, .monotonic);
@@ -241,7 +239,7 @@ fn clientTask(io: Io, addr: net.IpAddress, running: *std.atomic.Value(bool), req
 }
 
 fn doRequest(io: Io, addr: net.IpAddress, request: []const u8, buf: []u8) !void {
-    var stream = try addr.connect(io, .{ .mode = .stream });
+    var stream = try addr.connect(io, .{ .mode = .stream, .timeout = Io.Timeout.none });
     defer stream.close(io);
 
     // Write request

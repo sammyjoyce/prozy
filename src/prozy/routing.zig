@@ -117,12 +117,6 @@ pub const TransformPolicy = struct {
 
 /// Concurrency limits for a route/cluster
 pub const ConcurrencyPolicy = struct {
-    /// Maximum concurrent connections allowed
-    max_concurrent: u32 = 1000,
-
-    /// Maximum queue depth when at capacity
-    max_queue_depth: u32 = 100,
-
     /// Whether to reject immediately (503) or queue when at capacity
     reject_when_full: bool = false,
 };

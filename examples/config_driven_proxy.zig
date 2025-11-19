@@ -23,7 +23,7 @@ pub fn main() !void {
 
     // Start watcher
     try manager.startWatcher(io);
-    defer manager.stopWatcher();
+    defer manager.stopWatcher(io);
 
     // Get initial config
     var lease = manager.getConfig();

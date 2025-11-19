@@ -1,5 +1,8 @@
 const std = @import("std");
 const prozy = @import("prozy");
+const Io = std.Io;
+const net = Io.net;
+const Timeout = Io.Timeout;
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
@@ -85,9 +88,36 @@ pub fn main() !void {
     }
 
     // Cleanup
-    // Currently Proxy doesn't support graceful stop via flag in runWithIo loop
-    // So we just detach and exit
-    proxy_thread.detach();
+    std.debug.print("🧹 Shutting down proxy gracefully...\n", .{});
+
+    // 1. Request shutdown
+    proxy.shutdown();
+
+    // 2. Wake up the accept loop with a dummy connection
+    // The proxy is blocked on accept(), so we need one more connection to unblock it
+    // so it can check the shutdown flag and exit.
+    const wake_host = "127.0.0.1";
+    const wake_port = 8085;
+    // Resolve address (net.IpAddress.resolve takes 3 args: io, host, port)
+    const resolved_wake_addr = net.IpAddress.resolve(io, wake_host, wake_port) catch null;
+    if (resolved_wake_addr) |addr| {
+        // Connect using the resolved address and ConnectOptions
+        const connect_options = net.IpAddress.ConnectOptions{
+            .mode = .stream,
+            .timeout = Timeout.none,
+        };
+        if (addr.connect(io, connect_options) catch null) |wake_conn| {
+            wake_conn.close(io);
+        } else {
+            std.debug.print("   (Failed to connect for shutdown - proxy might already be stopped)\n", .{});
+        }
+    } else {
+        std.debug.print("   (Failed to resolve address for shutdown connection)\n", .{});
+    }
+
+    // 3. Join the proxy thread
+    proxy_thread.join();
+
 }
 
 fn runProxy(proxy: *prozy.Proxy, io: std.Io) void {

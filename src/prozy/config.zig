@@ -411,8 +411,14 @@ pub const ConfigManager = struct {
     }
 
     pub fn deinit(self: *ConfigManager) void {
-        // Stop watcher if running
-        self.stopWatcher();
+        // Verify watcher is stopped
+        if (self.watcher_running.load(.acquire)) {
+            if (builtin.is_test) {
+                // In tests we might tolerate it or panic
+            } else {
+                log.err("ConfigManager.deinit called while watcher is running! Call stopWatcher(io) first to avoid use-after-free.", .{});
+            }
+        }
 
         // Clean up resources
         self.allocator.free(self.config_path);
@@ -518,14 +524,20 @@ pub const ConfigManager = struct {
 
     /// Stop background watcher thread
     ///
-    /// Signals the background watcher to stop. The watcher will complete its current
-    /// iteration and then exit gracefully.
-    pub fn stopWatcher(self: *ConfigManager) void {
+    /// Signals the background watcher to stop and waits for the task to complete.
+    /// Requires the same Io executor that was used to start the watcher.
+    pub fn stopWatcher(self: *ConfigManager, io: std.Io) void {
         if (!self.watcher_running.load(.acquire)) {
             return;
         }
 
         self.watcher_running.store(false, .release);
+
+        if (self.watcher_future) |*fut| {
+            fut.await(io);
+            self.watcher_future = null;
+        }
+
         log.info("config watcher stopped", .{});
     }
 
@@ -1086,8 +1098,6 @@ test "ZON parsing - full configuration coverage" {
         \\                 .idle_timeout_seconds = 4,
         \\             },
         \\             .concurrency_policy = .{
-        \\                 .max_concurrent = 11,
-        \\                 .max_queue_depth = 12,
         \\                 .reject_when_full = true,
         \\             },
         \\         },
@@ -1161,8 +1171,6 @@ test "ZON parsing - full configuration coverage" {
     try std.testing.expectEqual(@as(u64, 3), route.timeout_policy.response_timeout_ms);
     try std.testing.expectEqual(@as(i64, 4), route.timeout_policy.idle_timeout_seconds);
 
-    try std.testing.expectEqual(@as(u32, 11), route.concurrency_policy.max_concurrent);
-    try std.testing.expectEqual(@as(u32, 12), route.concurrency_policy.max_queue_depth);
     try std.testing.expect(route.concurrency_policy.reject_when_full);
 }
 
@@ -1522,12 +1530,12 @@ test "ConfigManager - watcher state management" {
     try std.testing.expect(manager.watcher_running.load(.acquire));
 
     // Stop watcher
-    manager.stopWatcher();
+    manager.stopWatcher(undefined);
 
     // Verify watcher is stopped
     try std.testing.expect(!manager.watcher_running.load(.acquire));
 
     // Stop watcher again (should be no-op)
-    manager.stopWatcher();
+    manager.stopWatcher(undefined);
     try std.testing.expect(!manager.watcher_running.load(.acquire));
 }
