@@ -56,6 +56,18 @@ zig build test_e2e
 zig build full_features
 ```
 
+### Benchmarking
+```bash
+# Run performance benchmark (starts backend and proxy automatically)
+zig build benchmark
+
+# Run with custom parameters
+zig build benchmark -- --connections 100 --duration 30
+
+# Run against existing infrastructure (skip setup)
+zig build benchmark -- --skip-setup --port 8080
+```
+
 ### Testing
 ```bash
 # Unit tests (40+ tests covering all features)

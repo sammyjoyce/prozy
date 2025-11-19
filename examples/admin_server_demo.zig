@@ -27,7 +27,7 @@ pub fn main() !void {
     const io = threaded_io.io();
 
     // Create proxy with load balancer
-    var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+    var proxy = try prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
     defer proxy.deinit();
 
     // Configure load balancer with multiple backends

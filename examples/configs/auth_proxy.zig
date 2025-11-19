@@ -19,7 +19,7 @@ pub fn main() !void {
     defer threaded_io.deinit();
     const io = threaded_io.io();
 
-    var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+    var proxy = try prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
     defer proxy.deinit();
 
     // Enable RFC 7235 proxy authentication

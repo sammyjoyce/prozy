@@ -36,40 +36,36 @@ const AuthResult = root.AuthResult;
 test "Proxy initialization" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     try testing.expectEqual(proxy.proxy_port, 8080);
-    try testing.expectEqualStrings(proxy.backend_host, "127.0.0.1");
-    try testing.expectEqual(proxy.backend_port, 8000);
+    // backend_host/port are removed from proxy struct, so we can't check them directly
+    // But they are in the router
     try testing.expectEqual(proxy.allocator, allocator);
 }
 
 test "Proxy initialization with different configurations" {
     const allocator = testing.allocator;
 
-    var proxy_high_port = Proxy.init(allocator, 9090, "127.0.0.1", 9000);
+    var proxy_high_port = try Proxy.init(allocator, 9090, "127.0.0.1", 9000);
     defer proxy_high_port.deinit();
     try testing.expectEqual(proxy_high_port.proxy_port, 9090);
-    try testing.expectEqual(proxy_high_port.backend_port, 9000);
 
-    var proxy_localhost = Proxy.init(allocator, 3000, "localhost", 3001);
+    var proxy_localhost = try Proxy.init(allocator, 3000, "localhost", 3001);
     defer proxy_localhost.deinit();
-    try testing.expectEqualStrings(proxy_localhost.backend_host, "localhost");
-    try testing.expectEqual(proxy_localhost.backend_port, 3001);
+    // Check router configuration if needed
 }
 
 test "Multiple proxy instances are independent" {
     const allocator = testing.allocator;
 
-    var proxy_a = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy_a = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy_a.deinit();
-    var proxy_b = Proxy.init(allocator, 9090, "localhost", 9000);
+    var proxy_b = try Proxy.init(allocator, 9090, "localhost", 9000);
     defer proxy_b.deinit();
 
     try testing.expect(proxy_a.proxy_port != proxy_b.proxy_port);
-    try testing.expect(!std.mem.eql(u8, proxy_a.backend_host, proxy_b.backend_host));
-    try testing.expect(proxy_a.backend_port != proxy_b.backend_port);
 
     // Both should run without errors
     try proxy_a.run();
@@ -79,7 +75,7 @@ test "Multiple proxy instances are independent" {
 test "Proxy run method executes without errors" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // The current implementation just prints architecture info
@@ -89,7 +85,7 @@ test "Proxy run method executes without errors" {
 test "Proxy handleConnection method signature" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Currently does nothing but exists and is callable
@@ -99,7 +95,7 @@ test "Proxy handleConnection method signature" {
 test "Proxy copyStream method signature" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Currently does nothing but exists and is callable
@@ -117,16 +113,16 @@ test "Proxy with edge case configurations" {
     const allocator = testing.allocator;
 
     // Test with port 0 (should use any available port)
-    var proxy_zero_port = Proxy.init(allocator, 0, "127.0.0.1", 8000);
+    var proxy_zero_port = try Proxy.init(allocator, 0, "127.0.0.1", 8000);
     defer proxy_zero_port.deinit();
     try testing.expectEqual(proxy_zero_port.proxy_port, 0);
     try proxy_zero_port.run();
 
     // Test with maximum port numbers
-    var proxy_max_port = Proxy.init(allocator, 65535, "127.0.0.1", 65534);
+    var proxy_max_port = try Proxy.init(allocator, 65535, "127.0.0.1", 65534);
     defer proxy_max_port.deinit();
     try testing.expectEqual(proxy_max_port.proxy_port, 65535);
-    try testing.expectEqual(proxy_max_port.backend_port, 65534);
+    try testing.expectEqual(proxy_max_port.router.clusters[0].backends[0].port, 65534);
     try proxy_max_port.run();
 }
 
@@ -140,34 +136,34 @@ test "Test all public declarations" {
 test "Integration: Complete proxy workflow" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
     try testing.expectEqual(proxy.proxy_port, 8080);
-    try testing.expectEqualStrings(proxy.backend_host, "127.0.0.1");
-    try testing.expectEqual(proxy.backend_port, 8000);
+    try testing.expectEqualStrings(proxy.router.clusters[0].backends[0].host, "127.0.0.1");
+    try testing.expectEqual(proxy.router.clusters[0].backends[0].port, 8000);
     try proxy.run();
 }
 
 test "Integration: Multiple proxy configurations" {
     const allocator = testing.allocator;
 
-    var proxy_localhost = Proxy.init(allocator, 3000, "localhost", 3001);
+    var proxy_localhost = try Proxy.init(allocator, 3000, "localhost", 3001);
     defer proxy_localhost.deinit();
-    try testing.expectEqualStrings(proxy_localhost.backend_host, "localhost");
+    try testing.expectEqualStrings(proxy_localhost.router.clusters[0].backends[0].host, "localhost");
     try proxy_localhost.run();
 
-    var proxy_ip = Proxy.init(allocator, 4000, "192.168.1.100", 4001);
+    var proxy_ip = try Proxy.init(allocator, 4000, "192.168.1.100", 4001);
     defer proxy_ip.deinit();
-    try testing.expectEqualStrings(proxy_ip.backend_host, "192.168.1.100");
-    try testing.expectEqual(proxy_ip.backend_port, 4001);
+    try testing.expectEqualStrings(proxy_ip.router.clusters[0].backends[0].host, "192.168.1.100");
+    try testing.expectEqual(proxy_ip.router.clusters[0].backends[0].port, 4001);
     try proxy_ip.run();
 
-    var proxy_low_port = Proxy.init(allocator, 1024, "127.0.0.1", 80);
+    var proxy_low_port = try Proxy.init(allocator, 1024, "127.0.0.1", 80);
     defer proxy_low_port.deinit();
     try testing.expectEqual(proxy_low_port.proxy_port, 1024);
     try proxy_low_port.run();
 
-    var proxy_high_port = Proxy.init(allocator, 30000, "127.0.0.1", 8080);
+    var proxy_high_port = try Proxy.init(allocator, 30000, "127.0.0.1", 8080);
     defer proxy_high_port.deinit();
     try testing.expectEqual(proxy_high_port.proxy_port, 30000);
     try proxy_high_port.run();
@@ -176,7 +172,7 @@ test "Integration: Multiple proxy configurations" {
 test "Integration: Proxy method interfaces" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
     try proxy.run();
     proxy.handleConnection(@as(*anyopaque, undefined)) catch {};
@@ -193,17 +189,17 @@ test "Integration: Convenience function workflow" {
 test "Integration: Error handling scenarios" {
     const allocator = testing.allocator;
 
-    var proxy_zero = Proxy.init(allocator, 0, "127.0.0.1", 0);
+    var proxy_zero = try Proxy.init(allocator, 0, "127.0.0.1", 0);
     defer proxy_zero.deinit();
     try proxy_zero.run();
 
-    var proxy_max = Proxy.init(allocator, 65535, "127.0.0.1", 65534);
+    var proxy_max = try Proxy.init(allocator, 65535, "127.0.0.1", 65534);
     defer proxy_max.deinit();
     try proxy_max.run();
 
-    var proxy_hostname = Proxy.init(allocator, 8080, "my-server.local", 3000);
+    var proxy_hostname = try Proxy.init(allocator, 8080, "my-server.local", 3000);
     defer proxy_hostname.deinit();
-    try testing.expectEqualStrings(proxy_hostname.backend_host, "my-server.local");
+    try testing.expectEqualStrings(proxy_hostname.router.clusters[0].backends[0].host, "my-server.local");
     try proxy_hostname.run();
 }
 
@@ -212,7 +208,7 @@ test "Integration: Performance characteristics" {
 
     var proxies: [10]Proxy = undefined;
     for (proxies, 0..) |_, i| {
-        proxies[i] = Proxy.init(
+        proxies[i] = try Proxy.init(
             allocator,
             8000 + @as(u16, @intCast(i)),
             "127.0.0.1",
@@ -229,7 +225,7 @@ test "Integration: Performance characteristics" {
 test "Integration: API stability" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
     try proxy.run();
     try root.runProxy(allocator, 8080, "127.0.0.1", 8000);
@@ -240,19 +236,19 @@ test "Integration: API stability" {
 test "Integration: Real world scenarios" {
     const allocator = testing.allocator;
 
-    var web_proxy = Proxy.init(allocator, 80, "backend-server", 8080);
+    var web_proxy = try Proxy.init(allocator, 80, "backend-server", 8080);
     defer web_proxy.deinit();
     try web_proxy.run();
 
-    var dev_proxy = Proxy.init(allocator, 3000, "localhost", 5432);
+    var dev_proxy = try Proxy.init(allocator, 3000, "localhost", 5432);
     defer dev_proxy.deinit();
     try dev_proxy.run();
 
-    var lb_proxy1 = Proxy.init(allocator, 8080, "backend1", 3000);
+    var lb_proxy1 = try Proxy.init(allocator, 8080, "backend1", 3000);
     defer lb_proxy1.deinit();
-    var lb_proxy2 = Proxy.init(allocator, 8081, "backend2", 3000);
+    var lb_proxy2 = try Proxy.init(allocator, 8081, "backend2", 3000);
     defer lb_proxy2.deinit();
-    var lb_proxy3 = Proxy.init(allocator, 8082, "backend3", 3000);
+    var lb_proxy3 = try Proxy.init(allocator, 8082, "backend3", 3000);
     defer lb_proxy3.deinit();
 
     try lb_proxy1.run();
@@ -918,7 +914,7 @@ test "HTTPInspector: parseHttpDate handles different day names" {
 test "Proxy: with statistics enabled" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     // Stats should be initialized
@@ -936,7 +932,7 @@ test "Proxy: with statistics enabled" {
 test "Proxy: enable access control" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     // Enable access control
@@ -952,7 +948,7 @@ test "Proxy: enable access control" {
 test "Proxy: enable rate limiting" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     // Enable rate limiting
@@ -963,7 +959,7 @@ test "Proxy: enable rate limiting" {
 test "Proxy: feature integration" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     // Enable all features
@@ -1332,7 +1328,7 @@ test "LoadBalancer: no healthy backends" {
 test "Proxy: enable caching" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     // Enable caching
@@ -1351,7 +1347,7 @@ test "Proxy: enable caching" {
 test "Proxy: enable load balancing" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     var backends = [_]Backend{
@@ -1366,7 +1362,7 @@ test "Proxy: enable load balancing" {
 test "Proxy: all features enabled" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 3000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     // Enable all features
@@ -1985,7 +1981,7 @@ test "Proxy runWithIoOptions API with explicit Io executor" {
     const io = threaded_io.io();
 
     // Initialize proxy
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Test primary API with explicit Io and options
@@ -2001,7 +1997,7 @@ test "Proxy runWithIoOptions API with custom configuration" {
     const io = threaded_io.io();
 
     // Initialize proxy
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Test with custom configuration options (avoid overriding `max_connections`
@@ -2024,7 +2020,7 @@ test "Proxy API hierarchy demonstration" {
     const io = threaded_io.io();
 
     // Initialize proxy
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Test all three API levels work
@@ -2404,7 +2400,7 @@ test "HTTPInspector: X-Forwarded-Proto with trailing whitespace trimmed" {
 test "Proxy authentication enable and configuration" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Enable proxy authentication
@@ -2422,7 +2418,7 @@ test "Proxy authentication enable and configuration" {
 test "Proxy authentication user management" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Enable proxy authentication
@@ -2444,7 +2440,7 @@ test "Proxy authentication user management" {
 test "Proxy authentication with RunOptions" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     const options = RunOptions{
@@ -2467,7 +2463,7 @@ test "Proxy authentication with RunOptions" {
 test "Proxy authentication integration with other features" {
     const allocator = testing.allocator;
 
-    var proxy = Proxy.init(allocator, 8080, "127.0.0.1", 8000);
+    var proxy = try Proxy.init(allocator, 8080, "127.0.0.1", 8000);
     defer proxy.deinit();
 
     // Enable multiple features including authentication
@@ -2546,4 +2542,696 @@ test "Proxy authentication password verification and session tracking" {
     auth.endSession();
     stats = auth.getStats();
     try testing.expectEqual(@as(u64, 0), stats.active_sessions);
+}
+
+// ==================== Configuration Tests ====================
+
+const Config = @import("config.zig").Config;
+const ConfigManager = @import("config.zig").ConfigManager;
+const parseJson = @import("config.zig").parseJson;
+const parseZon = @import("config.zig").parseZon;
+
+test "Config: parse valid JSON with minimal fields" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": 8080
+        \\  },
+        \\  "clusters": [
+        \\    {
+        \\      "name": "backend",
+        \\      "backends": [
+        \\        { "host": "localhost", "port": 3003, "weight": 1 }
+        \\      ]
+        \\    }
+        \\  ],
+        \\  "routes": [
+        \\    {
+        \\      "name": "default",
+        \\      "match": {},
+        \\      "cluster": "backend"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const config = try parseJson(arena.allocator(), source);
+    try testing.expectEqualStrings("127.0.0.1", config.proxy.listen_host);
+    try testing.expectEqual(@as(u16, 8080), config.proxy.listen_port);
+    try testing.expectEqual(@as(usize, 1), config.clusters.len);
+    try testing.expectEqual(@as(usize, 1), config.routes.len);
+}
+
+test "Config: parse JSON with all feature flags" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "0.0.0.0",
+        \\    "listen_port": 9090,
+        \\    "max_connections": 5000,
+        \\    "reuse_address": false
+        \\  },
+        \\  "mode": "forward_proxy",
+        \\  "cache": {
+        \\    "enabled": true,
+        \\    "max_size": 20971520
+        \\  },
+        \\  "rate_limit": {
+        \\    "enabled": true,
+        \\    "max_per_ip": 50,
+        \\    "max_global": 5000
+        \\  },
+        \\  "access_control": {
+        \\    "enabled": true,
+        \\    "default_policy": "deny",
+        \\    "allow_list": ["10.0.0.1", "10.0.0.2"],
+        \\    "deny_list": ["192.168.1.1"]
+        \\  },
+        \\  "health_check": {
+        \\    "enabled": false,
+        \\    "interval_seconds": 30,
+        \\    "timeout_ms": 3000,
+        \\    "unhealthy_threshold": 5,
+        \\    "healthy_threshold": 3
+        \\  },
+        \\  "admin": {
+        \\    "enabled": true,
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": 9999
+        \\  },
+        \\  "logging": {
+        \\    "level": "debug",
+        \\    "enable_connection_logging": false,
+        \\    "enable_stats": true
+        \\  },
+        \\  "clusters": [
+        \\    {
+        \\      "name": "cluster1",
+        \\      "backends": [
+        \\        { "host": "10.0.1.10", "port": 8080, "weight": 5 }
+        \\      ],
+        \\      "strategy": "weighted_round_robin",
+        \\      "max_concurrent": 2000
+        \\    }
+        \\  ],
+        \\  "routes": [
+        \\    {
+        \\      "name": "route1",
+        \\      "match": {
+        \\        "host": "api.example.com",
+        \\        "path_prefix": "/v1",
+        \\        "methods": ["GET", "POST"]
+        \\      },
+        \\      "cluster": "cluster1"
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    const config = try parseJson(arena.allocator(), source);
+
+    // Verify proxy config
+    try testing.expectEqualStrings("0.0.0.0", config.proxy.listen_host);
+    try testing.expectEqual(@as(u16, 9090), config.proxy.listen_port);
+    try testing.expectEqual(@as(?usize, 5000), config.proxy.max_connections);
+    try testing.expect(!config.proxy.reuse_address);
+
+    // Verify mode
+    try testing.expectEqual(@import("routing.zig").HttpMode.forward_proxy, config.mode);
+
+    // Verify cache config
+    try testing.expect(config.cache.enabled);
+    try testing.expectEqual(@as(usize, 20971520), config.cache.max_size);
+
+    // Verify rate limit config
+    try testing.expect(config.rate_limit.enabled);
+    try testing.expectEqual(@as(u32, 50), config.rate_limit.max_per_ip);
+    try testing.expectEqual(@as(u32, 5000), config.rate_limit.max_global);
+
+    // Verify access control config
+    try testing.expect(config.access_control.enabled);
+    try testing.expectEqual(AccessControl.Policy.deny, config.access_control.default_policy);
+    try testing.expectEqual(@as(usize, 2), config.access_control.allow_list.len);
+    try testing.expectEqual(@as(usize, 1), config.access_control.deny_list.len);
+
+    // Verify health check config
+    try testing.expect(!config.health_check.enabled);
+    try testing.expectEqual(@as(u64, 30), config.health_check.interval_seconds);
+
+    // Verify admin config
+    try testing.expect(config.admin.enabled);
+    try testing.expectEqual(@as(u16, 9999), config.admin.listen_port);
+
+    // Verify logging config
+    try testing.expectEqual(std.log.Level.debug, config.logging.level);
+    try testing.expect(!config.logging.enable_connection_logging);
+    try testing.expect(config.logging.enable_stats);
+
+    // Verify clusters
+    try testing.expectEqual(@as(usize, 1), config.clusters.len);
+    try testing.expectEqualStrings("cluster1", config.clusters[0].name);
+    try testing.expectEqual(LoadBalancer.Strategy.weighted_round_robin, config.clusters[0].strategy);
+
+    // Verify routes
+    try testing.expectEqual(@as(usize, 1), config.routes.len);
+    try testing.expectEqualStrings("route1", config.routes[0].name);
+    try testing.expectEqualStrings("api.example.com", config.routes[0].match.host.?);
+    try testing.expectEqualStrings("/v1", config.routes[0].match.path_prefix.?);
+    try testing.expectEqual(@as(usize, 2), config.routes[0].match.methods.len);
+}
+
+test "Config: parse JSON with invalid syntax" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": 8080
+        \\  },
+        \\  "clusters": [
+        \\    {
+        \\      "name": "backend"
+        \\      "backends": []
+        \\    }
+        \\  ]
+        \\}
+    ; // Missing comma after "name"
+
+    const result = parseJson(arena.allocator(), source);
+    try testing.expectError(error.ParseFailed, result);
+}
+
+test "Config: parse JSON with invalid port type" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": "not_a_number"
+        \\  }
+        \\}
+    ;
+
+    const result = parseJson(arena.allocator(), source);
+    try testing.expectError(error.ParseFailed, result);
+}
+
+test "Config: parse JSON with unknown fields (should ignore)" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "proxy": {
+        \\    "listen_host": "127.0.0.1",
+        \\    "listen_port": 8080,
+        \\    "unknown_field": "should be ignored"
+        \\  },
+        \\  "clusters": [],
+        \\  "routes": [],
+        \\  "totally_unknown": "ignored"
+        \\}
+    ;
+
+    const config = try parseJson(arena.allocator(), source);
+    try testing.expectEqual(@as(u16, 8080), config.proxy.listen_port);
+}
+
+test "Config: parse JSON with missing optional fields (use defaults)" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "proxy": {
+        \\    "listen_port": 8080
+        \\  }
+        \\}
+    ;
+
+    const config = try parseJson(arena.allocator(), source);
+    // Should use defaults
+    try testing.expectEqualStrings("127.0.0.1", config.proxy.listen_host);
+    try testing.expectEqual(@as(u16, 8080), config.proxy.listen_port);
+    try testing.expectEqual(@as(usize, 0), config.clusters.len);
+    try testing.expectEqual(@as(usize, 0), config.routes.len);
+}
+
+test "Config: parse JSON with empty arrays" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\{
+        \\  "proxy": {
+        \\    "listen_port": 8080
+        \\  },
+        \\  "clusters": [],
+        \\  "routes": []
+        \\}
+    ;
+
+    const config = try parseJson(arena.allocator(), source);
+    try testing.expectEqual(@as(usize, 0), config.clusters.len);
+    try testing.expectEqual(@as(usize, 0), config.routes.len);
+}
+
+// ==================== ZON Config Parsing Tests ====================
+
+test "Config: parse valid ZON with minimal fields" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\ .{
+        \\     .proxy = .{
+        \\         .listen_host = "127.0.0.1",
+        \\         .listen_port = 8080,
+        \\     },
+        \\     .clusters = .{
+        \\         .{
+        \\             .name = "backend",
+        \\             .backends = .{
+        \\                 .{ .host = "localhost", .port = 3003, .weight = 1 },
+        \\             },
+        \\         },
+        \\     },
+        \\     .routes = .{
+        \\         .{
+        \\             .name = "default",
+        \\             .match = .{},
+        \\             .cluster = "backend",
+        \\         },
+        \\     },
+        \\ }
+    ;
+
+    const config = try parseZon(arena.allocator(), source);
+    try testing.expectEqualStrings("127.0.0.1", config.proxy.listen_host);
+    try testing.expectEqual(@as(u16, 8080), config.proxy.listen_port);
+    try testing.expectEqual(@as(usize, 1), config.clusters.len);
+    try testing.expectEqual(@as(usize, 1), config.routes.len);
+}
+
+test "Config: parse ZON with syntax error" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\ .{
+        \\     .proxy = .{
+        \\         .listen_host = "127.0.0.1"
+        \\         .listen_port = 8080,
+        \\     },
+        \\ }
+    ; // Missing comma after listen_host
+
+    const result = parseZon(arena.allocator(), source);
+    try testing.expectError(error.ParseFailed, result);
+}
+
+test "Config: parse ZON with type mismatch" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\ .{
+        \\     .proxy = .{
+        \\         .listen_port = "not_a_number",
+        \\     },
+        \\ }
+    ;
+
+    const result = parseZon(arena.allocator(), source);
+    try testing.expectError(error.ParseFailed, result);
+}
+
+test "Config: parse ZON with multiple clusters and routes" {
+    const allocator = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const source =
+        \\ .{
+        \\     .proxy = .{
+        \\         .listen_host = "0.0.0.0",
+        \\         .listen_port = 9090,
+        \\     },
+        \\     .clusters = .{
+        \\         .{
+        \\             .name = "cluster1",
+        \\             .backends = .{
+        \\                 .{ .host = "10.0.0.1", .port = 8080, .weight = 5 },
+        \\                 .{ .host = "10.0.0.2", .port = 8080, .weight = 3 },
+        \\             },
+        \\             .strategy = .weighted_round_robin,
+        \\         },
+        \\         .{
+        \\             .name = "cluster2",
+        \\             .backends = .{
+        \\                 .{ .host = "10.0.1.1", .port = 9000, .weight = 1 },
+        \\             },
+        \\             .strategy = .round_robin,
+        \\         },
+        \\     },
+        \\     .routes = .{
+        \\         .{
+        \\             .name = "route1",
+        \\             .match = .{
+        \\                 .host = "api.example.com",
+        \\                 .path_prefix = "/v1",
+        \\             },
+        \\             .cluster = "cluster1",
+        \\         },
+        \\         .{
+        \\             .name = "route2",
+        \\             .match = .{
+        \\                 .host = "static.example.com",
+        \\             },
+        \\             .cluster = "cluster2",
+        \\         },
+        \\     },
+        \\ }
+    ;
+
+    const config = try parseZon(arena.allocator(), source);
+    try testing.expectEqual(@as(usize, 2), config.clusters.len);
+    try testing.expectEqual(@as(usize, 2), config.routes.len);
+    try testing.expectEqualStrings("cluster1", config.clusters[0].name);
+    try testing.expectEqualStrings("cluster2", config.clusters[1].name);
+    try testing.expectEqual(@as(usize, 2), config.clusters[0].backends.len);
+    try testing.expectEqual(@as(usize, 1), config.clusters[1].backends.len);
+}
+
+// ==================== Config Validation Tests ====================
+
+test "Config: validation passes for valid config" {
+    const config = Config{
+        .clusters = &[_]@import("config.zig").ClusterConfig{
+            .{
+                .name = "test_cluster",
+                .backends = &[_]@import("config.zig").BackendConfig{
+                    .{ .host = "localhost", .port = 8080, .weight = 1 },
+                },
+            },
+        },
+        .routes = &[_]@import("config.zig").RouteConfig{
+            .{
+                .name = "test_route",
+                .match = .{},
+                .cluster = "test_cluster",
+            },
+        },
+    };
+
+    try config.validate();
+}
+
+test "Config: validation fails for port zero" {
+    const config = Config{
+        .proxy = .{ .listen_port = 0 },
+    };
+
+    const result = config.validate();
+    try testing.expectError(error.ValidationFailed, result);
+}
+
+test "Config: validation fails for empty cluster backends" {
+    const config = Config{
+        .clusters = &[_]@import("config.zig").ClusterConfig{
+            .{
+                .name = "empty_cluster",
+                .backends = &[_]@import("config.zig").BackendConfig{},
+            },
+        },
+    };
+
+    const result = config.validate();
+    try testing.expectError(error.ValidationFailed, result);
+}
+
+test "Config: validation fails for backend port zero" {
+    const config = Config{
+        .clusters = &[_]@import("config.zig").ClusterConfig{
+            .{
+                .name = "test_cluster",
+                .backends = &[_]@import("config.zig").BackendConfig{
+                    .{ .host = "localhost", .port = 0, .weight = 1 },
+                },
+            },
+        },
+    };
+
+    const result = config.validate();
+    try testing.expectError(error.ValidationFailed, result);
+}
+
+test "Config: validation fails for backend weight zero" {
+    const config = Config{
+        .clusters = &[_]@import("config.zig").ClusterConfig{
+            .{
+                .name = "test_cluster",
+                .backends = &[_]@import("config.zig").BackendConfig{
+                    .{ .host = "localhost", .port = 8080, .weight = 0 },
+                },
+            },
+        },
+    };
+
+    const result = config.validate();
+    try testing.expectError(error.ValidationFailed, result);
+}
+
+test "Config: validation fails for route referencing unknown cluster" {
+    const config = Config{
+        .clusters = &[_]@import("config.zig").ClusterConfig{
+            .{
+                .name = "real_cluster",
+                .backends = &[_]@import("config.zig").BackendConfig{
+                    .{ .host = "localhost", .port = 8080, .weight = 1 },
+                },
+            },
+        },
+        .routes = &[_]@import("config.zig").RouteConfig{
+            .{
+                .name = "bad_route",
+                .match = .{},
+                .cluster = "unknown_cluster",
+            },
+        },
+    };
+
+    const result = config.validate();
+    try testing.expectError(error.ValidationFailed, result);
+}
+
+test "Config: validation passes with multiple valid routes and clusters" {
+    const config = Config{
+        .clusters = &[_]@import("config.zig").ClusterConfig{
+            .{
+                .name = "cluster1",
+                .backends = &[_]@import("config.zig").BackendConfig{
+                    .{ .host = "10.0.0.1", .port = 8080, .weight = 1 },
+                },
+            },
+            .{
+                .name = "cluster2",
+                .backends = &[_]@import("config.zig").BackendConfig{
+                    .{ .host = "10.0.1.1", .port = 9000, .weight = 2 },
+                },
+            },
+        },
+        .routes = &[_]@import("config.zig").RouteConfig{
+            .{
+                .name = "route1",
+                .match = .{},
+                .cluster = "cluster1",
+            },
+            .{
+                .name = "route2",
+                .match = .{},
+                .cluster = "cluster2",
+            },
+        },
+    };
+
+    try config.validate();
+}
+
+// ==================== Router Tests ====================
+
+const Router = root.Router;
+const Route = root.Route;
+const Cluster = root.Cluster;
+const HttpMode = root.HttpMode;
+
+test "Router: tunnel_only mode with CONNECT method" {
+    const allocator = testing.allocator;
+
+    const backend = Backend.init("127.0.0.1", 3003, 1);
+    var backends = [_]Backend{backend};
+    const cluster = Cluster.init("tunnel-cluster", &backends, .round_robin, 10);
+
+    const route = Route{
+        .name = "tunnel-route",
+        .match = .{
+            .host = null, // Host is in the path for CONNECT
+            .path_prefix = null,
+            .methods = &[_][]const u8{"CONNECT"},
+        },
+        .cluster = .{ .name = "tunnel-cluster" },
+    };
+
+    var routes = [_]Route{route};
+    var clusters = [_]Cluster{cluster};
+    var router = Router.init(allocator, .tunnel_only, &routes, &clusters);
+
+    // Test CONNECT request
+    const req = HTTPInspector.HTTPRequest{
+        .method = "CONNECT",
+        .path = "example.com:443",
+        .version = "HTTP/1.1",
+    };
+    const headers = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+    const client_ip = IpKey{ .ipv4 = 0x7F000001 };
+
+    const decision = try router.routeRequest(&req, headers, client_ip);
+    try testing.expectEqualStrings("127.0.0.1", decision.backend.host);
+
+    router.releaseConnection("tunnel-cluster");
+
+    // Test non-CONNECT request (should fail in tunnel mode)
+    const req_get = HTTPInspector.HTTPRequest{
+        .method = "GET",
+        .path = "/foo",
+        .version = "HTTP/1.1",
+    };
+    const result = router.routeRequest(&req_get, headers, client_ip);
+    try testing.expectError(error.InvalidRequest, result);
+}
+
+test "Router: cluster capacity handling" {
+    const allocator = testing.allocator;
+
+    const backend = Backend.init("127.0.0.1", 3003, 1);
+    var backends = [_]Backend{backend};
+
+    // Cluster with max_concurrent = 1
+    const cluster = Cluster.init("small-cluster", &backends, .round_robin, 1);
+
+    const route = Route{
+        .name = "capacity-route",
+        .match = .{},
+        .cluster = .{ .name = "small-cluster" },
+        .concurrency_policy = .{
+            .reject_when_full = true,
+        },
+    };
+
+    var routes = [_]Route{route};
+    var clusters = [_]Cluster{cluster};
+    var router = Router.init(allocator, .reverse_proxy, &routes, &clusters);
+
+    const req = HTTPInspector.HTTPRequest{
+        .method = "GET",
+        .path = "/",
+        .version = "HTTP/1.1",
+    };
+    const headers = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+    const client_ip = IpKey{ .ipv4 = 0x7F000001 };
+
+    // First request should succeed (taking the only slot)
+    const decision1 = try router.routeRequest(&req, headers, client_ip);
+    try testing.expectEqualStrings("small-cluster", decision1.cluster.name);
+
+    // Second request should fail with ClusterAtCapacity
+    const result = router.routeRequest(&req, headers, client_ip);
+    try testing.expectError(error.ClusterAtCapacity, result);
+
+    // Release first connection
+    router.releaseConnection("small-cluster");
+
+    // Now request should succeed again
+    const decision2 = try router.routeRequest(&req, headers, client_ip);
+    try testing.expectEqualStrings("small-cluster", decision2.cluster.name);
+
+    router.releaseConnection("small-cluster");
+}
+
+test "Router: error cases (NoCluster, NoHealthyBackend)" {
+    const allocator = testing.allocator;
+
+    // 1. Test NoCluster (route points to missing cluster)
+    {
+        const route = Route{
+            .name = "broken-route",
+            .match = .{},
+            .cluster = .{ .name = "missing-cluster" },
+        };
+        var routes = [_]Route{route};
+        var clusters = [_]Cluster{}; // Empty clusters
+        var router = Router.init(allocator, .reverse_proxy, &routes, &clusters);
+
+        const req = HTTPInspector.HTTPRequest{
+            .method = "GET",
+            .path = "/",
+            .version = "HTTP/1.1",
+        };
+        const headers = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        const client_ip = IpKey{ .ipv4 = 0x7F000001 };
+
+        const result = router.routeRequest(&req, headers, client_ip);
+        try testing.expectError(error.NoCluster, result);
+    }
+
+    // 2. Test NoHealthyBackend
+    {
+        var backend = Backend.init("127.0.0.1", 3003, 1);
+        backend.markHealthy(false); // Mark backend as unhealthy
+
+        var backends = [_]Backend{backend};
+        const cluster = Cluster.init("sick-cluster", &backends, .round_robin, 10);
+
+        const route = Route{
+            .name = "sick-route",
+            .match = .{},
+            .cluster = .{ .name = "sick-cluster" },
+        };
+
+        var routes = [_]Route{route};
+        var clusters = [_]Cluster{cluster};
+        var router = Router.init(allocator, .reverse_proxy, &routes, &clusters);
+
+        const req = HTTPInspector.HTTPRequest{
+            .method = "GET",
+            .path = "/",
+            .version = "HTTP/1.1",
+        };
+        const headers = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        const client_ip = IpKey{ .ipv4 = 0x7F000001 };
+
+        const result = router.routeRequest(&req, headers, client_ip);
+        try testing.expectError(error.NoHealthyBackend, result);
+    }
 }

@@ -1,0 +1,67 @@
+{
+  "proxy": {
+    "listen_host": "0.0.0.0",
+    "listen_port": 80,
+    "max_connections": 10000,
+    "reuse_address": true
+  },
+  "mode": "reverse_proxy",
+  "cache": {
+    "enabled": true,
+    "max_size": 104857600
+  },
+  "rate_limit": {
+    "enabled": true,
+    "max_per_ip": 1000,
+    "max_global": 50000
+  },
+  "logging": {
+    "level": "info",
+    "enable_stats": true
+  },
+  "clusters": [
+    {
+      "name": "api_cluster",
+      "strategy": "weighted_round_robin",
+      "max_concurrent": 5000,
+      "backends": [
+        { "host": "10.0.1.10", "port": 8080, "weight": 5 },
+        { "host": "10.0.1.11", "port": 8080, "weight": 3 },
+        { "host": "10.0.1.12", "port": 8080, "weight": 2 }
+      ]
+    },
+    {
+      "name": "static_cluster",
+      "strategy": "round_robin",
+      "backends": [
+        { "host": "10.0.2.10", "port": 80 },
+        { "host": "10.0.2.11", "port": 80 }
+      ]
+    }
+  ],
+  "routes": [
+    {
+      "name": "api",
+      "match": {
+        "host": "api.example.com",
+        "path_prefix": "/v1"
+      },
+      "cluster": "api_cluster",
+      "timeout_policy": {
+        "connect_timeout_ms": 5000,
+        "request_timeout_ms": 30000
+      }
+    },
+    {
+      "name": "static_assets",
+      "match": {
+        "host": "static.example.com"
+      },
+      "cluster": "static_cluster",
+      "cache_policy": {
+        "allow": true,
+        "ttl_seconds": 3600
+      }
+    }
+  ]
+}

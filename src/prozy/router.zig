@@ -162,8 +162,17 @@ pub const Router = struct {
             if (route.concurrency_policy.reject_when_full) {
                 return error.ClusterAtCapacity;
             }
-            // TODO: Queue the request instead of failing immediately
-            return error.ClusterAtCapacity;
+
+            // Queue the request (wait for slot)
+            // Use connect_timeout or default to 30s
+            const timeout = if (route.timeout_policy.connect_timeout_ms > 0)
+                route.timeout_policy.connect_timeout_ms
+            else
+                30000;
+
+            if (!cluster.acquire(timeout)) {
+                return error.ClusterAtCapacity;
+            }
         }
 
         // Select a backend from the cluster

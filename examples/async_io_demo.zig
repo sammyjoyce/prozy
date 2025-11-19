@@ -139,7 +139,7 @@ fn showcaseProxyArchitecture(gpa: std.mem.Allocator) !void {
 
     // Show that Prozy can be imported and used
     const prozy = @import("prozy");
-    var proxy = prozy.Proxy.init(gpa, 0, "127.0.0.1", 3000);
+    var proxy = try prozy.Proxy.init(gpa, 0, "127.0.0.1", 3000);
     defer proxy.deinit();
 
     std.debug.print("   ✅ Prozy.Proxy initialized successfully\n", .{});

@@ -19,7 +19,7 @@ pub fn main() !void {
     std.debug.print("=========================================\n\n", .{});
 
     // Create proxy instance
-    var proxy = prozy.Proxy.init(gpa, 8080, "127.0.0.1", 3003);
+    var proxy = try prozy.Proxy.init(gpa, 8080, "127.0.0.1", 3003);
     defer proxy.deinit();
 
     std.debug.print("🔧 Initializing all proxy features...\n\n", .{});

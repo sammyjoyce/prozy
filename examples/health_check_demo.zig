@@ -41,7 +41,7 @@ pub fn main() !void {
     std.log.info("", .{});
 
     // Create proxy with load balancer
-    var proxy = prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
+    var proxy = try prozy.Proxy.init(allocator, 8080, "127.0.0.1", 3003);
     defer proxy.deinit();
 
     proxy.enableLoadBalancing(backends[0..], .round_robin);
