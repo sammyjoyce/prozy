@@ -1969,16 +1969,16 @@ test "HTTPCache Integration: prevent cache pollution across different hosts" {
         allocator.free(res.response);
     }
 
-    // Note: We can't compare them directly now because we freed them. 
+    // Note: We can't compare them directly now because we freed them.
     // The test logic above verifies they are correct individually.
     // If we want to compare, we need to keep them.
-    
+
     // Re-fetch to compare
     const c1 = cache.get("GET", "api1.example.com", "/api/users", null, false);
     const c2 = cache.get("GET", "api2.example.com", "/api/users", null, false);
     defer if (c1) |res| allocator.free(res.response);
     defer if (c2) |res| allocator.free(res.response);
-    
+
     // Verify they're different responses (multi-tenant isolation)
     if (c1) |r1| {
         if (c2) |r2| {
@@ -2413,6 +2413,46 @@ test "HTTPInspector: X-Forwarded-Proto with trailing whitespace trimmed" {
     try testing.expect(std.mem.indexOf(u8, modified, "proto=https") != null);
     // Should NOT contain trailing spaces
     try testing.expect(std.mem.indexOf(u8, modified, "proto=https  ") == null);
+}
+
+test "HTTPInspector: parseCacheControl with stale-while-revalidate" {
+
+    // Test stale-while-revalidate parsing
+    const response_with_swr = "HTTP/1.1 200 OK\r\nCache-Control: max-age=60, stale-while-revalidate=30\r\n\r\n";
+    const directives = HTTPInspector.parseCacheControl(response_with_swr);
+
+    try testing.expect(directives.max_age.? == 60);
+    try testing.expect(directives.stale_while_revalidate.? == 30);
+    try testing.expect(directives.isCacheable());
+
+    // Test stale-while-revalidate with other directives
+    const response_complex = "HTTP/1.1 200 OK\r\nCache-Control: public, max-age=300, stale-while-revalidate=60, must-revalidate\r\n\r\n";
+    const directives_complex = HTTPInspector.parseCacheControl(response_complex);
+
+    try testing.expect(directives_complex.public == true);
+    try testing.expect(directives_complex.max_age.? == 300);
+    try testing.expect(directives_complex.stale_while_revalidate.? == 60);
+    try testing.expect(directives_complex.must_revalidate == true);
+    try testing.expect(directives_complex.isCacheable());
+
+    // Test without stale-while-revalidate
+    const response_no_swr = "HTTP/1.1 200 OK\r\nCache-Control: max-age=120\r\n\r\n";
+    const directives_no_swr = HTTPInspector.parseCacheControl(response_no_swr);
+
+    try testing.expect(directives_no_swr.max_age.? == 120);
+    try testing.expect(directives_no_swr.stale_while_revalidate == null);
+
+    // Test boundary values
+    const response_max_swr = "HTTP/1.1 200 OK\r\nCache-Control: stale-while-revalidate=86400\r\n\r\n";
+    const directives_max = HTTPInspector.parseCacheControl(response_max_swr);
+
+    try testing.expect(directives_max.stale_while_revalidate.? == 86400);
+
+    // Test invalid stale-while-revalidate (too large)
+    const response_invalid = "HTTP/1.1 200 OK\r\nCache-Control: stale-while-revalidate=86401\r\n\r\n";
+    const directives_invalid = HTTPInspector.parseCacheControl(response_invalid);
+
+    try testing.expect(directives_invalid.stale_while_revalidate == null);
 }
 
 // ============= Proxy Authentication Tests =============

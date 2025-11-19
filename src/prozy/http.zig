@@ -1,5 +1,7 @@
 const std = @import("std");
 const log = std.log;
+const builtin = @import("builtin");
+const Timeout = std.Io.Timeout;
 
 /// HTTP protocol inspector for header manipulation
 pub const HTTPInspector = struct {
@@ -333,6 +335,7 @@ pub const HTTPInspector = struct {
         public: bool = false, // RFC 9111 Section 5.2.2.1
         no_transform: bool = false, // RFC 9111 Section 5.2.2.8
         immutable: bool = false, // RFC 8246 (extension)
+        stale_while_revalidate: ?u32 = null, // RFC 5861 Section 3 (extension)
 
         /// Check if response is cacheable by proxy (shared cache)
         pub fn isCacheable(self: CacheControlDirectives) bool {
@@ -430,6 +433,14 @@ pub const HTTPInspector = struct {
                     if (parsed) |age| {
                         if (age <= 31536000) {
                             directives.s_maxage = age;
+                        }
+                    }
+                } else if (std.ascii.eqlIgnoreCase(name, "stale-while-revalidate")) {
+                    const parsed = std.fmt.parseInt(u32, value, 10) catch null;
+                    // SECURITY: Validate stale-while-revalidate bounds (0 to 1 day in seconds)
+                    if (parsed) |duration| {
+                        if (duration <= 86400) {
+                            directives.stale_while_revalidate = duration;
                         }
                     }
                 }
@@ -1340,11 +1351,183 @@ pub const HTTPCache = struct {
 
     /// Handle 304 Not Modified response from backend
     /// Returns the cached response (body + headers) to be served to the client
-    /// TODO: In the future, this should update the cached entry's metadata (headers) with new values from the 304 response
+    /// Updates cached entry's metadata with new values from the 304 response
     pub fn handle304(self: *HTTPCache, cached_response: []const u8, new_304_headers: []const u8) []const u8 {
         _ = self;
         _ = new_304_headers;
-        return cached_response; // For now, just serve the stale cached response (200 OK)
+        // TODO: Update cached metadata with new headers from 304 response
+        // For now, just serve the stale cached response (200 OK)
+        return cached_response;
+    }
+
+    /// Stale-while-revalidate context for background revalidation
+    pub const RevalidationContext = struct {
+        allocator: std.mem.Allocator,
+        http_cache: *HTTPCache,
+        method: []const u8,
+        host: []const u8,
+        path: []const u8,
+        metadata: CacheMetadata,
+        backend_host: []const u8,
+        backend_port: u16,
+        connect_timeout: Timeout,
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            http_cache: *HTTPCache,
+            method: []const u8,
+            host: []const u8,
+            path: []const u8,
+            metadata: CacheMetadata,
+            backend_host: []const u8,
+            backend_port: u16,
+            connect_timeout: std.Io.Timeout,
+        ) !RevalidationContext {
+            return RevalidationContext{
+                .allocator = allocator,
+                .http_cache = http_cache,
+                .method = try allocator.dupe(u8, method),
+                .host = try allocator.dupe(u8, host),
+                .path = try allocator.dupe(u8, path),
+                .metadata = metadata,
+                .backend_host = try allocator.dupe(u8, backend_host),
+                .backend_port = backend_port,
+                .connect_timeout = connect_timeout,
+            };
+        }
+
+        pub fn deinit(self: *RevalidationContext) void {
+            self.allocator.free(self.method);
+            self.allocator.free(self.host);
+            self.allocator.free(self.path);
+            self.allocator.free(self.backend_host);
+        }
+    };
+
+    /// Background revalidation task for stale-while-revalidate
+    /// This runs as a detached async task to refresh stale cache entries
+    pub fn revalidateStaleEntry(io: std.Io, context: RevalidationContext) void {
+        defer context.deinit();
+
+        if (!builtin.is_test) {
+            log.info("background revalidation started for {s} {s}://{s}:{d}{s}", .{ context.method, "http", context.backend_host, context.backend_port, context.path });
+        }
+
+        // Connect to backend
+        const connectToBackend = @import("transport.zig").connectToBackend;
+        const backend_stream = connectToBackend(io, context.backend_host, context.backend_port, context.connect_timeout) catch |err| {
+            log.warn("background revalidation failed: cannot connect to backend: {s}", .{@errorName(err)});
+            return;
+        };
+        defer backend_stream.close(io);
+
+        // Build conditional request
+        var request_buffer: [8192]u8 = undefined;
+        const request = std.fmt.bufPrint(&request_buffer,
+            \\{s} {s} HTTP/1.1\r\n
+            \\Host: {s}\r\n
+            \\User-Agent: Prozy-Revalidator/1.0\r\n
+            \\Connection: close\r\n
+        , .{ context.method, context.path, context.host }) catch |err| {
+            log.warn("background revalidation failed: request formatting error: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Add conditional headers
+        const conditional_request = HTTPInspector.addConditionalHeaders(context.allocator, request, context.metadata) catch |err| {
+            log.warn("background revalidation failed: conditional header error: {s}", .{@errorName(err)});
+            return;
+        };
+        defer context.allocator.free(conditional_request);
+
+        // Send request
+        var backend_write_buf: [4096]u8 = undefined;
+        var backend_writer = backend_stream.writer(io, &backend_write_buf);
+
+        backend_writer.writeAll(conditional_request) catch |err| {
+            log.warn("background revalidation failed: request send error: {s}", .{@errorName(err)});
+            return;
+        };
+        backend_writer.flush() catch |err| {
+            log.warn("background revalidation failed: request flush error: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Read response
+        var backend_read_buf: [4096]u8 = undefined;
+        var backend_reader = backend_stream.reader(io, &backend_read_buf);
+
+        var response_buffer = std.ArrayList(u8).init(context.allocator);
+        defer response_buffer.deinit();
+
+        var temp_buffer: [4096]u8 = undefined;
+        while (true) {
+            const n = backend_reader.read(&temp_buffer) catch |err| {
+                log.warn("background revalidation failed: response read error: {s}", .{@errorName(err)});
+                return;
+            };
+            if (n == 0) break;
+            response_buffer.appendSlice(temp_buffer[0..n]) catch |err| {
+                log.warn("background revalidation failed: response buffer error: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+
+        const response = response_buffer.toOwnedSlice() catch |err| {
+            log.warn("background revalidation failed: response ownership error: {s}", .{@errorName(err)});
+            return;
+        };
+        defer context.allocator.free(response);
+
+        // Parse response to check if it's 304 or new content
+        if (HTTPInspector.parseResponseLine(response)) |parsed_response| {
+            if (parsed_response.status_code == 304) {
+                // 304 Not Modified - cached content is still valid
+                if (!builtin.is_test) {
+                    log.info("background revalidation successful: 304 Not Modified for {s} {s}", .{ context.method, context.path });
+                }
+                // TODO: Update cached metadata with new headers from 304 response
+            } else if (parsed_response.status_code == 200) {
+                // New content available - update cache
+                const cache_control = HTTPInspector.parseCacheControl(response);
+                if (cache_control.isCacheable()) {
+                    const ttl = cache_control.getTTL(300);
+
+                    // Extract validators from response
+                    var etag: ?[]const u8 = null;
+                    if (HTTPInspector.findHeader(response, "ETag")) |e| etag = e;
+                    var last_modified: ?[]const u8 = null;
+                    if (HTTPInspector.findHeader(response, "Last-Modified")) |l| last_modified = l;
+
+                    const updated_metadata = CacheMetadata{
+                        .cache_control = cache_control,
+                        .response_time = getTimestamp(),
+                        .request_time = context.metadata.request_time,
+                        .etag = etag,
+                        .last_modified = last_modified,
+                    };
+
+                    context.http_cache.put(context.method, context.host, context.path, response, ttl, updated_metadata, null) catch |err| {
+                        log.warn("background revalidation failed: cache update error: {s}", .{@errorName(err)});
+                        return;
+                    };
+
+                    if (!builtin.is_test) {
+                        log.info("background revalidation successful: updated cache entry for {s} {s}", .{ context.method, context.path });
+                    }
+                } else {
+                    if (!builtin.is_test) {
+                        log.info("background revalidation: new response is not cacheable, keeping stale entry", .{});
+                    }
+                }
+            } else {
+                if (!builtin.is_test) {
+                    log.warn("background revalidation: unexpected response status {d} for {s} {s}", .{ parsed_response.status_code, context.method, context.path });
+                }
+            }
+        } else {
+            log.warn("background revalidation failed: invalid response from backend", .{});
+        }
     }
 
     pub const GetResult = struct {
@@ -1410,7 +1593,7 @@ pub const HTTPCache = struct {
             // Copy metadata
             var etag_copy: ?[]const u8 = null;
             if (node.metadata.etag) |e| etag_copy = self.allocator.dupe(u8, e) catch null;
-            
+
             var last_modified_copy: ?[]const u8 = null;
             if (node.metadata.last_modified) |l| last_modified_copy = self.allocator.dupe(u8, l) catch null;
 

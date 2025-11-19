@@ -394,52 +394,55 @@ Result: Selected backend or null (no healthy/retryable backends)
    - Record connection start
    - Increment active connections counter
 
-4. **Request Buffering (8KB):**
+4. **Connection Loop (Keep-Alive):**
+   - Loop until client closes or timeout
+   - Read headers with 30s idle timeout
+   - If timeout or EOF: Close connection
+
+5. **Request Buffering (8KB):**
    - Read initial request into buffer
    - Prevents data loss when cache checking
    - Critical fix: buffered data forwarded on cache miss
 
-5. **HTTP Parsing:**
+6. **HTTP Parsing:**
    - Parse request line: `GET /path HTTP/1.1`
    - Extract method and path
    - Check if GET request
 
-6. **Cache Check (GET requests only):**
+7. **Cache Check (GET requests only):**
    - Hash key: method + path
    - Check cache for existing response
-   - If HIT: serve cached response, end connection
+   - If HIT: serve cached response, continue loop
    - If MISS: continue to backend
 
-7. **Load Balancing:**
+8. **Load Balancing:**
    - Select backend using configured strategy
    - Check backend health
    - Check retry eligibility (exponential backoff)
    - If no healthy backend: reject connection
 
-8. **Backend Connection:**
+9. **Backend Connection:**
    - Connect to selected backend with timeout
    - If FAILED: mark backend unhealthy, increment retry count
    - If SUCCESS: continue
 
-9. **Forward Buffered Request:**
-   - Write buffered 8KB request to backend
-   - Prevents data loss from cache check step
+10. **Forward Request & Headers:**
+    - Forward buffered request headers (manipulated)
+    - Stream request body to backend
 
-10. **Bidirectional Copy:**
-    - Spawn two concurrent tasks:
-      - Client → Backend (Future C2B)
-      - Backend → Client (Future B2C)
-    - Use `io.concurrent()` for parallel execution
-    - Use `io.select()` to wait for both
-    - Record bytes transferred
+11. **Stream Response:**
+    - Read response headers from backend
+    - Stream response body to client
+    - Optionally cache response if cacheable (200 OK, GET)
 
-11. **Cleanup:**
-    - Close client and backend connections
-    - Release rate limiter slot
-    - Decrement backend connection counter
-    - Record connection end
+12. **Cleanup (Per Request):**
+    - Close backend connection (unless backend keep-alive implemented)
+    - Update stats
+    - Loop back to step 4
 
 ### 8. Bidirectional Copy (src/prozy/proxy.zig)
+
+**Used for CONNECT tunnels (HTTPS) only.**
 
 **copyBidirectional:**
 ```zig

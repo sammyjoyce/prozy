@@ -245,25 +245,26 @@ grep -r "std\.crypto\.tls|std\.net\.tls|TlsStream|ClientHello|ServerName" src/
 ### 3. Proxy-Specific HTTP Headers and Metadata
 
 #### RFC 7239 – Forwarded HTTP Extension (June 2014)
-**Status**: ⚠️ **NOT Implemented** (X-Forwarded-* implemented instead)
+**Status**: ✅ **Implemented**
 
-**Configuration Exists**:
+**Configuration**:
 ```zig
-// src/prozy/http.zig:5-8
+// src/prozy/http.zig:5-9
 pub const HTTPInspector = struct {
     add_forwarded_headers: bool = true,
     add_via_header: bool = true,
+    add_rfc7239_forwarded: bool = true, // RFC 7239 Forwarded header
     proxy_name: []const u8 = "Prozy/1.0",
 ```
 
-**Implementation**: ❌ **RFC 7239 Forwarded header NOT implemented**
-- ❌ No `Forwarded` header per RFC 7239 spec
-- ✅ **De facto X-Forwarded-* headers implemented instead** (see below)
-- ✅ **Via header implemented** (RFC 9110 Section 7.6.3)
+**Implementation**:
+- ✅ **Forwarded header**: Implemented per RFC 7239
+- Format: `Forwarded: for=<client-ip>;host=<host>;proto=<protocol>`
+- IPv6 addresses quoted and bracketed `for="[::1]"`
+- IPv4 addresses unquoted `for=1.2.3.4`
+- Location: `src/prozy/http.zig`
 
-**Note**: X-Forwarded-* headers (de facto standard) are more widely supported than RFC 7239 Forwarded header. Most production systems use X-Forwarded-* headers.
-
-**Code Reference**: `src/prozy/http.zig:6-7` (configuration), `src/prozy/http.zig:312-328` (X-Forwarded-* implementation)
+**Code Reference**: `src/prozy/http.zig` (HTTPInspector)
 
 ---
 

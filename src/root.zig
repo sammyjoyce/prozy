@@ -14,8 +14,9 @@
 //! ## Known Limitations and Roadmap
 //!
 //! ### Request Handling
-//! - **Keep-Alive & Pipelining**: Currently, the proxy closes the connection after one request.
-//!   Support for persistent connections (HTTP Keep-Alive) and pipelining is scheduled for Phase 2.
+//! - **Keep-Alive & Pipelining**: HTTP Keep-Alive and pipelining are fully supported.
+//!   The proxy maintains persistent connections with clients and handles multiple requests per connection.
+//!   Idle connections are timed out after 30 seconds.
 //!
 //! ### Protocol Support
 //! - **HTTP/1.1 Only**: No HTTP/2 or WebSocket support yet.
@@ -23,18 +24,17 @@
 //!   for TLS termination. `X-Forwarded-Proto` is respected.
 //!
 //! ### Cache Compliance (RFC 9111)
-//! - **Partial Implementation**: `Cache-Control` parsing and basic LRU are implemented.
+//! - **Partial Implementation**: `Cache-Control` parsing (including `no-store`) and basic LRU are implemented.
 //!   Phase 3 will add `Vary` header support, `ETag` validation, and proper `Date`/`Expires` handling.
 //! - **Revalidation**: `stale-while-revalidate` is not yet implemented.
 //!
 //! ### Resilience
-//! - **Reactive Health Checks**: Backends are marked unhealthy only after a connection failure.
+//! - **Reactive Health Checks**: Backends are marked unhealthy after connection failure.
 //!   Proactive background probing is scheduled for Phase 4.
 //!
 //! ### Performance
 //! - **Fixed Buffer Sizes**: Uses 8KB buffers for headers and 4KB for bodies.
-//! - **Locking**: Cache uses shared locks for reads, but the single-threaded nature of the current
-//!   `std.Io` runtime (in `main.zig`) means we rely on non-blocking I/O rather than OS threads.
+//! - **Locking**: Cache uses shared locks for reads.
 
 const std = @import("std");
 
