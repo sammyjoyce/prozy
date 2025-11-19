@@ -628,8 +628,8 @@ pub const Proxy = struct {
             _ = connection_group.async(io, handleClientWithFeatures, .{
                 client_stream,
                 io,
+                &connection_group,
                 self.allocator,
-                options.connect_timeout,
                 @as(*ProxyStats, @constCast(&self.stats)),
                 &self.http_inspector,
                 options,
@@ -770,8 +770,8 @@ pub const Proxy = struct {
     fn handleClientWithFeatures(
         client_stream: net.Stream,
         io: Io,
+        connection_group: *std.Io.Group,
         allocator: std.mem.Allocator,
-        connect_timeout: Timeout,
         stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
@@ -781,6 +781,7 @@ pub const Proxy = struct {
         router: *Router, // Phase 3: Router for advanced routing
         access_control: ?AccessControl,
     ) void {
+        const connect_timeout = options.connect_timeout;
         // Extract client IP for access control and rate limiting
         const client_ip = extractClientIp(client_stream.socket.address);
 
@@ -999,15 +1000,40 @@ pub const Proxy = struct {
                                 cached_entry = entry;
 
                                 // Check if stale entry supports stale-while-revalidate
-                                // TODO: Implement background revalidation with detached async tasks
-                                // For now, we'll just log that stale-while-revalidate is available
                                 if (entry.metadata.cache_control.stale_while_revalidate) |swr_duration| {
                                     if (!builtin.is_test) {
                                         log.debug("stale-while-revalidate available for {d} seconds", .{swr_duration});
                                     }
+
+                                    // Create context for revalidation
+                                    // Note: context.init performs deep copies of metadata strings
+                                    if (HTTPCache.RevalidationContext.init(allocator, http_cache.?, parsed_request.method, host, parsed_request.path, entry.metadata, decision.backend.host, decision.backend.port, connect_timeout)) |context| {
+                                        // Spawn background revalidation task
+                                        // Use connection_group.async to spawn detached task
+                                        _ = connection_group.async(io, HTTPCache.revalidateStaleEntry, .{ io, context });
+
+                                        // Serve stale content immediately
+                                        defer http_cache.?.allocator.free(entry.response);
+                                        _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
+                                            break;
+                                        };
+                                        _ = Writer.flush(&client_writer.interface) catch {
+                                            break;
+                                        };
+                                        if (options.enable_stats) {
+                                            stats.recordBytesBackendToClient(@intCast(entry.response.len));
+                                        }
+
+                                        cache_hit = true;
+                                        decision.cluster.release();
+                                        // Clean up cached_entry reference since we served it
+                                        cached_entry = null;
+                                    } else |_| {
+                                        log.warn("failed to create revalidation context", .{});
+                                    }
                                 }
 
-                                // Don't set cache_hit yet, we need to revalidate
+                                // If not SWR or failed to init context, fall through to synchronous revalidation
                             }
                         }
                     }
@@ -1109,6 +1135,39 @@ pub const Proxy = struct {
                     // Revalidation Successful!
                     if (!builtin.is_test) log.info("revalidation successful (304), serving cached content", .{});
 
+                    // Update cache metadata
+                    if (http_cache) |cache| {
+                        if (HTTPInspector.findHeader(request_headers, "Host")) |host| {
+                            // Parse headers needed for metadata update
+                            const cache_control = HTTPInspector.parseCacheControl(response_headers);
+
+                            var etag: ?[]const u8 = null;
+                            if (HTTPInspector.findHeader(response_headers, "ETag")) |e| etag = e;
+                            var last_modified: ?[]const u8 = null;
+                            if (HTTPInspector.findHeader(response_headers, "Last-Modified")) |l| last_modified = l;
+
+                            const date_header = if (HTTPInspector.findHeader(response_headers, "Date")) |d| HTTPInspector.parseHttpDate(d) else null;
+                            const expires_header = if (HTTPInspector.findHeader(response_headers, "Expires")) |e| HTTPInspector.parseHttpDate(e) else null;
+                            const age_header = if (HTTPInspector.findHeader(response_headers, "Age")) |a| std.fmt.parseInt(u32, a, 10) catch null else null;
+
+                            const new_metadata = HTTPCache.CacheMetadata{
+                                .cache_control = cache_control,
+                                .response_time = getTimestamp(),
+                                .request_time = getTimestamp(),
+                                .etag = etag,
+                                .last_modified = last_modified,
+                                .date_header = date_header,
+                                .expires_header = expires_header,
+                                .age_header = age_header,
+                                .vary_context = entry.metadata.vary_context, // Preserve vary context
+                            };
+
+                            cache.updateMetadata(parsed_request.method, host, parsed_request.path, entry.metadata.vary_context, new_metadata) catch |err| {
+                                log.warn("failed to update cache metadata: {s}", .{@errorName(err)});
+                            };
+                        }
+                    }
+
                     defer http_cache.?.allocator.free(entry.response);
                     // Return cached response (using handle304 helper if we wanted, but direct write is fine)
                     _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
@@ -1130,6 +1189,7 @@ pub const Proxy = struct {
             }
 
             // Determine Response Body Type
+
             const response_body_type = HTTPInspector.getBodyType(response_headers);
 
             // Check Backend Connection: close

@@ -1,7 +1,10 @@
 const std = @import("std");
 const log = std.log;
 const builtin = @import("builtin");
-const Timeout = std.Io.Timeout;
+const Io = std.Io;
+const Timeout = Io.Timeout;
+const Writer = Io.Writer;
+const Reader = Io.Reader;
 
 /// HTTP protocol inspector for header manipulation
 pub const HTTPInspector = struct {
@@ -1383,13 +1386,30 @@ pub const HTTPCache = struct {
             backend_port: u16,
             connect_timeout: std.Io.Timeout,
         ) !RevalidationContext {
+            // Deep copy metadata strings to ensure safety if cache entry is evicted
+            var safe_metadata = metadata;
+
+            if (metadata.etag) |e| safe_metadata.etag = try allocator.dupe(u8, e);
+            if (metadata.last_modified) |l| safe_metadata.last_modified = try allocator.dupe(u8, l);
+
+            // Deep copy vary context if present
+            if (metadata.vary_context) |ctx| {
+                safe_metadata.vary_context = .{
+                    .accept = if (ctx.accept) |v| try allocator.dupe(u8, v) else null,
+                    .accept_encoding = if (ctx.accept_encoding) |v| try allocator.dupe(u8, v) else null,
+                    .accept_language = if (ctx.accept_language) |v| try allocator.dupe(u8, v) else null,
+                    .accept_charset = if (ctx.accept_charset) |v| try allocator.dupe(u8, v) else null,
+                    .user_agent = if (ctx.user_agent) |v| try allocator.dupe(u8, v) else null,
+                };
+            }
+
             return RevalidationContext{
                 .allocator = allocator,
                 .http_cache = http_cache,
                 .method = try allocator.dupe(u8, method),
                 .host = try allocator.dupe(u8, host),
                 .path = try allocator.dupe(u8, path),
-                .metadata = metadata,
+                .metadata = safe_metadata,
                 .backend_host = try allocator.dupe(u8, backend_host),
                 .backend_port = backend_port,
                 .connect_timeout = connect_timeout,
@@ -1401,21 +1421,35 @@ pub const HTTPCache = struct {
             self.allocator.free(self.host);
             self.allocator.free(self.path);
             self.allocator.free(self.backend_host);
+
+            // Free metadata strings
+            if (self.metadata.etag) |e| self.allocator.free(e);
+            if (self.metadata.last_modified) |l| self.allocator.free(l);
+
+            // Free vary context
+            if (self.metadata.vary_context) |*ctx| {
+                if (ctx.accept) |v| self.allocator.free(v);
+                if (ctx.accept_encoding) |v| self.allocator.free(v);
+                if (ctx.accept_language) |v| self.allocator.free(v);
+                if (ctx.accept_charset) |v| self.allocator.free(v);
+                if (ctx.user_agent) |v| self.allocator.free(v);
+            }
         }
     };
 
     /// Background revalidation task for stale-while-revalidate
     /// This runs as a detached async task to refresh stale cache entries
     pub fn revalidateStaleEntry(io: std.Io, context: RevalidationContext) void {
-        defer context.deinit();
+        var ctx = context;
+        defer ctx.deinit();
 
         if (!builtin.is_test) {
-            log.info("background revalidation started for {s} {s}://{s}:{d}{s}", .{ context.method, "http", context.backend_host, context.backend_port, context.path });
+            log.info("background revalidation started for {s} {s}://{s}:{d}{s}", .{ ctx.method, "http", ctx.backend_host, ctx.backend_port, ctx.path });
         }
 
         // Connect to backend
         const connectToBackend = @import("transport.zig").connectToBackend;
-        const backend_stream = connectToBackend(io, context.backend_host, context.backend_port, context.connect_timeout) catch |err| {
+        const backend_stream = connectToBackend(io, ctx.backend_host, ctx.backend_port, ctx.connect_timeout) catch |err| {
             log.warn("background revalidation failed: cannot connect to backend: {s}", .{@errorName(err)});
             return;
         };
@@ -1428,27 +1462,27 @@ pub const HTTPCache = struct {
             \\Host: {s}\r\n
             \\User-Agent: Prozy-Revalidator/1.0\r\n
             \\Connection: close\r\n
-        , .{ context.method, context.path, context.host }) catch |err| {
+        , .{ ctx.method, ctx.path, ctx.host }) catch |err| {
             log.warn("background revalidation failed: request formatting error: {s}", .{@errorName(err)});
             return;
         };
 
         // Add conditional headers
-        const conditional_request = HTTPInspector.addConditionalHeaders(context.allocator, request, context.metadata) catch |err| {
+        const conditional_request = HTTPInspector.addConditionalHeaders(ctx.allocator, request, ctx.metadata) catch |err| {
             log.warn("background revalidation failed: conditional header error: {s}", .{@errorName(err)});
             return;
         };
-        defer context.allocator.free(conditional_request);
+        defer ctx.allocator.free(conditional_request);
 
         // Send request
         var backend_write_buf: [4096]u8 = undefined;
         var backend_writer = backend_stream.writer(io, &backend_write_buf);
 
-        backend_writer.writeAll(conditional_request) catch |err| {
+        Writer.writeAll(&backend_writer.interface, conditional_request) catch |err| {
             log.warn("background revalidation failed: request send error: {s}", .{@errorName(err)});
             return;
         };
-        backend_writer.flush() catch |err| {
+        Writer.flush(&backend_writer.interface) catch |err| {
             log.warn("background revalidation failed: request flush error: {s}", .{@errorName(err)});
             return;
         };
@@ -1457,23 +1491,24 @@ pub const HTTPCache = struct {
         var backend_read_buf: [4096]u8 = undefined;
         var backend_reader = backend_stream.reader(io, &backend_read_buf);
 
-        var response_buffer = std.ArrayList(u8).init(context.allocator);
-        defer response_buffer.deinit();
+        var response_buffer = std.ArrayList(u8){};
+        defer response_buffer.deinit(context.allocator);
 
         var temp_buffer: [4096]u8 = undefined;
         while (true) {
-            const n = backend_reader.read(&temp_buffer) catch |err| {
+            var slices = [_][]u8{temp_buffer[0..]};
+            const n = backend_reader.interface.readVec(&slices) catch |err| {
                 log.warn("background revalidation failed: response read error: {s}", .{@errorName(err)});
                 return;
             };
             if (n == 0) break;
-            response_buffer.appendSlice(temp_buffer[0..n]) catch |err| {
+            response_buffer.appendSlice(context.allocator, temp_buffer[0..n]) catch |err| {
                 log.warn("background revalidation failed: response buffer error: {s}", .{@errorName(err)});
                 return;
             };
         }
 
-        const response = response_buffer.toOwnedSlice() catch |err| {
+        const response = response_buffer.toOwnedSlice(context.allocator) catch |err| {
             log.warn("background revalidation failed: response ownership error: {s}", .{@errorName(err)});
             return;
         };
@@ -1486,7 +1521,38 @@ pub const HTTPCache = struct {
                 if (!builtin.is_test) {
                     log.info("background revalidation successful: 304 Not Modified for {s} {s}", .{ context.method, context.path });
                 }
-                // TODO: Update cached metadata with new headers from 304 response
+
+                // Update metadata from 304 response headers
+                const cache_control = HTTPInspector.parseCacheControl(response);
+
+                var etag: ?[]const u8 = null;
+                if (HTTPInspector.findHeader(response, "ETag")) |e| etag = e;
+                var last_modified: ?[]const u8 = null;
+                if (HTTPInspector.findHeader(response, "Last-Modified")) |l| last_modified = l;
+
+                // Parse other freshness headers
+                const date_header = if (HTTPInspector.findHeader(response, "Date")) |d| HTTPInspector.parseHttpDate(d) else null;
+                const expires_header = if (HTTPInspector.findHeader(response, "Expires")) |e| HTTPInspector.parseHttpDate(e) else null;
+
+                // Calculate Age if present
+                const age_header = if (HTTPInspector.findHeader(response, "Age")) |a| std.fmt.parseInt(u32, a, 10) catch null else null;
+
+                const new_metadata = CacheMetadata{
+                    .cache_control = cache_control,
+                    .response_time = getTimestamp(),
+                    .request_time = getTimestamp(), // Approximation for background revalidation
+                    .etag = etag,
+                    .last_modified = last_modified,
+                    .date_header = date_header,
+                    .expires_header = expires_header,
+                    .age_header = age_header,
+                    // Preserve vary context from original request
+                    .vary_context = context.metadata.vary_context,
+                };
+
+                context.http_cache.updateMetadata(context.method, context.host, context.path, context.metadata.vary_context, new_metadata) catch |err| {
+                    log.warn("background revalidation failed: metadata update error: {s}", .{@errorName(err)});
+                };
             } else if (parsed_response.status_code == 200) {
                 // New content available - update cache
                 const cache_control = HTTPInspector.parseCacheControl(response);
@@ -1803,6 +1869,54 @@ pub const HTTPCache = struct {
 
         if (self.tail == null) {
             self.tail = node;
+        }
+    }
+
+    /// Update metadata for an existing cache entry (e.g., on 304 Not Modified)
+    pub fn updateMetadata(
+        self: *HTTPCache,
+        method: []const u8,
+        host: []const u8,
+        path: []const u8,
+        vary_context: ?HTTPInspector.VaryContext,
+        new_metadata: CacheMetadata,
+    ) !void {
+        const key = hashKey(method, host, path, vary_context);
+
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+
+        if (self.cache.get(key)) |node| {
+            // Free old metadata strings
+            if (node.metadata.etag) |e| self.allocator.free(e);
+            if (node.metadata.last_modified) |lm| self.allocator.free(lm);
+
+            // Copy new strings
+            var etag_copy: ?[]u8 = null;
+            if (new_metadata.etag) |etag_str| {
+                etag_copy = try self.allocator.alloc(u8, etag_str.len);
+                @memcpy(etag_copy.?, etag_str);
+            }
+
+            var last_modified_copy: ?[]u8 = null;
+            if (new_metadata.last_modified) |lm_str| {
+                last_modified_copy = try self.allocator.alloc(u8, lm_str.len);
+                @memcpy(last_modified_copy.?, lm_str);
+            }
+
+            // Update metadata fields
+            node.metadata.date_header = new_metadata.date_header;
+            node.metadata.age_header = new_metadata.age_header;
+            node.metadata.expires_header = new_metadata.expires_header;
+            node.metadata.request_time = new_metadata.request_time;
+            node.metadata.response_time = new_metadata.response_time;
+            node.metadata.cache_control = new_metadata.cache_control;
+            node.metadata.etag = etag_copy;
+            node.metadata.last_modified = last_modified_copy;
+            node.metadata.is_weak_etag = new_metadata.is_weak_etag;
+
+            // Move to front (MRU) as it was just validated/updated
+            self.moveToFront(node);
         }
     }
 

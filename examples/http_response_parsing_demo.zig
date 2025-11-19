@@ -111,7 +111,8 @@ pub fn main() !void {
 
                 // Step 5: Retrieve from cache
                 if (cache.get(cache_key_method, cache_key_host, cache_key_path, null, false)) |cached| {
-                    std.debug.print("  ✓ Retrieved from cache: {d} bytes\n", .{cached.len});
+                    defer allocator.free(cached.response);
+                    std.debug.print("  ✓ Retrieved from cache: {d} bytes\n", .{cached.response.len});
                     const stats = cache.getStats();
                     std.debug.print("  ✓ Hit rate: {d:.2}%\n", .{stats.hitRate() * 100});
                 }
