@@ -75,7 +75,7 @@ pub fn main() !void {
         },
         .transform_policy = .{},
         .concurrency_policy = prozy.ConcurrencyPolicy{
-            .max_concurrent = 100,
+            .reject_when_full = false,
         },
     };
 
@@ -97,7 +97,7 @@ pub fn main() !void {
         },
         .transform_policy = .{},
         .concurrency_policy = prozy.ConcurrencyPolicy{
-            .max_concurrent = 200,
+            .reject_when_full = false,
         },
     };
 

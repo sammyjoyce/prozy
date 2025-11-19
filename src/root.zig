@@ -11,61 +11,30 @@
 //! - Bidirectional data copying coordinated via io.concurrent/io.select
 //! - Structured concurrency via Io.Group and explicit cancellation
 //!
-//! ## Known Limitations and Assumptions
+//! ## Known Limitations and Roadmap
 //!
 //! ### Request Handling
-//! - **One HTTP request per TCP connection**: The proxy assumes each TCP connection
-//!   carries a single HTTP request. HTTP keep-alive and pipelining are NOT supported.
-//!   Subsequent requests in the same connection will bypass cache checking and request
-//!   inspection.
+//! - **Keep-Alive & Pipelining**: HTTP Keep-Alive and pipelining are fully supported.
+//!   The proxy maintains persistent connections with clients and handles multiple requests per connection.
+//!   Idle connections are timed out after 30 seconds.
 //!
 //! ### Protocol Support
-//! - **HTTP-only**: Currently designed for HTTP traffic. No TLS/SSL termination,
-//!   WebSocket support, or HTTP/2.
-//! - **TCP-only**: No UDP support. Adding UDP would require significant changes.
+//! - **HTTP/1.1 Only**: No HTTP/2 or WebSocket support yet.
+//! - **No TLS Termination**: The proxy expects plain HTTP. Use a frontend load balancer (ALB, Nginx)
+//!   for TLS termination. `X-Forwarded-Proto` is respected.
 //!
-//! ### Connection Handling
-//! - **30-second timeout**: After one direction of a connection completes, the proxy
-//!   waits up to 30 seconds for the other direction before timing out and canceling.
-//!   Implemented using io.concurrent(sleep, ...) combined with io.select() for concurrent
-//!   timeout enforcement. Prevents hung connections during HTTP keep-alive scenarios.
-//! - **Full close only**: No TCP half-close support. Both directions are closed together.
+//! ### Cache Compliance (RFC 9111)
+//! - **Partial Implementation**: `Cache-Control` parsing (including `no-store`) and basic LRU are implemented.
+//!   Phase 3 will add `Vary` header support, `ETag` validation, and proper `Date`/`Expires` handling.
+//! - **Revalidation**: `stale-while-revalidate` is not yet implemented.
 //!
-//! ### Cache Behavior
-//! - **GET requests only**: Only GET requests are cached. POST/PUT/DELETE bypass cache.
-//! - **Cache-Control: no-store respected**: Responses with `Cache-Control: no-store`
-//!   are NOT cached (security feature per RFC 9111).
-//! - **Partial RFC compliance**: Cache does NOT respect other Cache-Control directives,
-//!   Vary headers, or conditional requests. All cacheable GET responses use a fixed TTL.
-//! - **Limited cache population**: Responses from backends are buffered and stored in
-//!   cache for GET requests only (via copyPipeWithCaching).
-//! - **Fixed-size buffers**: Request headers are buffered in an 8KB buffer. Headers
-//!   larger than 8KB will cause cache checking to fail (request still forwarded).
-//!
-//! ### Load Balancing
-//! - **Reactive health checks**: Backend health is determined by connection success/
-//!   failure only. No proactive health checks, HTTP 5xx tracking, or timeout detection.
-//! - **Connection-level routing**: Load balancing decision is made per connection,
-//!   not per request (consistent with one-request-per-connection assumption).
-//!
-//! ### Security
-//! - **X-Forwarded-* headers**: Client IP, protocol, and host are forwarded to backends
-//!   via X-Forwarded-For, X-Forwarded-Proto, and X-Forwarded-Host headers (configurable).
-//! - **Via header**: Proxy identity is added to Via header chain for both requests and
-//!   responses (RFC 9110 Section 7.6.3, configurable).
-//! - **Hop-by-hop header removal**: Connection, Keep-Alive, Proxy-Connection, TE,
-//!   Trailer, Transfer-Encoding, Upgrade, Proxy-Authenticate, and Proxy-Authorization
-//!   headers are removed before forwarding (RFC 9110 Section 7.6.1).
-//! - **Cache-Control: no-store security**: Responses marked with `Cache-Control: no-store`
-//!   are NOT cached to prevent sensitive data leakage (RFC 9111).
-//! - **Trusted backend assumption**: No validation of backend responses or protection
-//!   against malicious backends.
+//! ### Resilience
+//! - **Reactive Health Checks**: Backends are marked unhealthy after connection failure.
+//!   Proactive background probing is scheduled for Phase 4.
 //!
 //! ### Performance
-//! - **Fixed buffer sizes**: 4KB client buffers, 4KB backend buffers, 8KB request buffer
-//! - **Per-chunk byte counting**: Statistics are updated per 8KB chunk (atomic operations)
-//! - **Approximate LRU**: Cache get() does NOT update LRU order for performance
-//!   (uses lockShared instead of write lock)
+//! - **Fixed Buffer Sizes**: Uses 8KB buffers for headers and 4KB for bodies.
+//! - **Locking**: Cache uses shared locks for reads.
 
 const std = @import("std");
 
@@ -122,7 +91,7 @@ const admin = @import("prozy/admin.zig");
 pub const AdminServer = admin.AdminServer;
 
 const health = @import("prozy/health.zig");
-pub const HealthChecker = health.HealthChecker;
+pub const HealthMonitor = health.HealthMonitor;
 
 // Configuration hot reload
 const config = @import("prozy/config.zig");

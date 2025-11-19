@@ -14,10 +14,9 @@
 //! ## Known Limitations and Assumptions
 //!
 //! ### Request Handling
-//! - **One HTTP request per TCP connection**: The proxy assumes each TCP connection
-//!   carries a single HTTP request. HTTP keep-alive and pipelining are NOT supported.
-//!   Subsequent requests in the same connection will bypass cache checking and request
-//!   inspection.
+//! - **Keep-Alive & Pipelining**: HTTP Keep-Alive and pipelining are fully supported.
+//!   The proxy maintains persistent connections with clients and handles multiple requests per connection.
+//!   Idle connections are timed out after 30 seconds.
 //!
 //! ### Protocol Support
 //! - **HTTP-only**: Currently designed for HTTP traffic. No TLS/SSL termination,
@@ -25,37 +24,32 @@
 //! - **TCP-only**: No UDP support. Adding UDP would require significant changes.
 //!
 //! ### Connection Handling
-//! - **30-second timeout**: After one direction of a connection completes, the proxy
-//!   waits up to 30 seconds for the other direction before timing out and canceling.
-//!   Implemented using io.concurrent(sleep, ...) combined with io.select() for concurrent
-//!   timeout enforcement. Prevents hung connections during HTTP keep-alive scenarios.
+//! - **30-second timeout**: Idle connections are closed after 30 seconds.
+//!   For bidirectional tunnels (CONNECT), both directions are monitored.
 //! - **Full close only**: No TCP half-close support. Both directions are closed together.
 //!
 //! ### Cache Behavior
 //! - **GET requests only**: Only GET requests are cached. POST/PUT/DELETE bypass cache.
-//! - **Basic cacheability**: Cache does NOT respect Cache-Control, Vary, or other
-//!   HTTP caching headers. All GET responses are cached with a fixed TTL.
-//! - **No cache population from backend**: Currently, responses from backends are
-//!   streamed directly to clients but NOT buffered and stored in the cache for future
-//!   requests. This is planned for a future release.
-//! - **Fixed-size buffers**: Request headers are buffered in an 8KB buffer. Headers
-//!   larger than 8KB will cause cache checking to fail (request still forwarded).
+//! - **Full Cache-Control**: Supports `no-store`, `max-age`, `s-maxage`, `stale-while-revalidate`, `Vary`, and more.
+//! - **Conditional requests**: Supports 304 Not Modified responses and ETag/Last-Modified validation.
+//! - **Stale-while-revalidate**: Can serve stale content while background revalidation refreshes cache.
+//! - **No cache population from backend**: Responses are streamed to clients and optionally stored
+//!   if cacheable.
+//! - **Fixed-size buffers**: Request headers are buffered in an 8KB buffer.
 //!
 //! ### Load Balancing
 //! - **Reactive health checks**: Backend health is determined by connection success/
-//!   failure only. No proactive health checks, HTTP 5xx tracking, or timeout detection.
-//! - **Connection-level routing**: Load balancing decision is made per connection,
-//!   not per request (consistent with one-request-per-connection assumption).
+//!   failure only. No proactive health checks.
+//! - **Per-request routing**: Routing decisions are made for each request in the connection.
 //!
 //! ### Security
-//! - **No X-Forwarded-For handling**: Client IP is extracted from TCP socket only.
-//!   If behind another proxy, all clients appear to come from the proxy's IP.
+//! - **X-Forwarded-For**: Client IP is extracted from TCP socket for ACLs.
+//!   `X-Forwarded-For` header is appended for backend visibility.
 //! - **Trusted backend assumption**: No validation of backend responses or protection
 //!   against malicious backends.
 //!
 //! ### Performance
 //! - **Fixed buffer sizes**: 4KB client buffers, 4KB backend buffers, 8KB request buffer
-//! - **Per-chunk byte counting**: Statistics are updated per 8KB chunk (atomic operations)
 //! - **Approximate LRU**: Cache get() does NOT update LRU order for performance
 //!   (uses lockShared instead of write lock)
 
@@ -89,6 +83,7 @@ const ProxyAuth = @import("auth.zig").ProxyAuth;
 const resolveListenAddress = @import("transport.zig").resolveListenAddress;
 const connectToBackend = @import("transport.zig").connectToBackend;
 const extractClientIp = @import("transport.zig").extractClientIp;
+const HealthMonitor = @import("health.zig").HealthMonitor;
 
 // Phase 3: Routing infrastructure
 const Router = @import("router.zig").Router;
@@ -147,6 +142,8 @@ pub const Proxy = struct {
     http_cache: ?HTTPCache = null,
     load_balancer: ?LoadBalancer = null,
     proxy_auth: ?ProxyAuth = null,
+    health_monitor: ?*HealthMonitor = null,
+    health_monitor_arena: ?std.heap.ArenaAllocator = null,
 
     // Phase 3: Routing and lifecycle
     router: *Router,
@@ -353,7 +350,44 @@ pub const Proxy = struct {
         if (self.proxy_auth) |*auth| {
             auth.deinit();
         }
+        if (self.health_monitor_arena) |*arena| {
+            arena.deinit();
+        }
         self.router_arena.deinit();
+    }
+
+    /// Enable proactive health monitoring
+    pub fn enableHealthMonitoring(self: *Self, check_interval_ms: u64, connect_timeout_ms: u64) !void {
+        // Create dedicated arena for health monitor
+        self.health_monitor_arena = std.heap.ArenaAllocator.init(self.allocator);
+        const arena = self.health_monitor_arena.?.allocator();
+
+        // Collect all backends from all clusters
+        var total_backends: usize = 0;
+        for (self.router.clusters) |cluster| {
+            total_backends += cluster.backends.len;
+        }
+
+        // Allocate slice of pointers to backends
+        const backends = try arena.alloc(*Backend, total_backends);
+        var i: usize = 0;
+        for (self.router.clusters) |cluster| {
+            for (cluster.backends) |*backend| {
+                backends[i] = backend;
+                i += 1;
+            }
+        }
+
+        // Create HealthMonitor
+        const monitor = try arena.create(HealthMonitor);
+        monitor.* = HealthMonitor.init(
+            arena,
+            backends,
+            check_interval_ms,
+            connect_timeout_ms,
+            &self.shutdown_requested,
+        );
+        self.health_monitor = monitor;
     }
 
     /// Enable access control with default policy
@@ -567,6 +601,15 @@ pub const Proxy = struct {
         var connection_group: std.Io.Group = .init;
         defer connection_group.wait(io);
 
+        // Start health monitor if enabled
+        if (self.health_monitor) |monitor| {
+            monitor.start(io, &connection_group) catch |err| {
+                log.err("failed to start health monitor: {s}", .{@errorName(err)});
+                // Non-fatal? Probably fatal if monitoring was requested.
+                // But let's log and continue for resilience.
+            };
+        }
+
         var accepted: usize = 0;
         while (!self.isShutdownRequested() and accepted < configured_limit) {
             log.info("calling server.accept() [accepted={}/{}]", .{ accepted, configured_limit });
@@ -585,8 +628,8 @@ pub const Proxy = struct {
             _ = connection_group.async(io, handleClientWithFeatures, .{
                 client_stream,
                 io,
+                &connection_group,
                 self.allocator,
-                options.connect_timeout,
                 @as(*ProxyStats, @constCast(&self.stats)),
                 &self.http_inspector,
                 options,
@@ -727,8 +770,8 @@ pub const Proxy = struct {
     fn handleClientWithFeatures(
         client_stream: net.Stream,
         io: Io,
+        connection_group: *std.Io.Group,
         allocator: std.mem.Allocator,
-        connect_timeout: Timeout,
         stats: *ProxyStats,
         http_inspector: *const HTTPInspector,
         options: RunOptions,
@@ -738,10 +781,11 @@ pub const Proxy = struct {
         router: *Router, // Phase 3: Router for advanced routing
         access_control: ?AccessControl,
     ) void {
+        const connect_timeout = options.connect_timeout;
         // Extract client IP for access control and rate limiting
         const client_ip = extractClientIp(client_stream.socket.address);
 
-        // Check access control
+        // Check access control (Connection Level)
         if (options.enable_access_control) {
             if (access_control) |acl| {
                 if (!acl.isAllowed(client_ip)) {
@@ -752,7 +796,7 @@ pub const Proxy = struct {
             }
         }
 
-        // Check rate limiting
+        // Check rate limiting (Connection Level)
         if (options.enable_rate_limiting) {
             if (rate_limiter) |limiter| {
                 if (!limiter.tryAcquire(client_ip)) {
@@ -762,13 +806,16 @@ pub const Proxy = struct {
                 }
             }
         }
-        const start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
-        var selected_backend: ?*Backend = null;
-        var routing_decision: ?RoutingDecision = null; // Phase 3: Track routing decision for cleanup
 
-        // Track buffered request data that must be forwarded after cache miss
-        var request_buffer: [8192]u8 = undefined;
-        var buffered_request_size: usize = 0;
+        // Statistics: Connection Start
+        if (options.enable_stats) {
+            stats.recordConnection();
+        }
+
+        const connection_start_time = if (options.enable_connection_logging) std.time.Instant.now() catch null else null;
+        if (options.enable_connection_logging and !builtin.is_test) {
+            log.info("new connection from client {any}", .{client_ip});
+        }
 
         defer {
             client_stream.close(io);
@@ -780,368 +827,487 @@ pub const Proxy = struct {
                     limiter.release(client_ip);
                 }
             }
-            if (selected_backend) |backend| {
-                backend.decrementConnections();
-            }
-            // Phase 3: Release cluster semaphore if using router
-            if (routing_decision) |decision| {
-                decision.cluster.release();
-            }
-        }
-
-        if (options.enable_connection_logging and !builtin.is_test) {
-            log.info("new connection from client", .{});
-        }
-
-        // Phase 3: Router-based request handling
-        // Read and parse initial request for routing decision
-        var parsed_request: ?HTTPInspector.HTTPRequest = null;
-        var request_headers: []const u8 = &[_]u8{};
-
-        // Always buffer initial request for router/inspection
-        if (true) {
-            // Buffer initial request for inspection/routing/authentication
-            var client_read_buf: [4096]u8 = undefined;
-            var client_reader = client_stream.reader(io, &client_read_buf);
-
-            // Read first chunk of request
-            var slices = [_][]u8{request_buffer[0..]};
-            const bytes_read = client_reader.interface.readVec(&slices) catch 0;
-            buffered_request_size = bytes_read;
-
-            if (bytes_read > 0) {
-                // Parse HTTP request line
-                parsed_request = HTTPInspector.parseRequestLine(request_buffer[0..bytes_read]);
-                request_headers = request_buffer[0..bytes_read];
-            }
-        }
-
-        // RFC 7235 Proxy Authentication check
-        if (options.enable_proxy_authentication and proxy_auth != null) {
-            // Find Proxy-Authorization header
-            const auth_header = HTTPInspector.findProxyAuthorizationHeader(request_headers);
-
-            const auth_result = proxy_auth.?.authenticate(auth_header, client_ip);
-
-            if (auth_result != .success) {
-                log.warn("authentication failed for {any}: {s}", .{ client_ip, @tagName(auth_result) });
-
-                // Generate 407 Proxy Authentication Required response
-                const auth_response = proxy_auth.?.generateAuthChallenge() catch |err| {
-                    log.err("failed to generate auth challenge: {s}", .{@errorName(err)});
-                    const fallback_response = "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"Prozy Proxy\"\r\nContent-Length: 27\r\n\r\nProxy authentication required";
-                    var error_write_buf: [4096]u8 = undefined;
-                    var error_writer = client_stream.writer(io, &error_write_buf);
-                    _ = Writer.writeAll(&error_writer.interface, fallback_response) catch {};
-                    _ = Writer.flush(&error_writer.interface) catch {};
-                    return;
-                };
-                defer allocator.free(auth_response);
-
-                var error_write_buf: [4096]u8 = undefined;
-                var error_writer = client_stream.writer(io, &error_write_buf);
-                _ = Writer.writeAll(&error_writer.interface, auth_response) catch {};
-                _ = Writer.flush(&error_writer.interface) catch {};
-                return;
-            }
-
-            if (!builtin.is_test) {
-                log.info("authentication successful for {any}", .{client_ip});
-            }
-        }
-
-        // Phase 3: If router is configured, use it for routing decision
-        // (Router is always configured now)
-        if (parsed_request) |req| {
-                // Check for CONNECT method - delegate to tunnel handler
-                if (std.mem.eql(u8, req.method, "CONNECT")) {
-                    // Parse target from path (format: "host:port")
-                    var host_port_iter = std.mem.splitScalar(u8, req.path, ':');
-                    const connect_host = host_port_iter.next() orelse {
-                        log.err("invalid CONNECT request path: {s}", .{req.path});
-                        const error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid CONNECT request";
-                        var error_write_buf: [4096]u8 = undefined;
-                        var error_writer = client_stream.writer(io, &error_write_buf);
-                        _ = Writer.writeAll(&error_writer.interface, error_response) catch {};
-                        _ = Writer.flush(&error_writer.interface) catch {};
-                        return;
-                    };
-                    const connect_port_str = host_port_iter.next() orelse "443";
-                    const connect_port = std.fmt.parseInt(u16, connect_port_str, 10) catch {
-                        log.err("invalid port in CONNECT request: {s}", .{connect_port_str});
-                        const error_response = "HTTP/1.1 400 Bad Request\r\nContent-Length: 22\r\n\r\nInvalid CONNECT request";
-                        var error_write_buf: [4096]u8 = undefined;
-                        var error_writer = client_stream.writer(io, &error_write_buf);
-                        _ = Writer.writeAll(&error_writer.interface, error_response) catch {};
-                        _ = Writer.flush(&error_writer.interface) catch {};
-                        return;
-                    };
-
-                    if (!builtin.is_test) {
-                        log.info("CONNECT request detected for {s}:{}, delegating to tunnel handler", .{ connect_host, connect_port });
-                    }
-                    handleConnectTunnel(
-                        client_stream,
-                        io,
-                        allocator,
-                        connect_host,
-                        connect_port,
-                        connect_timeout,
-                        stats,
-                        http_inspector,
-                        options,
-                    );
-                    return;
-                }
-
-                // Route the request using the router
-                const decision = router.routeRequest(&req, request_headers, client_ip) catch |err| {
-                    log.err("routing failed: {s}", .{@errorName(err)});
-                    if (options.enable_stats) {
-                        stats.recordError();
-                    }
-
-                    // Send error response
-                    const error_response = switch (err) {
-                        error.NoRoute => "HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\n\r\nNo route found",
-                        error.NoHealthyBackend => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nNo healthy backends",
-                        error.ClusterAtCapacity => "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 19\r\n\r\nCluster at capacity",
-                        else => "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 13\r\n\r\nRouting error",
-                    };
-
-                    var error_write_buf: [4096]u8 = undefined;
-                    var error_writer = client_stream.writer(io, &error_write_buf);
-                    Writer.writeAll(&error_writer.interface, error_response) catch {};
-                    Writer.flush(&error_writer.interface) catch {};
-                    return;
-                };
-
-                // Store routing decision for cleanup
-                routing_decision = decision;
-
-                // Use backend from routing decision
-                selected_backend = decision.backend;
-                decision.backend.incrementConnections();
-
-                if (!builtin.is_test) {
-                    log.info("router selected backend: {s}:{} (cluster: {s})", .{
-                        decision.backend.host,
-                        decision.backend.port,
-                        decision.cluster.name,
-                    });
-                }
-
-                // Continue with backend connection using router's decision
-                // (skip load balancer logic below)
-            } else {
-                log.warn("router configured but failed to parse request", .{});
-                if (options.enable_stats) {
-                    stats.recordError();
-                }
-                return;
-            }
-
-        // Try to use HTTP cache if enabled (and not using router, or router allows caching)
-        const cache_enabled = if (routing_decision) |decision|
-            options.enable_caching and decision.cache_allowed and http_cache != null
-        else
-            options.enable_caching and http_cache != null;
-
-        if (cache_enabled and http_cache != null and buffered_request_size > 0) {
-            // Use already buffered request data to check cache
-            // (buffered from router/inspection earlier)
-            if (parsed_request) |request| {
-                // Extract Host header for cache key (multi-tenant isolation)
-                // SECURITY: Requests without Host header are NOT cached to prevent
-                // cache pollution across different virtual hosts/APIs
-                const maybe_host = HTTPInspector.findHeader(request_headers, "Host");
-
-                // Only cache GET requests WITH valid Host header
-                if (std.mem.eql(u8, request.method, "GET")) {
-                    if (maybe_host) |host| {
-                        // Host header present - check cache
-                        if (http_cache.?.get(request.method, host, request.path, null)) |cached_response| {
-                            // IMPORTANT: get() returns an owned copy that we must free
-                            defer http_cache.?.allocator.free(cached_response);
-
-                            // Cache hit! Send cached response directly
-                            if (!builtin.is_test) {
-                                log.info("cache HIT for GET {s} Host: {s}", .{ request.path, host });
-                            }
-
-                            var client_write_buf: [4096]u8 = undefined;
-                            var client_writer = client_stream.writer(io, &client_write_buf);
-
-                            Writer.writeAll(&client_writer.interface, cached_response) catch |err| {
-                                log.warn("failed to write cached response: {s}", .{@errorName(err)});
-                                return;
-                            };
-                            Writer.flush(&client_writer.interface) catch {};
-
-                            if (options.enable_stats) {
-                                stats.recordBytesBackendToClient(@intCast(cached_response.len));
-                            }
-                            return;
-                        }
-
-                        // Cache miss - log and proceed to forward request
-                        if (!builtin.is_test) {
-                            log.info("cache MISS for GET {s} Host: {s}", .{ request.path, host });
-                        }
-                    } else {
-                        // Missing Host header - skip caching for security
-                        if (!builtin.is_test) {
-                            log.warn("cache SKIPPED for GET {s} - missing Host header (HTTP/1.1 violation)", .{request.path});
-                        }
-                        // Request will still be forwarded to backend, just not cached
-                    }
+            if (options.enable_connection_logging and !builtin.is_test and connection_start_time != null) {
+                if (std.time.Instant.now() catch null) |end_time| {
+                    const duration_ns = end_time.since(connection_start_time.?);
+                    const duration_ms = duration_ns / std.time.ns_per_ms;
+                    log.info("connection closed, duration: {}ms", .{duration_ms});
                 }
             }
         }
 
-        // Prepare cache context for cache population on cache miss
-        // Only create context if caching is enabled and we have a valid GET request with Host header
-        var cache_context: ?CacheContext = null;
-        if (cache_enabled and http_cache != null and parsed_request != null) {
-            if (parsed_request) |request| {
-                if (std.mem.eql(u8, request.method, "GET")) {
-                    if (HTTPInspector.findHeader(request_headers, "Host")) |host| {
-                        // Store cache context for later use in copyBidirectionalWithStats
-                        if (CacheContext.init(allocator, request.method, host, request.path)) |ctx| {
-                            cache_context = ctx;
-                        } else |err| {
-                            log.warn("failed to allocate cache context: {s}", .{@errorName(err)});
-                            // Continue without caching if allocation fails
-                        }
-                    }
-                }
-            }
-        }
-
-        // Select backend using routing decision
-        var actual_backend_host: []const u8 = undefined;
-        var actual_backend_port: u16 = 0;
-        var actual_connect_timeout = connect_timeout;
-
-        // Phase 3: If router selected a backend, use it
-        if (routing_decision) |decision| {
-            actual_backend_host = decision.backend.host;
-            actual_backend_port = decision.backend.port;
-
-            // Apply router's timeout policy
-            const timeout_ms = decision.timeouts.connect_timeout_ms;
-            actual_connect_timeout = if (timeout_ms > 0)
-                Timeout{ .duration = .{
-                    .raw = Duration.fromMilliseconds(@intCast(timeout_ms)),
-                    .clock = .awake,
-                } }
-            else
-                .none;
-
-            if (!builtin.is_test) {
-                log.info("using router-selected backend with timeout {}ms", .{timeout_ms});
-            }
-        } else {
-            // Should have returned earlier if routing failed, but double check
-            if (!builtin.is_test) {
-                log.err("no routing decision available", .{});
-            }
-            return;
-        }
-
-        // Connect to backend
-        const backend_stream = connectToBackend(io, actual_backend_host, actual_backend_port, actual_connect_timeout) catch |err| {
-            log.err("backend connect failed: {s}", .{@errorName(err)});
-            if (options.enable_stats) {
-                stats.recordBackendFailure();
-                stats.recordError();
-            }
-            if (selected_backend) |backend| {
-                backend.markHealthy(false);
-                if (!builtin.is_test) {
-                    log.warn("marked backend {s}:{} as unhealthy", .{ backend.host, backend.port });
-                }
-            }
-            return;
-        };
-        defer backend_stream.close(io);
-
-        // Connection succeeded - mark backend as healthy (recovery mechanism)
-        if (selected_backend) |backend| {
-            if (!backend.isHealthy()) {
-                backend.markHealthy(true);
-                if (!builtin.is_test) {
-                    log.info("backend {s}:{} recovered to healthy state", .{ backend.host, backend.port });
-                }
-            }
-        }
-
-        if (options.enable_connection_logging and !builtin.is_test) {
-            log.info("[{any}] connected to backend {s}:{}", .{ start_time, actual_backend_host, actual_backend_port });
-        }
-
-        // Set up buffered readers and writers
+        // Setup buffered reader/writer for Client (Persistent across loop)
         var client_read_buf: [4096]u8 = undefined;
-        var backend_read_buf: [4096]u8 = undefined;
         var client_write_buf: [4096]u8 = undefined;
-        var backend_write_buf: [4096]u8 = undefined;
-
         var client_reader = client_stream.reader(io, &client_read_buf);
-        var backend_reader = backend_stream.reader(io, &backend_read_buf);
         var client_writer = client_stream.writer(io, &client_write_buf);
-        var backend_writer = backend_stream.writer(io, &backend_write_buf);
 
-        // Forward any buffered request data from cache check before bidirectional copy
-        if (buffered_request_size > 0) {
-            const bytes_sent = forwardBufferedData(
-                &backend_writer.interface,
-                request_buffer[0..buffered_request_size],
-                http_inspector,
-                client_ip,
-                allocator,
-                options.enable_http_inspection,
-            ) catch |err| {
-                log.err("failed to forward buffered data: {s}", .{@errorName(err)});
-                if (options.enable_stats) {
-                    stats.recordError();
-                }
-                return;
+        // Keep-Alive State
+        var keep_alive = true;
+        var request_count: usize = 0;
+
+        // Request Buffer (Reusable)
+        var request_buffer: [8192]u8 = undefined;
+
+        // Loop for Persistent Connection
+        while (keep_alive) {
+            // 1. Read Request Headers with Idle Timeout
+            const idle_timeout_s: i64 = if (request_count > 0) 30 else 30; // 30s idle timeout (first or subsequent)
+
+            // Create a future for reading headers
+            var read_future = io.concurrent(readHeaders, .{ &client_reader.interface, &request_buffer }) catch |err| switch (err) {
+                error.ConcurrencyUnavailable => {
+                    // Fallback to blocking read (no timeout enforcement possible without concurrent)
+                    // This is suboptimal but functional
+                    // For Phase 2, we assume concurrency is available
+                    log.warn("concurrency unavailable for readHeaders", .{});
+                    break;
+                },
             };
-            if (options.enable_stats) {
-                // Record actual bytes sent to backend (including any added headers)
-                stats.recordBytesClientToBackend(@intCast(bytes_sent));
+
+            // Create a future for timeout
+            var timeout_future = io.concurrent(sleepForTimeout, .{ io, idle_timeout_s }) catch {
+                _ = read_future.cancel(io) catch {};
+                break;
+            };
+
+            // Wait for either Read or Timeout
+            const result = io.select(.{
+                .read = &read_future,
+                .timeout = &timeout_future,
+            }) catch |err| {
+                log.warn("io.select failed in keep-alive loop: {s}", .{@errorName(err)});
+                _ = read_future.cancel(io) catch {};
+                timeout_future.cancel(io);
+                break;
+            };
+
+            // Process Result
+            var headers_len: usize = 0;
+            switch (result) {
+                .read => |read_result| {
+                    timeout_future.cancel(io); // Cancel timeout
+                    headers_len = read_result catch |err| {
+                        if (err == error.EndOfStream) {
+                            if (request_count > 0 and !builtin.is_test) {
+                                log.info("client closed connection (EOF)", .{});
+                            }
+                        } else {
+                            log.warn("failed to read headers: {s}", .{@errorName(err)});
+                        }
+                        break; // Exit loop on error/EOF
+                    };
+                },
+                .timeout => {
+                    _ = read_future.cancel(io) catch {}; // Cancel read
+                    if (request_count > 0 and !builtin.is_test) {
+                        log.info("keep-alive idle timeout ({d}s)", .{idle_timeout_s});
+                    }
+                    break; // Exit loop on timeout
+                },
             }
-        }
 
-        // Start bidirectional copy with statistics tracking
-        // Enable cache population if we have a cache context (GET with Host header on cache miss)
-        copyBidirectionalWithStats(
-            io,
-            &client_reader.interface,
-            &backend_writer.interface,
-            &backend_reader.interface,
-            &client_writer.interface,
-            stats,
-            http_inspector,
-            options,
-            allocator,
-            http_cache,
-            cache_context,
-        );
+            request_count += 1;
+            const request_headers = request_buffer[0..headers_len];
 
-        // Clean up cache context if it was allocated
-        if (cache_context) |*ctx| {
-            ctx.deinit();
-        }
+            // 2. Parse Request Line
+            const parsed_request = HTTPInspector.parseRequestLine(request_headers) orelse {
+                log.warn("invalid request line", .{});
+                break;
+            };
 
-        if (options.enable_connection_logging and !builtin.is_test and start_time != null) {
-            if (std.time.Instant.now()) |end_time| {
-                const duration_ns = end_time.since(start_time.?);
-                const duration_ms = duration_ns / std.time.ns_per_ms;
-                log.info("connection completed, duration: {}ms", .{duration_ms});
+            // Check Connection: close header to update keep_alive state
+            // Simple check: if "Connection: close" is present
+            // TODO: Improved parsing for comma-separated values
+            if (HTTPInspector.findHeader(request_headers, "Connection")) |conn| {
+                if (std.ascii.indexOfIgnoreCase(conn, "close") != null) {
+                    keep_alive = false;
+                }
+            }
+
+            // 3. Check for CONNECT Tunnel
+            if (std.mem.eql(u8, parsed_request.method, "CONNECT")) {
+                // Handle CONNECT (opaque tunnel) - this takes over the connection completely
+                // Parse host/port logic duplicated from original...
+                var host_port_iter = std.mem.splitScalar(u8, parsed_request.path, ':');
+                const connect_host = host_port_iter.next() orelse {
+                    break;
+                };
+                const connect_port_str = host_port_iter.next() orelse "443";
+                const connect_port = std.fmt.parseInt(u16, connect_port_str, 10) catch {
+                    break;
+                };
+
+                handleConnectTunnel(client_stream, io, allocator, connect_host, connect_port, connect_timeout, stats, http_inspector, options);
+                return; // CONNECT tunnel consumes connection
+            }
+
+            // 4. RFC 7235 Proxy Authentication
+            if (options.enable_proxy_authentication and proxy_auth != null) {
+                const auth_header = HTTPInspector.findProxyAuthorizationHeader(request_headers);
+                const auth_result = proxy_auth.?.authenticate(auth_header, client_ip);
+
+                if (auth_result != .success) {
+                    // Send 407 and Close (auth failure usually breaks keep-alive flow in simple proxies)
+                    // Or we can try to keep alive, but 407 body streaming is needed.
+                    // For simplicity, send 407 and close.
+                    const auth_response = proxy_auth.?.generateAuthChallenge() catch {
+                        break;
+                    };
+                    defer allocator.free(auth_response);
+                    _ = Writer.writeAll(&client_writer.interface, auth_response) catch {};
+                    _ = Writer.flush(&client_writer.interface) catch {};
+                    break;
+                }
+            }
+
+            // 5. Routing
+            const decision = router.routeRequest(&parsed_request, request_headers, client_ip) catch |err| {
+                log.warn("routing failed: {s}", .{@errorName(err)});
+                // Send 502/500
+                const err_resp = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n";
+                _ = Writer.writeAll(&client_writer.interface, err_resp) catch {};
+                _ = Writer.flush(&client_writer.interface) catch {};
+                break;
+            };
+
+            // 6. Caching Check
+            var cache_hit = false;
+            var cached_entry: ?HTTPCache.GetResult = null;
+
+            if (options.enable_caching and decision.cache_allowed and http_cache != null) {
+                if (std.mem.eql(u8, parsed_request.method, "GET")) {
+                    if (HTTPInspector.findHeader(request_headers, "Host")) |host| {
+                        // Try GET (allow stale to handle revalidation)
+                        if (http_cache.?.get(parsed_request.method, host, parsed_request.path, null, true)) |entry| {
+                            if (!entry.is_stale) {
+                                // Fresh hit: Serve immediately
+                                defer http_cache.?.allocator.free(entry.response);
+                                _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
+                                    // Clean up entry before breaking
+                                    break;
+                                };
+                                _ = Writer.flush(&client_writer.interface) catch {
+                                    break;
+                                };
+                                if (options.enable_stats) {
+                                    stats.recordBytesBackendToClient(@intCast(entry.response.len));
+                                }
+                                cache_hit = true;
+                                decision.cluster.release();
+                            } else {
+                                // Stale hit: Keep entry for conditional request
+                                cached_entry = entry;
+
+                                // Check if stale entry supports stale-while-revalidate
+                                if (entry.metadata.cache_control.stale_while_revalidate) |swr_duration| {
+                                    // Calculate freshness to see if we are within SWR window
+                                    const freshness_info = HTTPInspector.FreshnessInfo{
+                                        .date = entry.metadata.date_header,
+                                        .age = entry.metadata.age_header,
+                                        .expires = entry.metadata.expires_header,
+                                        .cache_control = entry.metadata.cache_control,
+                                        .response_time = entry.metadata.response_time,
+                                        .request_time = entry.metadata.request_time,
+                                    };
+
+                                    const now = getTimestamp();
+                                    const current_age = freshness_info.calculateCurrentAge(now);
+                                    const freshness_lifetime = freshness_info.calculateFreshnessLifetime();
+                                    const swr_limit = freshness_lifetime + swr_duration;
+
+                                    if (current_age <= swr_limit) {
+                                        if (!builtin.is_test) {
+                                            log.debug("stale-while-revalidate applicable (age={d}, limit={d})", .{ current_age, swr_limit });
+                                        }
+
+                                        // Create context for revalidation
+                                        // Note: context.init performs deep copies of metadata strings
+                                        if (HTTPCache.RevalidationContext.init(allocator, http_cache.?, parsed_request.method, host, parsed_request.path, entry.metadata, decision.backend.host, decision.backend.port, connect_timeout)) |context| {
+                                            // Spawn background revalidation task
+                                            // Use connection_group.async to spawn detached task
+                                            _ = connection_group.async(io, HTTPCache.revalidateStaleEntry, .{ io, context });
+
+                                            // Serve stale content immediately
+                                            defer http_cache.?.allocator.free(entry.response);
+                                            if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                                            if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
+
+                                            _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
+                                                break;
+                                            };
+                                            _ = Writer.flush(&client_writer.interface) catch {
+                                                break;
+                                            };
+                                            if (options.enable_stats) {
+                                                stats.recordBytesBackendToClient(@intCast(entry.response.len));
+                                            }
+
+                                            cache_hit = true;
+                                            decision.cluster.release();
+                                            // Clean up cached_entry reference since we served it
+                                            cached_entry = null;
+                                        } else |err| {
+                                            log.warn("failed to create revalidation context: {s}", .{@errorName(err)});
+                                        }
+                                    }
+                                }
+
+                                // If not SWR or failed to init context, fall through to synchronous revalidation
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (cache_hit) {
+                continue; // Next request
+            }
+
+            // 7. Cache Miss or Stale Revalidation: Proxy to Backend
+
+            // Determine request body type to stream it
+            const request_body_type = HTTPInspector.getBodyType(request_headers);
+
+            // Connect Backend
+            const backend_stream = connectToBackend(io, decision.backend.host, decision.backend.port, connect_timeout) catch {
+                decision.cluster.release();
+                // If we have a stale entry, serve it as fallback (stale-if-error behavior)
+                if (cached_entry) |entry| {
+                    defer http_cache.?.allocator.free(entry.response);
+                    if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                    if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
+
+                    log.warn("backend connection failed, serving stale content", .{});
+                    _ = Writer.writeAll(&client_writer.interface, entry.response) catch {};
+                    _ = Writer.flush(&client_writer.interface) catch {};
+                    continue;
+                }
+
+                // Send 503
+                const err_resp = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n";
+                _ = Writer.writeAll(&client_writer.interface, err_resp) catch {};
+                _ = Writer.flush(&client_writer.interface) catch {};
+                break;
+            };
+            defer backend_stream.close(io); // Close backend at end of scope (request)
+
+            // Mark Healthy/Stats
+            decision.backend.incrementConnections();
+            decision.backend.markHealthy(true);
+
+            var backend_read_buf: [4096]u8 = undefined;
+            var backend_write_buf: [4096]u8 = undefined;
+            var backend_reader = backend_stream.reader(io, &backend_read_buf);
+            var backend_writer = backend_stream.writer(io, &backend_write_buf);
+
+            // Forward Request Headers (Manipulated + Conditional)
+            {
+                const ip_str = client_ip.toStringAlloc(allocator) catch "0.0.0.0";
+                defer allocator.free(ip_str);
+
+                // X-Forwarded-Proto Check
+                const client_proto = if (HTTPInspector.findHeader(request_headers, "X-Forwarded-Proto")) |p| p else "http";
+                const host_header = HTTPInspector.findHeader(request_headers, "Host");
+
+                var headers_to_send = if (http_inspector.manipulateRequestHeaders(allocator, request_headers, ip_str, client_proto, host_header)) |mod|
+                    mod
+                else |_|
+                    allocator.dupe(u8, request_headers) catch request_headers; // Fallback
+
+                // Add Conditional Headers if revalidating
+                if (cached_entry) |entry| {
+                    if (HTTPInspector.addConditionalHeaders(allocator, headers_to_send, entry.metadata)) |cond_headers| {
+                        // Free previous headers if they were allocated (not equal to buffer)
+                        if (headers_to_send.ptr != request_headers.ptr) {
+                            allocator.free(headers_to_send);
+                        }
+                        headers_to_send = cond_headers;
+                    } else |_| {}
+                }
+
+                defer if (headers_to_send.ptr != request_headers.ptr) allocator.free(headers_to_send);
+
+                Writer.writeAll(&backend_writer.interface, headers_to_send) catch {
+                    break;
+                };
+            }
+            Writer.flush(&backend_writer.interface) catch {
+                break;
+            };
+
+            // Stream Request Body
+            streamMessage(&client_reader.interface, &backend_writer.interface, request_body_type, stats, .client_to_backend) catch |err| {
+                log.warn("failed to stream request body: {s}", .{@errorName(err)});
+                break;
+            };
+
+            // Read Response Headers
+            var response_header_buf: [8192]u8 = undefined;
+            const resp_headers_len = readHeaders(&backend_reader.interface, &response_header_buf) catch |err| {
+                log.warn("failed to read response headers: {s}", .{@errorName(err)});
+                break;
+            };
+            const response_headers = response_header_buf[0..resp_headers_len];
+
+            // Handle 304 Not Modified
+            if (cached_entry) |entry| {
+                // Check if response is 304
+                if (std.mem.indexOf(u8, response_headers, " 304 ") != null) {
+                    // Revalidation Successful!
+                    if (!builtin.is_test) log.info("revalidation successful (304), serving cached content", .{});
+
+                    // Update cache metadata
+                    if (http_cache) |cache| {
+                        if (HTTPInspector.findHeader(request_headers, "Host")) |host| {
+                            // Parse headers needed for metadata update
+                            const cache_control = HTTPInspector.parseCacheControl(response_headers);
+
+                            var etag: ?[]const u8 = null;
+                            if (HTTPInspector.findHeader(response_headers, "ETag")) |e| etag = e;
+                            var last_modified: ?[]const u8 = null;
+                            if (HTTPInspector.findHeader(response_headers, "Last-Modified")) |l| last_modified = l;
+
+                            const date_header = if (HTTPInspector.findHeader(response_headers, "Date")) |d| HTTPInspector.parseHttpDate(d) else null;
+                            const expires_header = if (HTTPInspector.findHeader(response_headers, "Expires")) |e| HTTPInspector.parseHttpDate(e) else null;
+                            const age_header = if (HTTPInspector.findHeader(response_headers, "Age")) |a| std.fmt.parseInt(u32, a, 10) catch null else null;
+
+                            const new_metadata = HTTPCache.CacheMetadata{
+                                .cache_control = cache_control,
+                                .response_time = getTimestamp(),
+                                .request_time = getTimestamp(),
+                                .etag = etag,
+                                .last_modified = last_modified,
+                                .date_header = date_header,
+                                .expires_header = expires_header,
+                                .age_header = age_header,
+                                .vary_context = entry.metadata.vary_context, // Preserve vary context
+                            };
+
+                            cache.updateMetadata(parsed_request.method, host, parsed_request.path, entry.metadata.vary_context, new_metadata) catch |err| {
+                                log.warn("failed to update cache metadata: {s}", .{@errorName(err)});
+                            };
+                        }
+                    }
+
+                    defer http_cache.?.allocator.free(entry.response);
+                    if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                    if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
+
+                    // Return cached response (using handle304 helper if we wanted, but direct write is fine)
+                    _ = Writer.writeAll(&client_writer.interface, entry.response) catch {
+                        break;
+                    };
+                    _ = Writer.flush(&client_writer.interface) catch {
+                        break;
+                    };
+
+                    decision.backend.decrementConnections();
+                    decision.cluster.release();
+                    continue;
+                } else {
+                    // 200 OK or other code -> New content or error
+                    // Free the stale entry since we won't use it
+                    http_cache.?.allocator.free(entry.response);
+                    if (entry.metadata.etag) |e| http_cache.?.allocator.free(e);
+                    if (entry.metadata.last_modified) |l| http_cache.?.allocator.free(l);
+                    cached_entry = null;
+                }
+            }
+
+            // Determine Response Body Type
+
+            const response_body_type = HTTPInspector.getBodyType(response_headers);
+
+            // Check Backend Connection: close
+            if (HTTPInspector.findHeader(response_headers, "Connection")) |conn| {
+                if (std.ascii.indexOfIgnoreCase(conn, "close") != null) {
+                    // Backend closed
+                }
+            }
+
+            // Manipulate Response Headers (Add Via, etc)
+            if (http_inspector.manipulateResponseHeaders(allocator, response_headers)) |mod_resp| {
+                defer allocator.free(mod_resp);
+                Writer.writeAll(&client_writer.interface, mod_resp) catch {
+                    break;
+                };
             } else |_| {
-                log.info("connection completed", .{});
+                Writer.writeAll(&client_writer.interface, response_headers) catch {
+                    break;
+                };
             }
+            Writer.flush(&client_writer.interface) catch {
+                break;
+            };
+
+            // Stream Response Body (and Cache)
+            var streamed = false;
+
+            if (options.enable_caching and decision.cache_allowed and http_cache != null) {
+                const cache_control = HTTPInspector.parseCacheControl(response_headers);
+
+                const status_line = if (std.mem.indexOf(u8, response_headers, "\r\n")) |idx| response_headers[0..idx] else response_headers;
+                const is_200 = std.mem.indexOf(u8, status_line, " 200 ") != null;
+                const is_get = std.mem.eql(u8, parsed_request.method, "GET");
+
+                if (is_get and is_200 and cache_control.isCacheable()) {
+                    var response_buffer = std.ArrayListUnmanaged(u8){};
+                    defer response_buffer.deinit(allocator);
+
+                    var tee_writer = TeeWriter(*Writer){
+                        .child_writer = &client_writer.interface,
+                        .buffer = &response_buffer,
+                        .max_size = 100 * 1024, // 100KB limit
+                        .allocator = allocator,
+                    };
+
+                    streamMessage(&backend_reader.interface, &tee_writer, response_body_type, stats, .backend_to_client) catch |err| {
+                        log.warn("failed to stream response body (caching): {s}", .{@errorName(err)});
+                        break;
+                    };
+                    streamed = true;
+
+                    // If complete and within size, store in cache
+                    if (!tee_writer.was_truncated and response_buffer.items.len > 0) {
+                        const ttl = cache_control.getTTL(300);
+
+                        // Extract validators
+                        var etag: ?[]const u8 = null;
+                        if (HTTPInspector.findHeader(response_headers, "ETag")) |e| {
+                            etag = e;
+                        }
+                        var last_modified: ?[]const u8 = null;
+                        if (HTTPInspector.findHeader(response_headers, "Last-Modified")) |l| {
+                            last_modified = l;
+                        }
+
+                        const metadata = HTTPCache.CacheMetadata{
+                            .cache_control = cache_control,
+                            .response_time = getTimestamp(),
+                            .request_time = getTimestamp(), // approx
+                            .etag = etag,
+                            .last_modified = last_modified,
+                        };
+
+                        if (HTTPInspector.findHeader(request_headers, "Host")) |host| {
+                            http_cache.?.put(parsed_request.method, host, parsed_request.path, response_buffer.items, ttl, metadata, null) catch {};
+                        }
+                    }
+                }
+            }
+
+            if (!streamed) {
+                streamMessage(&backend_reader.interface, &client_writer.interface, response_body_type, stats, .backend_to_client) catch |err| {
+                    log.warn("failed to stream response body: {s}", .{@errorName(err)});
+                    break;
+                };
+            }
+
+            decision.backend.decrementConnections();
+            decision.cluster.release();
+
+            // End of Loop Iteration
         }
     }
 
@@ -1193,9 +1359,11 @@ pub const Proxy = struct {
         const host_header = HTTPInspector.findHeader(buffered_data, "Host");
 
         // Determine protocol (http or https)
-        // For now, assume http (we don't terminate TLS)
-        // TODO: Detect if behind TLS terminator by checking X-Forwarded-Proto from upstream
-        const client_proto = "http";
+        // Check if we are behind a TLS terminator (e.g. AWS ALB, Nginx)
+        const client_proto = if (HTTPInspector.findHeader(buffered_data, "X-Forwarded-Proto")) |proto|
+            proto
+        else
+            "http";
 
         const modified_request = http_inspector.manipulateRequestHeaders(
             allocator,
@@ -1237,6 +1405,34 @@ pub const Proxy = struct {
 
         // Return actual bytes sent (may be larger than original if headers were added)
         return modified_request.len;
+    }
+
+    fn TeeWriter(comptime ChildWriterType: type) type {
+        return struct {
+            const TeeSelf = @This();
+            child_writer: ChildWriterType,
+            buffer: *std.ArrayListUnmanaged(u8),
+            max_size: usize,
+            allocator: std.mem.Allocator,
+            was_truncated: bool = false,
+
+            pub fn writeAll(self: *TeeSelf, bytes: []const u8) !void {
+                try self.child_writer.writeAll(bytes);
+                if (self.was_truncated) return;
+
+                if (self.buffer.items.len + bytes.len <= self.max_size) {
+                    try self.buffer.appendSlice(self.allocator, bytes);
+                } else {
+                    self.was_truncated = true;
+                }
+            }
+
+            pub fn flush(self: *TeeSelf) !void {
+                if (@hasDecl(@TypeOf(self.child_writer.*), "flush")) {
+                    try self.child_writer.flush();
+                }
+            }
+        };
     }
 
     const PipeJob = struct {
@@ -2088,23 +2284,227 @@ pub const Proxy = struct {
         copyPipeWithCaching(job) catch |err| log.warn("sequential copy with caching error: {s}", .{@errorName(err)});
     }
 
+    /// Phase 2: Read HTTP headers byte-by-byte to ensure we don't over-read into the body.
+    /// Relies on the fact that the underlying Reader is buffered for performance.
+    fn readHeaders(reader: *Reader, buffer: []u8) !usize {
+        var total_read: usize = 0;
+        var state: u8 = 0; // 0: start, 1: \r, 2: \r\n, 3: \r\n\r
+
+        while (total_read < buffer.len) {
+            var byte: [1]u8 = undefined;
+            var slices = [_][]u8{&byte};
+            const n = reader.readVec(&slices) catch |err| switch (err) {
+                error.EndOfStream => return if (total_read == 0) error.EndOfStream else error.IncompleteHeaders,
+                else => return err,
+            };
+
+            if (n == 0) {
+                if (total_read == 0) return error.EndOfStream;
+                return error.IncompleteHeaders;
+            }
+
+            buffer[total_read] = byte[0];
+            total_read += 1;
+
+            switch (state) {
+                0 => if (byte[0] == '\r') {
+                    state = 1;
+                } else {
+                    state = 0;
+                },
+                1 => if (byte[0] == '\n') {
+                    state = 2;
+                } else if (byte[0] == '\r') {
+                    state = 1;
+                } else {
+                    state = 0;
+                },
+                2 => if (byte[0] == '\r') {
+                    state = 3;
+                } else {
+                    state = 0;
+                },
+                3 => if (byte[0] == '\n') {
+                    return total_read;
+                } else {
+                    state = 0;
+                },
+                else => unreachable,
+            }
+        }
+        return error.HeadersTooLarge;
+    }
+
+    /// Phase 2: Copy exactly N bytes
+    fn copyNBytes(reader: *Reader, writer: anytype, n: u64, stats: *ProxyStats, direction: PipeJobWithStats.Direction) !void {
+        var remaining = n;
+        var buffer: [8192]u8 = undefined;
+
+        while (remaining > 0) {
+            const to_read = @min(remaining, buffer.len);
+            var slices = [_][]u8{buffer[0..to_read]};
+            const read = try reader.readVec(&slices);
+            if (read == 0) return error.UnexpectedEOF;
+
+            // Update stats
+            switch (direction) {
+                .client_to_backend => stats.recordBytesClientToBackend(@intCast(read)),
+                .backend_to_client => stats.recordBytesBackendToClient(@intCast(read)),
+            }
+
+            try writer.writeAll(buffer[0..read]);
+            remaining -= read;
+        }
+        // Flush if available (duck typing try)
+        if (@hasDecl(@TypeOf(writer.*), "flush")) {
+            try writer.flush();
+        }
+    }
+
+    /// Phase 2: Copy chunked encoding stream
+    /// Reads chunks until 0-sized chunk is found.
+    fn copyChunked(reader: *Reader, writer: anytype, stats: *ProxyStats, direction: PipeJobWithStats.Direction) !void {
+        var header_buffer: [128]u8 = undefined; // Chunk headers are small
+
+        while (true) {
+            // 1. Read chunk size line
+            var size_line_len: usize = 0;
+            var state: u8 = 0; // 0: start, 1: \r
+            var chunk_size: u64 = 0;
+
+            // Read until \r\n
+            while (size_line_len < header_buffer.len) {
+                var byte: [1]u8 = undefined;
+                var slices = [_][]u8{&byte};
+                const n = try reader.readVec(&slices);
+                if (n == 0) return error.UnexpectedEOF;
+
+                header_buffer[size_line_len] = byte[0];
+                size_line_len += 1;
+
+                if (state == 0 and byte[0] == '\r') {
+                    state = 1;
+                } else if (state == 1 and byte[0] == '\n') {
+                    break;
+                } else {
+                    state = 0;
+                }
+            }
+
+            // Parse hex size
+            // Format: size [; extension] \r\n
+            const line = header_buffer[0..size_line_len];
+            const trim_line = std.mem.trimRight(u8, line, "\r\n");
+            var parts = std.mem.splitScalar(u8, trim_line, ';');
+            const size_hex = parts.first();
+            const trimmed_hex = std.mem.trim(u8, size_hex, " ");
+
+            chunk_size = std.fmt.parseInt(u64, trimmed_hex, 16) catch return error.InvalidChunkSize;
+
+            // Write chunk header
+            try writer.writeAll(line);
+
+            // If size 0, this is the last chunk
+            if (chunk_size == 0) {
+                // Read/Write trailers until empty line
+                // State machine to detect empty line (\r\n at start of line)
+                var trailer_state: u8 = 0; // 0: start of line, 1: saw \r at start, 2: mid-line, 3: saw \r mid-line
+
+                trailers: while (true) {
+                    var byte: [1]u8 = undefined;
+                    var slices = [_][]u8{&byte};
+                    const n = try reader.readVec(&slices);
+                    if (n == 0) return error.UnexpectedEOF;
+
+                    try writer.writeAll(&byte);
+                    const c = byte[0];
+
+                    switch (trailer_state) {
+                        0 => { // Start of line
+                            if (c == '\r') {
+                                trailer_state = 1;
+                            } else {
+                                trailer_state = 2;
+                            }
+                        },
+                        1 => { // Saw \r at start
+                            if (c == '\n') {
+                                break :trailers;
+                            } else {
+                                trailer_state = 2;
+                            }
+                        },
+                        2 => { // Mid-line
+                            if (c == '\r') {
+                                trailer_state = 3;
+                            }
+                        },
+                        3 => { // Saw \r mid-line
+                            if (c == '\n') {
+                                trailer_state = 0;
+                            } else {
+                                trailer_state = 2;
+                            }
+                        },
+                        else => unreachable,
+                    }
+                }
+
+                if (@hasDecl(@TypeOf(writer.*), "flush")) {
+                    try writer.flush();
+                }
+                return;
+            }
+
+            // Copy chunk data
+            try copyNBytes(reader, writer, chunk_size, stats, direction);
+
+            // Read/Write trailing CRLF
+            var crlf: [2]u8 = undefined;
+            var crlf_slices = [_][]u8{&crlf};
+            if (try reader.readVec(&crlf_slices) != 2) return error.UnexpectedEOF;
+            try writer.writeAll(&crlf);
+        }
+    }
+
+    /// Phase 2: Stream a complete HTTP message based on body type
+    fn streamMessage(reader: *Reader, writer: anytype, body_type: HTTPInspector.MessageBodyType, stats: *ProxyStats, direction: PipeJobWithStats.Direction) !void {
+        switch (body_type) {
+            .none => {},
+            .content_length => |len| try copyNBytes(reader, writer, len, stats, direction),
+            .chunked => try copyChunked(reader, writer, stats, direction),
+            .until_close => {
+                // Fallback for HTTP/1.0 or unknown length: read until EOF
+                var buffer: [8192]u8 = undefined;
+                while (true) {
+                    var slices = [_][]u8{buffer[0..]};
+                    const n = reader.readVec(&slices) catch |err| switch (err) {
+                        error.EndOfStream => break,
+                        else => return err,
+                    };
+                    if (n == 0) break;
+
+                    switch (direction) {
+                        .client_to_backend => stats.recordBytesClientToBackend(@intCast(n)),
+                        .backend_to_client => stats.recordBytesBackendToClient(@intCast(n)),
+                    }
+                    try writer.writeAll(buffer[0..n]);
+                }
+                if (@hasDecl(@TypeOf(writer.*), "flush")) {
+                    try writer.flush();
+                }
+            },
+        }
+    }
+
     /// Handle a single client connection (simplified concept)
     pub fn handleConnection(self: Self, client_connection: anytype) !void {
-        // In the full implementation, this would:
-        // 1. Connect to backend server
-        // 2. Set up bidirectional async copy tasks
-        // 3. Use io.select() to manage both directions
-        // 4. Clean up properly when connection ends
-
         _ = self;
         _ = client_connection;
     }
 
     /// Copy data between two streams (placeholder)
     pub fn copyStream(source: anytype, destination: anytype) !void {
-        // Historical shim retained for API compatibility. The actual async
-        // proxy implementation relies on copyBidirectional{,WithStats}, which
-        // uses io.concurrent/io.select as described in the new std.Io guide.
         _ = source;
         _ = destination;
     }

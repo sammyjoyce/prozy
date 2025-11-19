@@ -46,36 +46,19 @@ pub fn main() !void {
 
     proxy.enableLoadBalancing(backends[0..], .round_robin);
 
-    // Create health checker
-    var health_checker = prozy.HealthChecker.init(
-        allocator,
-        backends[0..],
-        5000, // Check every 5 seconds
-        2000, // 2 second connection timeout
-        &proxy.shutdown_requested,
-    );
+    // Enable health monitoring
+    try proxy.enableHealthMonitoring(5000, 2000);
 
     std.log.info("Starting health checker (5 second interval)...", .{});
     std.log.info("Health checker will probe unhealthy backends and mark them healthy on success", .{});
     std.log.info("Press Ctrl+C to shutdown", .{});
     std.log.info("", .{});
 
-    // Run health checker in background
-    var health_group: std.Io.Group = .init;
-    defer health_group.wait(io);
-
-    health_group.async(io, runHealthChecker, .{ &health_checker, io });
-
     // Run proxy (this will block)
     try proxy.runWithIoOptions(io, .{
         .enable_stats = true,
         .enable_load_balancing = true,
+        .enable_health_monitoring = true,
         .max_connections = 100,
     });
-}
-
-fn runHealthChecker(health_checker: *prozy.HealthChecker, io: std.Io) void {
-    health_checker.run(io) catch |err| {
-        std.log.err("health checker failed: {s}", .{@errorName(err)});
-    };
 }

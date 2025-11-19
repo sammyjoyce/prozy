@@ -162,7 +162,7 @@ Prozy is an enterprise-ready async TCP proxy built with Zig's async I/O system. 
 
 ## Component Details
 
-### 1. Proxy Main (src/root.zig:1046-1361)
+### 1. Proxy Main (src/prozy/proxy.zig)
 **Responsibilities:**
 - Initialize async I/O runtime (`std.Io.Threaded`)
 - Listen on configured port (default: 8080)
@@ -183,7 +183,7 @@ http_cache: ?HTTPCache
 load_balancer: ?LoadBalancer
 ```
 
-### 2. Access Control (src/root.zig:86-144)
+### 2. Access Control (src/prozy/access.zig)
 **Responsibilities:**
 - IP-based filtering with allow/deny lists
 - Default policy configuration (allow-all or deny-all)
@@ -202,7 +202,7 @@ default_policy: Policy  // .allow or .deny
 3. If allow list exists but IP not in it → reject (whitelist mode)
 4. Fall back to default policy
 
-### 3. Rate Limiter (src/root.zig:146-201)
+### 3. Rate Limiter (src/prozy/access.zig)
 **Responsibilities:**
 - Per-IP connection rate limiting
 - Global connection throttling
@@ -224,7 +224,7 @@ mutex: std.Thread.Mutex
 4. Acquire: increment counters
 5. Release: decrement counters
 
-### 4. HTTP Cache (src/root.zig:344-614)
+### 4. HTTP Cache (src/prozy/http.zig)
 **Responsibilities:**
 - O(1) LRU cache for GET responses
 - TTL-based expiration
@@ -260,7 +260,7 @@ struct CacheNode {
 ```
 
 **Algorithm:**
-- **Get (src/root.zig:411-438):**
+- **Get:**
   1. Hash key: `Wyhash(method + path)`
   2. Lock (write lock - modifies LRU order)
   3. Check if expired → evict if TTL exceeded
@@ -268,7 +268,7 @@ struct CacheNode {
   5. Increment access count
   6. Return response (or null if miss/expired)
 
-- **Put (src/root.zig:440-516):**
+- **Put:**
   1. Don't cache if response > 50% of max size
   2. Lock (write lock)
   3. Evict old entry if exists
@@ -278,13 +278,13 @@ struct CacheNode {
   7. Add to front of LRU list (head)
   8. Update cache size
 
-- **LRU Eviction (src/root.zig:566-589):**
+- **LRU Eviction:**
   1. Remove from tail of linked list (LRU)
   2. Remove from hash map
   3. Decrement size counter
   4. Free allocated memory
 
-### 5. Backend (src/root.zig:616-744)
+### 5. Backend (src/prozy/backend.zig)
 **Responsibilities:**
 - Backend server configuration
 - Health status tracking
@@ -306,7 +306,7 @@ base_recovery_interval_seconds: u32 = 5
 max_recovery_interval_seconds: u32 = 300
 ```
 
-**Exponential Backoff Algorithm (src/root.zig:669-694, 723-743):**
+**Exponential Backoff Algorithm:**
 ```
 Formula: base * 2^retry_count (capped at max)
 
@@ -327,7 +327,7 @@ Circuit Breaker: max_retry_count = 5
 - **Mark Healthy:** Reset timestamp and retry count to 0
 - **Should Retry:** Check if backoff interval has passed AND retry count < max
 
-### 6. Load Balancer (src/root.zig:746-1044)
+### 6. Load Balancer (src/prozy/backend.zig)
 **Responsibilities:**
 - Traffic distribution across backends
 - 5 selection strategies
@@ -336,32 +336,32 @@ Circuit Breaker: max_retry_count = 5
 
 **Strategies:**
 
-1. **Round Robin (src/root.zig:820-829):**
+1. **Round Robin:**
    - Even distribution across all backends
    - Atomic index increment for thread safety
    - Simple modulo arithmetic
 
-2. **Weighted Round Robin (src/root.zig:831-879):**
+2. **Weighted Round Robin:**
    - Weight-based traffic shaping
    - Higher weight = more connections
    - Cycle through backends proportionally
 
-3. **Least Connections (src/root.zig:881-949):**
+3. **Least Connections:**
    - Route to backend with fewest active connections
    - Load-aware selection
    - Prevents overloading single backend
 
-4. **Random (src/root.zig:951-1001):**
+4. **Random:**
    - Random backend selection
    - Good for load distribution
    - Stateless approach
 
-5. **IP Hash (src/root.zig:1003-1044):**
+5. **IP Hash:**
    - Consistent hashing for session affinity
    - Same client IP → same backend
    - Hash IP address to select backend
 
-**Two-Pass Selection Algorithm (src/root.zig:784-818):**
+**Two-Pass Selection Algorithm:**
 ```
 Pass 1: Select from healthy backends only
   └─ Use strategy-specific selector
@@ -376,9 +376,9 @@ Pass 2: If no healthy backend found, check retry candidates
 Result: Selected backend or null (no healthy/retryable backends)
 ```
 
-### 7. Request Processing Flow (src/root.zig:1363-1590)
+### 7. Request Processing Flow (src/prozy/proxy.zig)
 
-**handleClientWithFeatures (src/root.zig:1363-1590):**
+**handleClientWithFeatures:**
 
 1. **Access Control:**
    - Extract client IP from socket address
@@ -394,54 +394,57 @@ Result: Selected backend or null (no healthy/retryable backends)
    - Record connection start
    - Increment active connections counter
 
-4. **Request Buffering (8KB):**
+4. **Connection Loop (Keep-Alive):**
+   - Loop until client closes or timeout
+   - Read headers with 30s idle timeout
+   - If timeout or EOF: Close connection
+
+5. **Request Buffering (8KB):**
    - Read initial request into buffer
    - Prevents data loss when cache checking
    - Critical fix: buffered data forwarded on cache miss
 
-5. **HTTP Parsing:**
+6. **HTTP Parsing:**
    - Parse request line: `GET /path HTTP/1.1`
    - Extract method and path
    - Check if GET request
 
-6. **Cache Check (GET requests only):**
+7. **Cache Check (GET requests only):**
    - Hash key: method + path
    - Check cache for existing response
-   - If HIT: serve cached response, end connection
+   - If HIT: serve cached response, continue loop
    - If MISS: continue to backend
 
-7. **Load Balancing:**
+8. **Load Balancing:**
    - Select backend using configured strategy
    - Check backend health
    - Check retry eligibility (exponential backoff)
    - If no healthy backend: reject connection
 
-8. **Backend Connection:**
+9. **Backend Connection:**
    - Connect to selected backend with timeout
    - If FAILED: mark backend unhealthy, increment retry count
    - If SUCCESS: continue
 
-9. **Forward Buffered Request:**
-   - Write buffered 8KB request to backend
-   - Prevents data loss from cache check step
+10. **Forward Request & Headers:**
+    - Forward buffered request headers (manipulated)
+    - Stream request body to backend
 
-10. **Bidirectional Copy:**
-    - Spawn two concurrent tasks:
-      - Client → Backend (Future C2B)
-      - Backend → Client (Future B2C)
-    - Use `io.concurrent()` for parallel execution
-    - Use `io.select()` to wait for both
-    - Record bytes transferred
+11. **Stream Response:**
+    - Read response headers from backend
+    - Stream response body to client
+    - Optionally cache response if cacheable (200 OK, GET)
 
-11. **Cleanup:**
-    - Close client and backend connections
-    - Release rate limiter slot
-    - Decrement backend connection counter
-    - Record connection end
+12. **Cleanup (Per Request):**
+    - Close backend connection (unless backend keep-alive implemented)
+    - Update stats
+    - Loop back to step 4
 
-### 8. Bidirectional Copy (src/root.zig:1591-1730)
+### 8. Bidirectional Copy (src/prozy/proxy.zig)
 
-**copyBidirectional (src/root.zig:1591-1625):**
+**Used for CONNECT tunnels (HTTPS) only.**
+
+**copyBidirectional:**
 ```zig
 fn copyBidirectional(
     io: Io,
@@ -479,13 +482,13 @@ fn copyBidirectional(
 }
 ```
 
-**copyPipe (src/root.zig:1645-1673):**
+**copyPipe:**
 - Buffered I/O with 4KB buffer
 - Read from source, write to destination
 - Loop until EOF or error
 - Track total bytes transferred
 
-### 9. Proxy Statistics (src/root.zig:28-84)
+### 9. Proxy Statistics (src/prozy/stats.zig)
 
 **Atomic Counters (Thread-Safe):**
 ```zig
@@ -558,33 +561,33 @@ _ = io.select(&[_]Io.Future{future1, future2});
 ### 1. Request Buffering for Cache Checking
 **Problem:** Reading initial request to check cache consumes data from stream
 **Solution:** 8KB buffer holds initial request, forwarded to backend on cache miss
-**Location:** src/root.zig:1382, 1423-1466
+**Location:** src/prozy/proxy.zig
 
 ### 2. Exponential Backoff for Health Recovery
 **Problem:** Thundering herd when backends recover
 **Solution:** Exponential backoff (5s → 300s) with circuit breaker
-**Location:** src/root.zig:625-743
+**Location:** src/prozy/backend.zig
 
 ### 3. Two-Pass Backend Selection
 **Problem:** All backends might be unhealthy
 **Solution:** First try healthy, then try retry-eligible with backoff
-**Location:** src/root.zig:784-818
+**Location:** src/prozy/backend.zig
 
 ### 4. RwLock for Cache Concurrency
 **Problem:** Mutex serializes all cache reads
 **Solution:** RwLock allows multiple concurrent readers
 **Note:** Cache get() uses write lock (modifies LRU order)
-**Location:** src/root.zig:384, 411-438
+**Location:** src/prozy/http.zig
 
 ### 5. O(1) LRU Eviction
 **Problem:** Finding LRU entry should be fast
 **Solution:** Doubly-linked list with head=MRU, tail=LRU
-**Location:** src/root.zig:346-357, 525-589
+**Location:** src/prozy/http.zig
 
 ### 6. Atomic Statistics
 **Problem:** Multiple threads updating stats concurrently
 **Solution:** Atomic operations with monotonic ordering
-**Location:** src/root.zig:29-84
+**Location:** src/prozy/stats.zig
 
 ## Performance Characteristics
 
@@ -606,18 +609,20 @@ _ = io.select(&[_]Io.Future{future1, future2});
 prozy/
 ├── src/
 │   ├── main.zig              # Entry point, creates Io runtime
-│   └── root.zig              # All proxy logic
-│       ├── ProxyStats        (28-84)      # Statistics & monitoring
-│       ├── AccessControl     (86-144)     # IP filtering
-│       ├── RateLimiter       (146-201)    # Connection throttling
-│       ├── HTTPInspector     (203-342)    # HTTP parsing
-│       ├── HTTPCache         (344-614)    # LRU cache with TTL
-│       ├── Backend           (616-744)    # Backend config & health
-│       ├── LoadBalancer      (746-1044)   # Traffic routing
-│       ├── Proxy             (1046-1361)  # Main proxy struct
-│       ├── handleClient*     (1363-1590)  # Connection handling
-│       ├── copyBidirectional (1591-1730)  # Async I/O copying
-│       └── Tests             (1732+)      # 40+ unit tests
+│   ├── root.zig              # Library root, re-exports from prozy/
+│   └── prozy/
+│       ├── access.zig        # IP access control
+│       ├── auth.zig          # Proxy authentication
+│       ├── backend.zig       # Backend health & load balancing
+│       ├── config.zig        # Configuration management
+│       ├── health.zig        # Health checking
+│       ├── http.zig          # HTTP parsing & caching
+│       ├── proxy.zig         # Main proxy logic & connection handling
+│       ├── router.zig        # Request routing
+│       ├── routing.zig       # Routing policies & structs
+│       ├── stats.zig         # Statistics
+│       ├── tests.zig         # Unit tests
+│       └── transport.zig     # Network transport utils
 ├── examples/
 │   ├── async_io_demo.zig           # Async I/O capabilities demo
 │   ├── full_features_demo.zig      # All proxy features showcase
@@ -756,13 +761,12 @@ try proxy.runWithIoOptions(io, .{
 
 ### Location in Code
 
-- Primary implementation: `src/proxy.zig:222-241` (`runWithIoOptions`)
-- Convenience wrappers: `src/proxy.zig:243-255` (`runWithIo`, `run`, `runWithDefaults`)
+- Primary implementation: `src/prozy/proxy.zig` (`runWithIoOptions`)
 - Usage examples: `src/main.zig:38`, `examples/configs/*.zig`
 
 ## Visualization
 
-To generate visual diagrams from `prozy-architecture.dot`:
+To generate visual diagrams from `docs/prozy-architecture.dot`:
 
 ```bash
 # Install GraphViz
@@ -771,17 +775,17 @@ brew install graphviz           # macOS
 choco install graphviz          # Windows
 
 # Generate PNG
-dot -Tpng prozy-architecture.dot -o prozy-architecture.png
+dot -Tpng docs/prozy-architecture.dot -o docs/prozy-architecture.png
 
 # Generate SVG
-dot -Tsvg prozy-architecture.dot -o prozy-architecture.svg
+dot -Tsvg docs/prozy-architecture.dot -o docs/prozy-architecture.svg
 
 # Generate PDF
-dot -Tpdf prozy-architecture.dot -o prozy-architecture.pdf
+dot -Tpdf docs/prozy-architecture.dot -o docs/prozy-architecture.pdf
 ```
 
 ## References
 
 - **CLAUDE.md**: Coding style guide and design principles
 - **README.md**: Quick start and feature overview
-- **src/root.zig**: Complete implementation with inline documentation
+- **src/prozy/**: Modular implementation

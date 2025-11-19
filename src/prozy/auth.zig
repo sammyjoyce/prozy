@@ -1001,9 +1001,86 @@ pub const DigestCredentials = struct {
     qop: ?[]const u8 = null,
 
     pub fn parse(header_value: []const u8, allocator: std.mem.Allocator) !?DigestCredentials {
-        _ = header_value;
-        _ = allocator;
-        // TODO: Implement Digest authentication parsing in Phase 2
+        if (header_value.len < 7) return null;
+
+        if (!std.ascii.eqlIgnoreCase(header_value[0..6], "Digest")) {
+            return null;
+        }
+
+        const params_part = std.mem.trim(u8, header_value[6..], " \t");
+        if (params_part.len == 0) return null;
+
+        var result = DigestCredentials{
+            .username = &[_]u8{}, // placeholders, will be overwritten
+            .realm = &[_]u8{},
+            .nonce = &[_]u8{},
+            .uri = &[_]u8{},
+            .response = &[_]u8{},
+        };
+
+        var has_username = false;
+        var has_realm = false;
+        var has_nonce = false;
+        var has_uri = false;
+        var has_response = false;
+
+        var it = std.mem.splitScalar(u8, params_part, ',');
+        while (it.next()) |param| {
+            const trimmed = std.mem.trim(u8, param, " \t");
+            if (trimmed.len == 0) continue;
+
+            const eq_idx = std.mem.indexOf(u8, trimmed, "=") orelse continue;
+            const key = std.mem.trim(u8, trimmed[0..eq_idx], " \t");
+            var value = std.mem.trim(u8, trimmed[eq_idx + 1 ..], " \t");
+
+            // Remove quotes if present
+            if (value.len >= 2 and value[0] == '"' and value[value.len - 1] == '"') {
+                value = value[1 .. value.len - 1];
+            }
+
+            const duped_val = try allocator.dupe(u8, value);
+
+            if (std.mem.eql(u8, key, "username")) {
+                result.username = duped_val;
+                has_username = true;
+            } else if (std.mem.eql(u8, key, "realm")) {
+                result.realm = duped_val;
+                has_realm = true;
+            } else if (std.mem.eql(u8, key, "nonce")) {
+                result.nonce = duped_val;
+                has_nonce = true;
+            } else if (std.mem.eql(u8, key, "uri")) {
+                result.uri = duped_val;
+                has_uri = true;
+            } else if (std.mem.eql(u8, key, "response")) {
+                result.response = duped_val;
+                has_response = true;
+            } else if (std.mem.eql(u8, key, "algorithm")) {
+                result.algorithm = duped_val;
+            } else if (std.mem.eql(u8, key, "cnonce")) {
+                result.cnonce = duped_val;
+            } else if (std.mem.eql(u8, key, "nc")) {
+                result.nc = duped_val;
+            } else if (std.mem.eql(u8, key, "qop")) {
+                result.qop = duped_val;
+            }
+        }
+
+        if (has_username and has_realm and has_nonce and has_uri and has_response) {
+            return result;
+        }
+
+        // Clean up partial result on failure
+        if (has_username) allocator.free(result.username);
+        if (has_realm) allocator.free(result.realm);
+        if (has_nonce) allocator.free(result.nonce);
+        if (has_uri) allocator.free(result.uri);
+        if (has_response) allocator.free(result.response);
+        if (result.algorithm) |s| allocator.free(s);
+        if (result.cnonce) |s| allocator.free(s);
+        if (result.nc) |s| allocator.free(s);
+        if (result.qop) |s| allocator.free(s);
+
         return null;
     }
 };

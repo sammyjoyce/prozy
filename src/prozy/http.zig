@@ -1,5 +1,10 @@
 const std = @import("std");
 const log = std.log;
+const builtin = @import("builtin");
+const Io = std.Io;
+const Timeout = Io.Timeout;
+const Writer = Io.Writer;
+const Reader = Io.Reader;
 
 /// HTTP protocol inspector for header manipulation
 pub const HTTPInspector = struct {
@@ -86,6 +91,34 @@ pub const HTTPInspector = struct {
             return idx + marker.len;
         }
         return null;
+    }
+
+    pub const MessageBodyType = union(enum) {
+        none,
+        content_length: u64,
+        chunked,
+        until_close, // For HTTP/1.0 or ambiguous responses
+    };
+
+    /// Determine the body type and length from headers
+    pub fn getBodyType(headers: []const u8) MessageBodyType {
+        // Check for Transfer-Encoding: chunked (precedence over Content-Length)
+        if (findHeader(headers, "Transfer-Encoding")) |transfer_encoding| {
+            if (std.mem.indexOf(u8, transfer_encoding, "chunked") != null) {
+                return .chunked;
+            }
+        }
+
+        // Check for Content-Length header
+        if (findHeader(headers, "Content-Length")) |content_length_str| {
+            if (std.fmt.parseInt(u64, content_length_str, 10)) |len| {
+                return .{ .content_length = len };
+            } else |_| {}
+        }
+
+        // If neither, assume no body (or until close for legacy)
+        // For strict HTTP/1.1 pipelining, we can't support "until_close" easily without closing connection.
+        return .none;
     }
 
     /// Check if buffer contains a complete HTTP response
@@ -305,6 +338,7 @@ pub const HTTPInspector = struct {
         public: bool = false, // RFC 9111 Section 5.2.2.1
         no_transform: bool = false, // RFC 9111 Section 5.2.2.8
         immutable: bool = false, // RFC 8246 (extension)
+        stale_while_revalidate: ?u32 = null, // RFC 5861 Section 3 (extension)
 
         /// Check if response is cacheable by proxy (shared cache)
         pub fn isCacheable(self: CacheControlDirectives) bool {
@@ -404,6 +438,14 @@ pub const HTTPInspector = struct {
                             directives.s_maxage = age;
                         }
                     }
+                } else if (std.ascii.eqlIgnoreCase(name, "stale-while-revalidate")) {
+                    const parsed = std.fmt.parseInt(u32, value, 10) catch null;
+                    // SECURITY: Validate stale-while-revalidate bounds (0 to 1 day in seconds)
+                    if (parsed) |duration| {
+                        if (duration <= 86400) {
+                            directives.stale_while_revalidate = duration;
+                        }
+                    }
                 }
             } else {
                 // Boolean directives (no value) - case insensitive comparison
@@ -436,6 +478,54 @@ pub const HTTPInspector = struct {
     pub fn hasCacheControlNoStore(headers: []const u8) bool {
         const directives = parseCacheControl(headers);
         return directives.no_store;
+    }
+
+    /// Generate conditional request headers (If-None-Match, If-Modified-Since)
+    /// Returns a new buffer with the modified headers if validators exist, otherwise returns copy of original
+    pub fn addConditionalHeaders(
+        allocator: std.mem.Allocator,
+        original_headers: []const u8,
+        metadata: HTTPCache.CacheMetadata,
+    ) ![]u8 {
+        if (metadata.etag == null and metadata.last_modified == null) {
+            return allocator.dupe(u8, original_headers);
+        }
+
+        // Find where headers end
+        const headers_end = findHeadersEnd(original_headers) orelse {
+            return allocator.dupe(u8, original_headers);
+        };
+
+        var modified = std.ArrayListUnmanaged(u8){};
+        errdefer modified.deinit(allocator);
+
+        // Copy everything up to the end of headers (excluding the final \r\n that marks end of headers)
+        // headers_end points after \r\n\r\n
+        // So we want to slice up to headers_end - 2 (keep the first \r\n)
+        try modified.appendSlice(allocator, original_headers[0 .. headers_end - 2]);
+
+        if (metadata.etag) |etag| {
+            // Check if etag is quoted, if not add quotes (some backends require it)
+            // But we stored it raw. RFC says If-None-Match: "etag"
+            try modified.appendSlice(allocator, "If-None-Match: ");
+            try modified.appendSlice(allocator, etag);
+            try modified.appendSlice(allocator, "\r\n");
+        }
+
+        if (metadata.last_modified) |lm| {
+            try modified.appendSlice(allocator, "If-Modified-Since: ");
+            try modified.appendSlice(allocator, lm);
+            try modified.appendSlice(allocator, "\r\n");
+        }
+
+        try modified.appendSlice(allocator, "\r\n"); // End of headers
+
+        // Copy body if any
+        if (headers_end < original_headers.len) {
+            try modified.appendSlice(allocator, original_headers[headers_end..]);
+        }
+
+        return modified.toOwnedSlice(allocator);
     }
 
     /// RFC 9111 Phase 4: ETag support
@@ -1262,26 +1352,266 @@ pub const HTTPCache = struct {
         self.cache.deinit();
     }
 
+    /// Handle 304 Not Modified response from backend
+    /// Returns the cached response (body + headers) to be served to the client
+    /// Updates cached entry's metadata with new values from the 304 response
+    pub fn handle304(self: *HTTPCache, cached_response: []const u8, new_304_headers: []const u8) []const u8 {
+        _ = self;
+        _ = new_304_headers;
+        // TODO: Update cached metadata with new headers from 304 response
+        // For now, just serve the stale cached response (200 OK)
+        return cached_response;
+    }
+
+    /// Stale-while-revalidate context for background revalidation
+    pub const RevalidationContext = struct {
+        allocator: std.mem.Allocator,
+        http_cache: *HTTPCache,
+        method: []const u8,
+        host: []const u8,
+        path: []const u8,
+        metadata: CacheMetadata,
+        backend_host: []const u8,
+        backend_port: u16,
+        connect_timeout: Timeout,
+
+        pub fn init(
+            allocator: std.mem.Allocator,
+            http_cache: *HTTPCache,
+            method: []const u8,
+            host: []const u8,
+            path: []const u8,
+            metadata: CacheMetadata,
+            backend_host: []const u8,
+            backend_port: u16,
+            connect_timeout: std.Io.Timeout,
+        ) !RevalidationContext {
+            // Deep copy metadata strings to ensure safety if cache entry is evicted
+            var safe_metadata = metadata;
+
+            if (metadata.etag) |e| safe_metadata.etag = try allocator.dupe(u8, e);
+            if (metadata.last_modified) |l| safe_metadata.last_modified = try allocator.dupe(u8, l);
+
+            // Deep copy vary context if present
+            if (metadata.vary_context) |ctx| {
+                safe_metadata.vary_context = .{
+                    .accept = if (ctx.accept) |v| try allocator.dupe(u8, v) else null,
+                    .accept_encoding = if (ctx.accept_encoding) |v| try allocator.dupe(u8, v) else null,
+                    .accept_language = if (ctx.accept_language) |v| try allocator.dupe(u8, v) else null,
+                    .accept_charset = if (ctx.accept_charset) |v| try allocator.dupe(u8, v) else null,
+                    .user_agent = if (ctx.user_agent) |v| try allocator.dupe(u8, v) else null,
+                };
+            }
+
+            return RevalidationContext{
+                .allocator = allocator,
+                .http_cache = http_cache,
+                .method = try allocator.dupe(u8, method),
+                .host = try allocator.dupe(u8, host),
+                .path = try allocator.dupe(u8, path),
+                .metadata = safe_metadata,
+                .backend_host = try allocator.dupe(u8, backend_host),
+                .backend_port = backend_port,
+                .connect_timeout = connect_timeout,
+            };
+        }
+
+        pub fn deinit(self: *RevalidationContext) void {
+            self.allocator.free(self.method);
+            self.allocator.free(self.host);
+            self.allocator.free(self.path);
+            self.allocator.free(self.backend_host);
+
+            // Free metadata strings
+            if (self.metadata.etag) |e| self.allocator.free(e);
+            if (self.metadata.last_modified) |l| self.allocator.free(l);
+
+            // Free vary context
+            if (self.metadata.vary_context) |*ctx| {
+                if (ctx.accept) |v| self.allocator.free(v);
+                if (ctx.accept_encoding) |v| self.allocator.free(v);
+                if (ctx.accept_language) |v| self.allocator.free(v);
+                if (ctx.accept_charset) |v| self.allocator.free(v);
+                if (ctx.user_agent) |v| self.allocator.free(v);
+            }
+        }
+    };
+
+    /// Background revalidation task for stale-while-revalidate
+    /// This runs as a detached async task to refresh stale cache entries
+    pub fn revalidateStaleEntry(io: std.Io, context: RevalidationContext) void {
+        var ctx = context;
+        defer ctx.deinit();
+
+        if (!builtin.is_test) {
+            log.info("background revalidation started for {s} {s}://{s}:{d}{s}", .{ ctx.method, "http", ctx.backend_host, ctx.backend_port, ctx.path });
+        }
+
+        // Connect to backend
+        const connectToBackend = @import("transport.zig").connectToBackend;
+        const backend_stream = connectToBackend(io, ctx.backend_host, ctx.backend_port, ctx.connect_timeout) catch |err| {
+            log.warn("background revalidation failed: cannot connect to backend: {s}", .{@errorName(err)});
+            return;
+        };
+        defer backend_stream.close(io);
+
+        // Build conditional request
+        var request_buffer: [8192]u8 = undefined;
+        const request = std.fmt.bufPrint(&request_buffer,
+            \\{s} {s} HTTP/1.1\r\n
+            \\Host: {s}\r\n
+            \\User-Agent: Prozy-Revalidator/1.0\r\n
+            \\Connection: close\r\n
+        , .{ ctx.method, ctx.path, ctx.host }) catch |err| {
+            log.warn("background revalidation failed: request formatting error: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Add conditional headers
+        const conditional_request = HTTPInspector.addConditionalHeaders(ctx.allocator, request, ctx.metadata) catch |err| {
+            log.warn("background revalidation failed: conditional header error: {s}", .{@errorName(err)});
+            return;
+        };
+        defer ctx.allocator.free(conditional_request);
+
+        // Send request
+        var backend_write_buf: [4096]u8 = undefined;
+        var backend_writer = backend_stream.writer(io, &backend_write_buf);
+
+        Writer.writeAll(&backend_writer.interface, conditional_request) catch |err| {
+            log.warn("background revalidation failed: request send error: {s}", .{@errorName(err)});
+            return;
+        };
+        Writer.flush(&backend_writer.interface) catch |err| {
+            log.warn("background revalidation failed: request flush error: {s}", .{@errorName(err)});
+            return;
+        };
+
+        // Read response
+        var backend_read_buf: [4096]u8 = undefined;
+        var backend_reader = backend_stream.reader(io, &backend_read_buf);
+
+        var response_buffer = std.ArrayList(u8){};
+        defer response_buffer.deinit(context.allocator);
+
+        var temp_buffer: [4096]u8 = undefined;
+        while (true) {
+            var slices = [_][]u8{temp_buffer[0..]};
+            const n = backend_reader.interface.readVec(&slices) catch |err| {
+                log.warn("background revalidation failed: response read error: {s}", .{@errorName(err)});
+                return;
+            };
+            if (n == 0) break;
+            response_buffer.appendSlice(context.allocator, temp_buffer[0..n]) catch |err| {
+                log.warn("background revalidation failed: response buffer error: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+
+        const response = response_buffer.toOwnedSlice(context.allocator) catch |err| {
+            log.warn("background revalidation failed: response ownership error: {s}", .{@errorName(err)});
+            return;
+        };
+        defer context.allocator.free(response);
+
+        // Parse response to check if it's 304 or new content
+        if (HTTPInspector.parseResponseLine(response)) |parsed_response| {
+            if (parsed_response.status_code == 304) {
+                // 304 Not Modified - cached content is still valid
+                if (!builtin.is_test) {
+                    log.info("background revalidation successful: 304 Not Modified for {s} {s}", .{ context.method, context.path });
+                }
+
+                // Update metadata from 304 response headers
+                const cache_control = HTTPInspector.parseCacheControl(response);
+
+                var etag: ?[]const u8 = null;
+                if (HTTPInspector.findHeader(response, "ETag")) |e| etag = e;
+                var last_modified: ?[]const u8 = null;
+                if (HTTPInspector.findHeader(response, "Last-Modified")) |l| last_modified = l;
+
+                // Parse other freshness headers
+                const date_header = if (HTTPInspector.findHeader(response, "Date")) |d| HTTPInspector.parseHttpDate(d) else null;
+                const expires_header = if (HTTPInspector.findHeader(response, "Expires")) |e| HTTPInspector.parseHttpDate(e) else null;
+
+                // Calculate Age if present
+                const age_header = if (HTTPInspector.findHeader(response, "Age")) |a| std.fmt.parseInt(u32, a, 10) catch null else null;
+
+                const new_metadata = CacheMetadata{
+                    .cache_control = cache_control,
+                    .response_time = getTimestamp(),
+                    .request_time = getTimestamp(), // Approximation for background revalidation
+                    .etag = etag,
+                    .last_modified = last_modified,
+                    .date_header = date_header,
+                    .expires_header = expires_header,
+                    .age_header = age_header,
+                    // Preserve vary context from original request
+                    .vary_context = context.metadata.vary_context,
+                };
+
+                context.http_cache.updateMetadata(context.method, context.host, context.path, context.metadata.vary_context, new_metadata) catch |err| {
+                    log.warn("background revalidation failed: metadata update error: {s}", .{@errorName(err)});
+                };
+            } else if (parsed_response.status_code == 200) {
+                // New content available - update cache
+                const cache_control = HTTPInspector.parseCacheControl(response);
+                if (cache_control.isCacheable()) {
+                    const ttl = cache_control.getTTL(300);
+
+                    // Extract validators from response
+                    var etag: ?[]const u8 = null;
+                    if (HTTPInspector.findHeader(response, "ETag")) |e| etag = e;
+                    var last_modified: ?[]const u8 = null;
+                    if (HTTPInspector.findHeader(response, "Last-Modified")) |l| last_modified = l;
+
+                    const updated_metadata = CacheMetadata{
+                        .cache_control = cache_control,
+                        .response_time = getTimestamp(),
+                        .request_time = context.metadata.request_time,
+                        .etag = etag,
+                        .last_modified = last_modified,
+                    };
+
+                    context.http_cache.put(context.method, context.host, context.path, response, ttl, updated_metadata, null) catch |err| {
+                        log.warn("background revalidation failed: cache update error: {s}", .{@errorName(err)});
+                        return;
+                    };
+
+                    if (!builtin.is_test) {
+                        log.info("background revalidation successful: updated cache entry for {s} {s}", .{ context.method, context.path });
+                    }
+                } else {
+                    if (!builtin.is_test) {
+                        log.info("background revalidation: new response is not cacheable, keeping stale entry", .{});
+                    }
+                }
+            } else {
+                if (!builtin.is_test) {
+                    log.warn("background revalidation: unexpected response status {d} for {s} {s}", .{ parsed_response.status_code, context.method, context.path });
+                }
+            }
+        } else {
+            log.warn("background revalidation failed: invalid response from backend", .{});
+        }
+    }
+
+    pub const GetResult = struct {
+        response: []u8,
+        metadata: CacheMetadata,
+        is_stale: bool,
+    };
+
     /// Get cached response (returns owned copy that caller must free)
-    ///
-    /// IMPORTANT CHANGES:
-    /// - Now includes Host header in cache key for multi-tenant isolation
-    /// - Uses lockShared() for concurrent reads (high performance)
-    /// - Does NOT update LRU order to avoid write lock contention
-    /// - Expired entries are detected but not evicted (cleanup happens during put)
-    /// - Returns an OWNED COPY to prevent use-after-free (caller must free!)
-    ///
-    /// This design prioritizes safety and read performance over zero-copy efficiency.
-    /// The copy overhead is acceptable for cached responses since we avoid network I/O.
-    /// Get cached response for method, host, path, and optional vary context
-    /// RFC 9111 Phase 3: Vary support enables multiple variants for same URL
+    /// allow_stale: if true, returns stale entries (marked as is_stale=true) for revalidation
     pub fn get(
         self: *HTTPCache,
         method: []const u8,
         host: []const u8,
         path: []const u8,
         vary_context: ?HTTPInspector.VaryContext,
-    ) ?[]u8 {
+        allow_stale: bool,
+    ) ?GetResult {
         const key = hashKey(method, host, path, vary_context);
 
         // Use shared (read) lock for concurrent reads
@@ -1291,11 +1621,9 @@ pub const HTTPCache = struct {
         if (self.cache.get(key)) |node| {
             const now = getTimestamp();
 
-            // Check expiration: Use RFC 9111 freshness if metadata available, otherwise fall back to TTL
+            // Check expiration
             const is_stale = blk: {
-                // If we have RFC 9111 metadata (date_header or cache_control max-age), use it
                 if (node.metadata.date_header != null or node.metadata.cache_control.max_age != null) {
-                    // RFC 9111 Phase 5: Use freshness calculation
                     const freshness_info = HTTPInspector.FreshnessInfo{
                         .date = node.metadata.date_header,
                         .age = node.metadata.age_header,
@@ -1306,38 +1634,61 @@ pub const HTTPCache = struct {
                     };
                     break :blk freshness_info.isStale(now);
                 } else {
-                    // Backward compatibility: Simple TTL-based expiration
-                    // This fallback is used when RFC 9111 metadata is unavailable
-                    // (e.g., responses cached before metadata support was added)
                     const elapsed = now - node.created_at;
-                    // Guard against negative elapsed time (clock adjustments)
                     break :blk elapsed >= 0 and elapsed > @as(i64, node.ttl);
                 }
             };
 
-            if (is_stale) {
-                // Entry is stale - treat as cache miss
+            if (is_stale and !allow_stale) {
                 _ = self.misses.fetchAdd(1, .monotonic);
                 return null;
             }
 
-            // Entry is fresh - serve from cache
-            // Don't update LRU order (read-only path for concurrency)
-            // Access count is not updated to avoid write contention
-            _ = self.hits.fetchAdd(1, .monotonic);
+            // Update stats
+            if (!is_stale) {
+                _ = self.hits.fetchAdd(1, .monotonic);
+            } else {
+                _ = self.misses.fetchAdd(1, .monotonic); // Stale is technically a miss for "fresh" content
+            }
 
-            // CRITICAL: Copy response to prevent use-after-free
-            // The caller holds no lock after we return, so another thread
-            // could evict this entry and free the buffer. Return an owned copy.
             const response_copy = self.allocator.alloc(u8, node.response.len) catch {
-                // Allocation failed, treat as cache miss
-                // Only decrement hits (incremented above)
-                // Don't decrement misses (never incremented in this path)
-                _ = self.hits.fetchSub(1, .monotonic);
                 return null;
             };
             @memcpy(response_copy, node.response);
-            return response_copy;
+
+            // Copy metadata
+            var etag_copy: ?[]const u8 = null;
+            if (node.metadata.etag) |e| etag_copy = self.allocator.dupe(u8, e) catch {
+                self.allocator.free(response_copy);
+                return null;
+            };
+
+            var last_modified_copy: ?[]const u8 = null;
+            if (node.metadata.last_modified) |l| last_modified_copy = self.allocator.dupe(u8, l) catch {
+                if (etag_copy) |e| self.allocator.free(e);
+                self.allocator.free(response_copy);
+                return null;
+            };
+
+            const metadata = CacheMetadata{
+                .date_header = node.metadata.date_header,
+                .age_header = node.metadata.age_header,
+                .expires_header = node.metadata.expires_header,
+                .request_time = node.metadata.request_time,
+                .response_time = node.metadata.response_time,
+                .cache_control = node.metadata.cache_control,
+                .etag = etag_copy,
+                .last_modified = last_modified_copy,
+                .is_weak_etag = node.metadata.is_weak_etag,
+                .vary_headers = null, // Deep copy TODO if needed
+                .vary_context = null, // Deep copy TODO if needed
+            };
+
+            return GetResult{
+                .response = response_copy,
+                .metadata = metadata,
+                .is_stale = is_stale,
+            };
         }
 
         _ = self.misses.fetchAdd(1, .monotonic);
@@ -1525,6 +1876,54 @@ pub const HTTPCache = struct {
 
         if (self.tail == null) {
             self.tail = node;
+        }
+    }
+
+    /// Update metadata for an existing cache entry (e.g., on 304 Not Modified)
+    pub fn updateMetadata(
+        self: *HTTPCache,
+        method: []const u8,
+        host: []const u8,
+        path: []const u8,
+        vary_context: ?HTTPInspector.VaryContext,
+        new_metadata: CacheMetadata,
+    ) !void {
+        const key = hashKey(method, host, path, vary_context);
+
+        self.rwlock.lock();
+        defer self.rwlock.unlock();
+
+        if (self.cache.get(key)) |node| {
+            // Free old metadata strings
+            if (node.metadata.etag) |e| self.allocator.free(e);
+            if (node.metadata.last_modified) |lm| self.allocator.free(lm);
+
+            // Copy new strings
+            var etag_copy: ?[]u8 = null;
+            if (new_metadata.etag) |etag_str| {
+                etag_copy = try self.allocator.alloc(u8, etag_str.len);
+                @memcpy(etag_copy.?, etag_str);
+            }
+
+            var last_modified_copy: ?[]u8 = null;
+            if (new_metadata.last_modified) |lm_str| {
+                last_modified_copy = try self.allocator.alloc(u8, lm_str.len);
+                @memcpy(last_modified_copy.?, lm_str);
+            }
+
+            // Update metadata fields
+            node.metadata.date_header = new_metadata.date_header;
+            node.metadata.age_header = new_metadata.age_header;
+            node.metadata.expires_header = new_metadata.expires_header;
+            node.metadata.request_time = new_metadata.request_time;
+            node.metadata.response_time = new_metadata.response_time;
+            node.metadata.cache_control = new_metadata.cache_control;
+            node.metadata.etag = etag_copy;
+            node.metadata.last_modified = last_modified_copy;
+            node.metadata.is_weak_etag = new_metadata.is_weak_etag;
+
+            // Move to front (MRU) as it was just validated/updated
+            self.moveToFront(node);
         }
     }
 
