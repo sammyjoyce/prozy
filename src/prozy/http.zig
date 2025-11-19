@@ -88,6 +88,34 @@ pub const HTTPInspector = struct {
         return null;
     }
 
+    pub const MessageBodyType = union(enum) {
+        none,
+        content_length: u64,
+        chunked,
+        until_close, // For HTTP/1.0 or ambiguous responses
+    };
+
+    /// Determine the body type and length from headers
+    pub fn getBodyType(headers: []const u8) MessageBodyType {
+        // Check for Transfer-Encoding: chunked (precedence over Content-Length)
+        if (findHeader(headers, "Transfer-Encoding")) |transfer_encoding| {
+            if (std.mem.indexOf(u8, transfer_encoding, "chunked") != null) {
+                return .chunked;
+            }
+        }
+
+        // Check for Content-Length header
+        if (findHeader(headers, "Content-Length")) |content_length_str| {
+            if (std.fmt.parseInt(u64, content_length_str, 10)) |len| {
+                return .{ .content_length = len };
+            } else |_| {}
+        }
+
+        // If neither, assume no body (or until close for legacy)
+        // For strict HTTP/1.1 pipelining, we can't support "until_close" easily without closing connection.
+        return .none;
+    }
+
     /// Check if buffer contains a complete HTTP response
     pub fn isCompleteResponse(buffer: []const u8) bool {
         // First, check if we have complete headers
@@ -436,6 +464,54 @@ pub const HTTPInspector = struct {
     pub fn hasCacheControlNoStore(headers: []const u8) bool {
         const directives = parseCacheControl(headers);
         return directives.no_store;
+    }
+
+    /// Generate conditional request headers (If-None-Match, If-Modified-Since)
+    /// Returns a new buffer with the modified headers if validators exist, otherwise returns copy of original
+    pub fn addConditionalHeaders(
+        allocator: std.mem.Allocator,
+        original_headers: []const u8,
+        metadata: HTTPCache.CacheMetadata,
+    ) ![]u8 {
+        if (metadata.etag == null and metadata.last_modified == null) {
+            return allocator.dupe(u8, original_headers);
+        }
+
+        // Find where headers end
+        const headers_end = findHeadersEnd(original_headers) orelse {
+            return allocator.dupe(u8, original_headers);
+        };
+
+        var modified = std.ArrayListUnmanaged(u8){};
+        errdefer modified.deinit(allocator);
+
+        // Copy everything up to the end of headers (excluding the final \r\n that marks end of headers)
+        // headers_end points after \r\n\r\n
+        // So we want to slice up to headers_end - 2 (keep the first \r\n)
+        try modified.appendSlice(allocator, original_headers[0 .. headers_end - 2]);
+
+        if (metadata.etag) |etag| {
+            // Check if etag is quoted, if not add quotes (some backends require it)
+            // But we stored it raw. RFC says If-None-Match: "etag"
+            try modified.appendSlice(allocator, "If-None-Match: ");
+            try modified.appendSlice(allocator, etag);
+            try modified.appendSlice(allocator, "\r\n");
+        }
+
+        if (metadata.last_modified) |lm| {
+            try modified.appendSlice(allocator, "If-Modified-Since: ");
+            try modified.appendSlice(allocator, lm);
+            try modified.appendSlice(allocator, "\r\n");
+        }
+
+        try modified.appendSlice(allocator, "\r\n"); // End of headers
+
+        // Copy body if any
+        if (headers_end < original_headers.len) {
+            try modified.appendSlice(allocator, original_headers[headers_end..]);
+        }
+
+        return modified.toOwnedSlice(allocator);
     }
 
     /// RFC 9111 Phase 4: ETag support
@@ -1262,26 +1338,31 @@ pub const HTTPCache = struct {
         self.cache.deinit();
     }
 
+    /// Handle 304 Not Modified response from backend
+    /// Returns the cached response (body + headers) to be served to the client
+    /// TODO: In the future, this should update the cached entry's metadata (headers) with new values from the 304 response
+    pub fn handle304(self: *HTTPCache, cached_response: []const u8, new_304_headers: []const u8) []const u8 {
+        _ = self;
+        _ = new_304_headers;
+        return cached_response; // For now, just serve the stale cached response (200 OK)
+    }
+
+    pub const GetResult = struct {
+        response: []u8,
+        metadata: CacheMetadata,
+        is_stale: bool,
+    };
+
     /// Get cached response (returns owned copy that caller must free)
-    ///
-    /// IMPORTANT CHANGES:
-    /// - Now includes Host header in cache key for multi-tenant isolation
-    /// - Uses lockShared() for concurrent reads (high performance)
-    /// - Does NOT update LRU order to avoid write lock contention
-    /// - Expired entries are detected but not evicted (cleanup happens during put)
-    /// - Returns an OWNED COPY to prevent use-after-free (caller must free!)
-    ///
-    /// This design prioritizes safety and read performance over zero-copy efficiency.
-    /// The copy overhead is acceptable for cached responses since we avoid network I/O.
-    /// Get cached response for method, host, path, and optional vary context
-    /// RFC 9111 Phase 3: Vary support enables multiple variants for same URL
+    /// allow_stale: if true, returns stale entries (marked as is_stale=true) for revalidation
     pub fn get(
         self: *HTTPCache,
         method: []const u8,
         host: []const u8,
         path: []const u8,
         vary_context: ?HTTPInspector.VaryContext,
-    ) ?[]u8 {
+        allow_stale: bool,
+    ) ?GetResult {
         const key = hashKey(method, host, path, vary_context);
 
         // Use shared (read) lock for concurrent reads
@@ -1291,11 +1372,9 @@ pub const HTTPCache = struct {
         if (self.cache.get(key)) |node| {
             const now = getTimestamp();
 
-            // Check expiration: Use RFC 9111 freshness if metadata available, otherwise fall back to TTL
+            // Check expiration
             const is_stale = blk: {
-                // If we have RFC 9111 metadata (date_header or cache_control max-age), use it
                 if (node.metadata.date_header != null or node.metadata.cache_control.max_age != null) {
-                    // RFC 9111 Phase 5: Use freshness calculation
                     const freshness_info = HTTPInspector.FreshnessInfo{
                         .date = node.metadata.date_header,
                         .age = node.metadata.age_header,
@@ -1306,38 +1385,54 @@ pub const HTTPCache = struct {
                     };
                     break :blk freshness_info.isStale(now);
                 } else {
-                    // Backward compatibility: Simple TTL-based expiration
-                    // This fallback is used when RFC 9111 metadata is unavailable
-                    // (e.g., responses cached before metadata support was added)
                     const elapsed = now - node.created_at;
-                    // Guard against negative elapsed time (clock adjustments)
                     break :blk elapsed >= 0 and elapsed > @as(i64, node.ttl);
                 }
             };
 
-            if (is_stale) {
-                // Entry is stale - treat as cache miss
+            if (is_stale and !allow_stale) {
                 _ = self.misses.fetchAdd(1, .monotonic);
                 return null;
             }
 
-            // Entry is fresh - serve from cache
-            // Don't update LRU order (read-only path for concurrency)
-            // Access count is not updated to avoid write contention
-            _ = self.hits.fetchAdd(1, .monotonic);
+            // Update stats
+            if (!is_stale) {
+                _ = self.hits.fetchAdd(1, .monotonic);
+            } else {
+                _ = self.misses.fetchAdd(1, .monotonic); // Stale is technically a miss for "fresh" content
+            }
 
-            // CRITICAL: Copy response to prevent use-after-free
-            // The caller holds no lock after we return, so another thread
-            // could evict this entry and free the buffer. Return an owned copy.
             const response_copy = self.allocator.alloc(u8, node.response.len) catch {
-                // Allocation failed, treat as cache miss
-                // Only decrement hits (incremented above)
-                // Don't decrement misses (never incremented in this path)
-                _ = self.hits.fetchSub(1, .monotonic);
                 return null;
             };
             @memcpy(response_copy, node.response);
-            return response_copy;
+
+            // Copy metadata
+            var etag_copy: ?[]const u8 = null;
+            if (node.metadata.etag) |e| etag_copy = self.allocator.dupe(u8, e) catch null;
+            
+            var last_modified_copy: ?[]const u8 = null;
+            if (node.metadata.last_modified) |l| last_modified_copy = self.allocator.dupe(u8, l) catch null;
+
+            const metadata = CacheMetadata{
+                .date_header = node.metadata.date_header,
+                .age_header = node.metadata.age_header,
+                .expires_header = node.metadata.expires_header,
+                .request_time = node.metadata.request_time,
+                .response_time = node.metadata.response_time,
+                .cache_control = node.metadata.cache_control,
+                .etag = etag_copy,
+                .last_modified = last_modified_copy,
+                .is_weak_etag = node.metadata.is_weak_etag,
+                .vary_headers = null, // Deep copy TODO if needed
+                .vary_context = null, // Deep copy TODO if needed
+            };
+
+            return GetResult{
+                .response = response_copy,
+                .metadata = metadata,
+                .is_stale = is_stale,
+            };
         }
 
         _ = self.misses.fetchAdd(1, .monotonic);
